@@ -87,8 +87,10 @@ modification. It does not calculate an Opus duration. Audio and data use one
 sequence space. A data packet can activate a granted stream.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
-inactivity timeout, and transmit time limit. Each release produces one monitor
-event and one listener revoke operation.
+inactivity timeout, and transmit time limit. Each release emits one
+`stream_ended` event and starts the listener revoke procedure. A grant timeout
+or media-inactivity timeout also emits `stream_timeout`. A transmit time limit
+also emits `transmit_time_limit`.
 
 ## 5. Client architecture
 

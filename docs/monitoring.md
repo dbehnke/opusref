@@ -56,11 +56,12 @@ defined event types are `client_connected`, `client_disconnected`,
 | `queue_drop` | Fixed queue, fixed item type, frame count, and recipient count |
 | `control_overload` | Session ID |
 
-The server emits `stream_active` for the first accepted media frame. It emits a
-specific timeout event and `stream_ended` for a timeout. It emits
-`client_disconnected` on each path that removes a session. It emits
-`queue_drop` when it observes an inbound drop or rejects queued media or
-control work.
+The server emits `stream_active` for the first accepted media frame. Every
+release emits `stream_ended`. A grant timeout or media-inactivity timeout also
+emits `stream_timeout`. A transmit time limit also emits
+`transmit_time_limit`. The server emits `client_disconnected` on each path that
+removes a session. It emits `queue_drop` when it observes an inbound drop or
+rejects queued media or control work.
 
 The bounded disconnect reasons are `client_request`, `server_shutdown`,
 `session_timeout`, `control_overload`, and
