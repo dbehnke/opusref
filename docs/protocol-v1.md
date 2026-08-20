@@ -120,9 +120,9 @@ the source callsign. Audio and data packets do not repeat callsigns.
 | `0x20` | STREAM_REQUEST | Client to server |
 | `0x21` | STREAM_GRANT | Server to requester |
 | `0x22` | STREAM_BUSY | Server to requester |
-| `0x23` | STREAM_START | Server to listeners |
+| `0x23` | STREAM_START | Server notification; listener acknowledgement |
 | `0x24` | STREAM_END | Client request or server acknowledgement |
-| `0x25` | STREAM_REVOKE | Server to clients |
+| `0x25` | STREAM_REVOKE | Server notification; listener acknowledgement |
 | `0x40` | AUDIO | Floor owner to server; server to listeners |
 | `0x41` | DATA | Floor owner to server; server to listeners |
 
@@ -155,10 +155,12 @@ an empty payload.
 | STREAM_REQUEST | Session | New stream | Zero | RETRY on a retry only | Transaction ID, source callsign | None | Empty |
 | STREAM_GRANT | Session | Requested stream | Zero | RESPONSE | Transaction ID, transmit time limit | None | Empty |
 | STREAM_BUSY | Session | Requested stream | Zero | RESPONSE | Transaction ID | None | Empty |
-| STREAM_START | Owner | Active stream | Zero | Zero | Node callsign, source callsign, transmit time limit | None | Empty |
+| STREAM_START notification | Owner | Active stream | Zero | RETRY on a retry only | Transaction ID, node callsign, source callsign, transmit time limit | None | Empty |
+| STREAM_START acknowledgement | Listener session | Active stream | Zero | RESPONSE | Transaction ID | None | Empty |
 | STREAM_END request | Session | Active stream | Next sequence and current timestamp | RETRY on a retry only | Transaction ID | None | Empty |
 | STREAM_END response | Session | Ended stream | Request values | RESPONSE | Transaction ID, end reason | None | Empty |
-| STREAM_REVOKE | Owner | Ended stream | Next sequence and final timestamp; both zero after an unused grant | Zero | End reason | None | Empty |
+| STREAM_REVOKE notification | Owner | Ended stream | Next sequence and final timestamp; both zero after an unused grant | RETRY on a retry only | Transaction ID, end reason | None | Empty |
+| STREAM_REVOKE acknowledgement | Listener session | Ended stream | Notification values | RESPONSE | Transaction ID | None | Empty |
 | AUDIO | Owner | Active stream | Current media values | Zero | None | Future optional TLVs | One Opus packet |
 | DATA | Owner | Active stream | Current media values | Zero | Data type | Future optional TLVs | Opaque data |
 
@@ -179,6 +181,8 @@ sequenceDiagram
     R-->>C: CHALLENGE (server nonce, reflector identity)
     C->>R: AUTHENTICATE (nonces, optional HMAC)
     R-->>C: WELCOME (session ID)
+    C->>R: KEEPALIVE (session confirmation)
+    R-->>C: KEEPALIVE RESPONSE
     loop When no other packet is sent for 10 seconds
         C->>R: KEEPALIVE
         R-->>C: KEEPALIVE RESPONSE
@@ -209,6 +213,11 @@ nonzero 64-bit session ID after successful admission. The session is bound to
 the source IP address and UDP port. A client MUST complete a new handshake after
 its address changes.
 
+The client sends a `KEEPALIVE` immediately after it receives `WELCOME`. This
+packet confirms that the client received its session ID. The server does not
+mark the client ready and does not send stream notifications or media to it
+until it receives this confirmation. The server returns a `KEEPALIVE` response.
+
 The client sends `KEEPALIVE` every 10 seconds when it sends no other packet.
 The server returns the same transaction ID with `RESPONSE`. Any valid packet
 refreshes session activity. The server expires a session after 30 seconds with
@@ -216,11 +225,11 @@ no valid packet.
 
 ## 8. Transactions and retries
 
-A control request that expects a response MUST contain a transaction ID. The
-client sends the first attempt at time zero. If no response arrives, it sends
+A control message that expects a response MUST contain a transaction ID. The
+initiator sends the first attempt at time zero. If no response arrives, it sends
 three retries. The retries occur 500 ms, 1.5 seconds, and 3.5 seconds after the
 first attempt. Thus, the delay after each attempt is 500 ms, 1 second, and 2
-seconds. Each retry uses the same transaction ID and sets `RETRY`. The client
+seconds. Each retry uses the same transaction ID and sets `RETRY`. The initiator
 stops after four total attempts.
 
 Handshake requests always use the remote IP address and port, the request packet
@@ -232,6 +241,18 @@ part of the key.
 
 After admission, non-handshake requests use the session ID, request packet type,
 and transaction ID as the cache key.
+
+The server starts a separate transaction for each listener when it sends
+`STREAM_START` or `STREAM_REVOKE`. The server cache key uses the listener session
+ID, notification packet type, and transaction ID. An acknowledgement uses the
+listener's session ID, not the floor owner's session ID. It copies the stream ID
+and transaction ID and sets `RESPONSE`. A client acknowledges each duplicate
+notification but applies its state change only one time.
+
+If the server does not receive a `STREAM_START` acknowledgement after four
+attempts, it stops media fan-out to that listener for the active stream. The
+listener session stays ready for the next stream. When a stream ends, the server
+cancels its outstanding start transactions before it starts revoke transactions.
 
 The server keeps a completed result for at least 30 seconds. When it receives a
 duplicate request, it returns the prior logical result and does not repeat the
@@ -248,11 +269,13 @@ sequenceDiagram
     alt Floor is free
         R-->>T: STREAM_GRANT
         R-->>L: STREAM_START
+        L-->>R: STREAM_START RESPONSE
         T->>R: AUDIO or DATA
         R-->>L: AUDIO or DATA
         T->>R: STREAM_END
         R-->>T: STREAM_END RESPONSE
         R-->>L: STREAM_REVOKE
+        L-->>R: STREAM_REVOKE RESPONSE
     else Floor is in use
         R-->>T: STREAM_BUSY
     end
@@ -261,8 +284,9 @@ sequenceDiagram
 One server has one channel and one floor owner. A client sends `STREAM_REQUEST`
 with a new nonzero stream ID, a transaction ID, and a source callsign. If the
 floor is free, the server sends `STREAM_GRANT` to the requester. It also sends
-`STREAM_START` with node callsign, source callsign, and transmit time limit to all
-listeners. If the floor is not free, it sends `STREAM_BUSY`.
+`STREAM_START` with a transaction ID, node callsign, source callsign, and
+transmit time limit to each listener. Each listener acknowledges it. If the
+floor is not free, the server sends `STREAM_BUSY`.
 
 The client MUST wait for `STREAM_GRANT` before it sends media. The grant expires
 if no media arrives in two seconds. The server releases the floor after one
@@ -270,9 +294,10 @@ second with no valid media. The default transmit time limit releases the floor
 after 180 seconds. These three values are server configuration values.
 
 The owner sends `STREAM_END` to release the floor. The server acknowledges it
-with `STREAM_END` and `RESPONSE`, then sends `STREAM_REVOKE` to listeners. The
-server also sends `STREAM_REVOKE` after a timeout or owner disconnect. The end
-reason states why the server released the floor.
+with `STREAM_END` and `RESPONSE`, then sends a transactional `STREAM_REVOKE` to
+each listener. Each listener acknowledges it. The server also sends
+`STREAM_REVOKE` after a timeout or owner disconnect. The end reason states why
+the server released the floor.
 
 If an unused grant expires, no media sequence or timestamp exists. The server
 sets both fields to zero in `STREAM_REVOKE` for this case.
@@ -281,9 +306,17 @@ The server forwards only valid media from the floor owner's bound session and
 stream ID. It forwards the original sequence, timestamp, TLVs, and payload. It
 does not send media back to the owner. It drops media from all other clients.
 
-A client that joins during a stream receives `WELCOME`, then the current
-`STREAM_START`, then subsequent media. UDP can reorder these packets. A client
-MUST discard media for a stream until it has the stream metadata.
+A client that joins during a stream receives `WELCOME`, then the
+session-confirmation exchange, then the current `STREAM_START`, then subsequent
+media. The server sends the first `STREAM_START` attempt before it sends media
+to that listener. It does not wait for the acknowledgement before it sends
+media. A client MUST discard media for a stream until it has the stream
+metadata. If the first notification is lost, a retry supplies the metadata.
+
+A listener releases its receive state when it receives `STREAM_REVOKE`. It also
+releases stale receive state after two seconds with no media or when it accepts
+a new `STREAM_START`. These rules provide recovery when all revoke attempts are
+lost.
 
 ## 10. Audio and data
 

@@ -10,6 +10,7 @@ func TestProtocolScenarios(t *testing.T) {
 		"simultaneous floor contention",
 		"grant inactivity and transmit time limit release",
 		"late join stream metadata",
+		"stream metadata acknowledgement and retry",
 		"data rejected outside active stream",
 		"sequence wrap and loss accounting",
 	}

@@ -60,7 +60,9 @@ stateDiagram-v2
         [*] --> New
         New --> Challenged: HELLO accepted
         Challenged --> Connected: AUTHENTICATE accepted
+        Connected --> Ready: confirmation KEEPALIVE
         Connected --> Disconnected: disconnect or timeout
+        Ready --> Disconnected: disconnect or timeout
         Disconnected --> [*]
     }
     state Floor {
@@ -90,6 +92,12 @@ The client package accepts a packet transport, clock, random source, and event
 sink. It owns one connection state machine and at most one local stream. It
 performs control retries and keepalives. It exposes received stream metadata,
 opaque audio, typed data, busy, revoke, and error events.
+
+The server uses a per-listener transaction for each stream-start and
+stream-revoke notification. The listener acknowledges the notification. The
+server retries an unacknowledged notification with the standard bounded retry
+schedule. A new session does not enter the fan-out set until its immediate
+post-welcome keepalive confirms the session ID.
 
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send
