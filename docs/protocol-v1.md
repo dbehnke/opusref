@@ -258,6 +258,31 @@ The server keeps a completed result for at least 30 seconds. When it receives a
 duplicate request, it returns the prior logical result and does not repeat the
 state change. A response copies the transaction ID and sets `RESPONSE`.
 
+The normalized request fingerprint contains the packet type, flags with only
+`RETRY` removed, all state header fields, canonical ordered TLVs, and payload.
+The receiver rejects the same cache key with a different fingerprint as a
+malformed transaction conflict. The server does not evict a retained result
+before its retention time ends. Only a packet that passes semantic validation
+and the session address check refreshes session activity.
+
+## 11. Diagnostic record format
+
+The diagnostic client uses this local record format. It is not an OpusRef UDP
+datagram.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `ORR1` |
+| 4 | 1 | Kind: 1 audio, 2 data |
+| 5 | 1 | Flags: zero |
+| 6 | 2 | Data type: zero for audio, nonzero for data |
+| 8 | 4 | Endpoint-supplied 48 kHz timestamp |
+| 12 | 4 | Payload length |
+
+Audio payload length is 1 through 1,168 bytes. Data payload length is 1 through
+1,160 bytes. A reader validates the complete header and length before it
+allocates payload memory.
+
 ## 9. Half-duplex stream procedure
 
 ```mermaid

@@ -43,10 +43,11 @@ rule removes lock ordering from protocol policy. The UDP reader copies each
 datagram into a bounded buffer and validates it before it creates an event. The
 state owner does not block on network writes, logs, metrics, or HTTP clients.
 
-One UDP writer receives immutable send intents. Its queue is bounded. When the
-queue is full, the server drops the new media intent, increments a metric, and
-continues. Control responses use a small reserved queue so that media load does
-not block disconnect, revoke, or error traffic.
+One UDP writer receives immutable send intents. Its queues are bounded. The
+media queue has 256 frame batches. A batch contains one datagram and one
+recipient snapshot. The control queue has 64 destination datagrams. The writer
+sends available control traffic before each media batch and between recipient
+writes. The state owner does not block on either queue.
 
 The server uses one UDP socket. A session key contains the random session ID and
 the remote IP address and port. The session store has configured client and
@@ -77,10 +78,10 @@ stateDiagram-v2
 Only the state owner can grant or release the floor. The first accepted
 `STREAM_REQUEST` in event order wins. A duplicate transaction returns its prior
 result. A second client receives `STREAM_BUSY`. A grant becomes active on the
-first valid audio or data packet. The first media packet establishes the initial
-48 kHz stream position. Data does not advance that position. Audio advances it
-by the decoded sample count. Thus, a data packet can activate a granted stream,
-and the first later audio packet uses the established position.
+first valid audio or data packet. The endpoint supplies each 48 kHz timestamp.
+The reflector records and forwards the current header timestamp without
+modification. It does not calculate an Opus duration. Audio and data use one
+sequence space. A data packet can activate a granted stream.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
 inactivity timeout, and transmit time limit. Each release produces one monitor
@@ -104,10 +105,29 @@ and timestamps so that an application can implement a jitter buffer. Send
 methods accept a complete Opus packet or typed data payload. They reject a
 payload that cannot fit in a 1,200-byte datagram.
 
-`opusrefctl` reads and writes a diagnostic record format. Each record has a
-four-byte network-order length followed by one opaque payload. The command can
-connect, request the floor, send records from standard input, and write received
-records to standard output. It does not use microphone or speaker devices.
+`opusrefctl` reads and writes the 16-byte `ORR1` diagnostic record header that
+the protocol specification defines. It does not use microphone or speaker
+devices.
+
+### 5.1 Capacity and shutdown
+
+The server permits 100 connected clients and 100 pending challenges. It uses a
+256-datagram inbound queue. It retains 1,024 completed transactions globally
+and 64 for each admitted session. It permits 200 pending notifications globally
+and two for each listener. It retains 256 monitoring events.
+
+```mermaid
+sequenceDiagram
+    participant Command
+    participant State as State owner
+    participant Writer
+    Command->>State: Start restricted drain
+    State->>State: Reject admission, floor, and media
+    State->>Writer: STREAM_REVOKE transactions
+    Writer-->>State: Acknowledgement or retry exhaustion
+    State->>Writer: DISCONNECT transactions
+    Command->>Command: Close after drain or 5 seconds
+```
 
 ## 6. Configuration and secrets
 

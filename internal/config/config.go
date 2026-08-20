@@ -16,10 +16,17 @@ type Config struct {
 
 type Network struct{ UDPListen string }
 type Reflector struct{ ID, DisplayName string }
-type Limits struct{ MaxClients, MaxDatagramBytes, OutboundQueueFrames, RecentEvents int }
+type Limits struct {
+	MaxClients, MaxDatagramBytes, InboundQueuePackets           int
+	OutboundMediaQueueFrames, OutboundControlQueuePackets       int
+	MaxPendingChallenges, MaxCompletedTransactions              int
+	MaxCompletedTransactionsPerSession, MaxPendingNotifications int
+	MaxPendingNotificationsPerClient, RecentEvents              int
+}
 type Timers struct {
 	KeepaliveInterval, SessionTimeout, GrantTimeout time.Duration
 	StreamInactivityTimeout, TransmitTimeLimit      time.Duration
+	HealthDeadline, ShutdownGrace                   time.Duration
 }
 type Authentication struct{ SharedKeyEnv, SharedKeyFile string }
 type Monitoring struct{ HTTPListen string }

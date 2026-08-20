@@ -38,7 +38,8 @@ Each event contains an event ID, UTC timestamp, event type, severity, and a
 small set of typed details. Event IDs increase for the process lifetime. The
 defined event types are client connected, client disconnected, authentication
 failed, stream granted, stream busy, stream active, stream ended, stream
-timeout, transmit time limit, malformed packet, and queue drop.
+timeout, transmit time limit, malformed packet, queue drop, and
+`control_overload`.
 
 An event must not contain media or typed-data payload bytes. Error text must not
 contain secret material.
@@ -63,14 +64,21 @@ All names use the `opusref_` prefix. Counters have a `_total` suffix.
 | `opusref_stream_duration_seconds` | Histogram | None |
 | `opusref_busy_total` | Counter | None |
 | `opusref_timeouts_total` | Counter | `kind` |
-| `opusref_fanout_frames_total` | Counter | `frame_type` |
-| `opusref_fanout_recipients_total` | Counter | `frame_type` |
-| `opusref_queue_drops_total` | Counter | `queue`, `frame_type` |
+| `opusref_fanout_frames_total` | Counter | `item_type` |
+| `opusref_fanout_recipients_total` | Counter | `item_type` |
+| `opusref_queue_drops_total` | Counter | `queue`, `item_type` |
+| `opusref_queue_drop_recipients_total` | Counter | `queue`, `item_type` |
 | `opusref_sequence_gaps_total` | Counter | `direction` |
 
 Label values come from fixed enumerations. Callsigns, identifiers, addresses,
 data type numbers, and error text are prohibited labels. Histograms use fixed
-buckets that the implementation documents with its first metrics code.
+buckets of 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, and 180 seconds.
+
+The fixed `direction` values are `rx` and `tx`. The fixed `item_type` values are
+`datagram`, `audio`, `data`, `control`, and `event`. Queue values are
+`server_inbound`, `server_media`, `server_control`, `client_inbound`,
+`client_events`, `client_media`, and `client_control`. The implementation MUST
+reject any other label value.
 
 ## 5. Snapshot design
 
