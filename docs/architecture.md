@@ -76,7 +76,9 @@ Only the state owner can grant or release the floor. The first accepted
 `STREAM_REQUEST` in event order wins. A duplicate transaction returns its prior
 result. A second client receives `STREAM_BUSY`. A grant becomes active on the
 first valid audio or data packet. The first media packet establishes the initial
-48 kHz timestamp. Thus, a data packet can activate a granted stream.
+48 kHz stream position. Data does not advance that position. Audio advances it
+by the decoded sample count. Thus, a data packet can activate a granted stream,
+and the first later audio packet uses the established position.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
 inactivity timeout, and transmit time limit. Each release produces one monitor

@@ -45,10 +45,12 @@ one shared sequence space for the stream. The first media packet uses sequence
 zero. The value increases by one modulo 2^32 for each audio or data packet.
 
 The first media timestamp MAY have any value. This rule applies when the first
-media packet is audio or data. A first data packet establishes the initial
-stream position. Each later audio timestamp adds the number of decoded samples
-in the prior Opus packet at a 48 kHz clock. A data packet uses the most recent
-stream timestamp. Consecutive data packets can use the same timestamp.
+media packet is audio or data. The value establishes the current stream
+position. A data packet uses the current stream position and does not change it.
+The first audio packet uses the current stream position. After an audio packet
+with timestamp T and duration D, the current stream position becomes T plus D
+modulo 2^32. Thus, the next audio packet uses T plus D even when data packets
+occur between the audio packets.
 
 ### 3.1 Flags
 
@@ -87,7 +89,7 @@ have the length in the following table.
 | `0x0009` | Data type | 2-byte unsigned integer |
 | `0x000a` | Error code | 2-byte unsigned integer |
 | `0x000b` | Error text | 1-128 bytes of UTF-8 |
-| `0x000c` | Transmit time limit | 4-byte seconds value |
+| `0x000c` | Transmit time limit | 4-byte nonzero seconds value |
 | `0x000d` | End reason | 2-byte unsigned integer |
 
 A reflector ID uses uppercase ASCII, is left-aligned, and is padded with
@@ -156,7 +158,7 @@ an empty payload.
 | STREAM_START | Owner | Active stream | Zero | Zero | Node callsign, source callsign, transmit time limit | None | Empty |
 | STREAM_END request | Session | Active stream | Next sequence and current timestamp | RETRY on a retry only | Transaction ID | None | Empty |
 | STREAM_END response | Session | Ended stream | Request values | RESPONSE | Transaction ID, end reason | None | Empty |
-| STREAM_REVOKE | Owner | Ended stream | Next sequence and final timestamp | Zero | End reason | None | Empty |
+| STREAM_REVOKE | Owner | Ended stream | Next sequence and final timestamp; both zero after an unused grant | Zero | End reason | None | Empty |
 | AUDIO | Owner | Active stream | Current media values | Zero | None | Future optional TLVs | One Opus packet |
 | DATA | Owner | Active stream | Current media values | Zero | Data type | Future optional TLVs | Opaque data |
 
@@ -271,6 +273,9 @@ The owner sends `STREAM_END` to release the floor. The server acknowledges it
 with `STREAM_END` and `RESPONSE`, then sends `STREAM_REVOKE` to listeners. The
 server also sends `STREAM_REVOKE` after a timeout or owner disconnect. The end
 reason states why the server released the floor.
+
+If an unused grant expires, no media sequence or timestamp exists. The server
+sets both fields to zero in `STREAM_REVOKE` for this case.
 
 The server forwards only valid media from the floor owner's bound session and
 stream ID. It forwards the original sequence, timestamp, TLVs, and payload. It
