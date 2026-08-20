@@ -14,6 +14,7 @@ var (
 	ErrControlBackpressure     = errors.New("client control queue is full")
 	ErrNotConnected            = errors.New("client is not connected")
 	ErrStreamInactive          = errors.New("client stream is not active")
+	ErrConnectInProgress       = errors.New("client connection is in progress")
 )
 
 type EventKind uint8
@@ -96,20 +97,22 @@ type Client interface {
 
 // QueueClient applies queue and ownership rules around an injected sender.
 type QueueClient struct {
-	mu                    sync.Mutex
-	options               Options
-	sender                Sender
-	events                chan Event
-	media                 chan Outbound
-	control               chan Outbound
-	done                  chan struct{}
-	connected, stream     bool
-	requesting            bool
-	streamID, sequence    uint32
-	lastTimestamp         uint32
-	terminal, closeResult error
-	closeCalled           bool
-	once                  sync.Once
+	mu                                    sync.Mutex
+	options                               Options
+	sender                                Sender
+	events                                chan Event
+	media                                 chan Outbound
+	mediaProgress                         chan struct{}
+	control                               chan Outbound
+	done                                  chan struct{}
+	connected, connecting, stream, ending bool
+	requesting                            bool
+	streamID, sequence                    uint32
+	lastTimestamp                         uint32
+	mediaAccepted, mediaSent              uint64
+	terminal, closeResult                 error
+	closeCalled                           bool
+	once                                  sync.Once
 }
 
 func New(options Options, sender Sender) (*QueueClient, error) {
@@ -120,7 +123,7 @@ func New(options Options, sender Sender) (*QueueClient, error) {
 	if sender == nil {
 		return nil, errors.New("sender is required")
 	}
-	return &QueueClient{options: options, sender: sender, events: make(chan Event, options.ApplicationQueueEvents), media: make(chan Outbound, options.MediaSendQueueFrames), control: make(chan Outbound, options.ControlSendQueuePackets), done: make(chan struct{})}, nil
+	return &QueueClient{options: options, sender: sender, events: make(chan Event, options.ApplicationQueueEvents), media: make(chan Outbound, options.MediaSendQueueFrames), mediaProgress: make(chan struct{}, 1), control: make(chan Outbound, options.ControlSendQueuePackets), done: make(chan struct{})}, nil
 }
 func (c *QueueClient) Connect(ctx context.Context) error {
 	c.mu.Lock()
@@ -128,7 +131,13 @@ func (c *QueueClient) Connect(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if c.connecting {
+		c.mu.Unlock()
+		return ErrConnectInProgress
+	}
+	c.connecting = true
 	c.mu.Unlock()
+	defer func() { c.mu.Lock(); c.connecting = false; c.mu.Unlock() }()
 	if err := c.sender.Send(ctx, Outbound{Kind: EventStatus}); err != nil {
 		return err
 	}
@@ -151,7 +160,7 @@ func (c *QueueClient) requestStream(ctx context.Context, source string) error {
 		c.mu.Unlock()
 		return errors.New("source callsign is required")
 	}
-	if c.stream || c.requesting {
+	if c.stream || c.requesting || c.ending {
 		c.mu.Unlock()
 		return errors.New("stream request is already active")
 	}
@@ -206,6 +215,7 @@ func (c *QueueClient) enqueueMedia(out Outbound) error {
 	case c.media <- out:
 		c.sequence++
 		c.lastTimestamp = out.Timestamp
+		c.mediaAccepted++
 		c.mu.Unlock()
 		return nil
 	default:
@@ -230,8 +240,14 @@ func (c *QueueClient) EndStream(ctx context.Context) error {
 		return ErrStreamInactive
 	}
 	out := Outbound{Kind: EventStreamEnd, StreamID: c.streamID, Sequence: c.sequence, Timestamp: c.lastTimestamp}
+	target := c.mediaAccepted
 	c.stream = false
+	c.ending = true
 	c.mu.Unlock()
+	defer func() { c.mu.Lock(); c.ending = false; c.mu.Unlock() }()
+	if err := c.waitMedia(ctx, target); err != nil {
+		return err
+	}
 	if err := c.acquireControl(out); err != nil {
 		return err
 	}
@@ -249,8 +265,35 @@ func (c *QueueClient) run() {
 				c.fail(err)
 				return
 			}
+			c.mu.Lock()
+			c.mediaSent++
+			c.mu.Unlock()
+			select {
+			case c.mediaProgress <- struct{}{}:
+			default:
+			}
 		case <-c.done:
 			return
+		}
+	}
+}
+func (c *QueueClient) waitMedia(ctx context.Context, target uint64) error {
+	for {
+		c.mu.Lock()
+		sent, terminal := c.mediaSent, c.terminal
+		c.mu.Unlock()
+		if sent >= target {
+			return nil
+		}
+		if terminal != nil {
+			return terminal
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return c.Err()
+		case <-c.mediaProgress:
 		}
 	}
 }

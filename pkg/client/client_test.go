@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type memorySender struct {
@@ -18,6 +19,14 @@ type memorySender struct {
 type busySender struct{ memorySender }
 
 func (*busySender) RequestFloor(context.Context, Outbound) error { return ErrBusy }
+
+type blockingConnectSender struct{ entered, release chan struct{} }
+
+func (s *blockingConnectSender) Send(context.Context, Outbound) error {
+	close(s.entered)
+	<-s.release
+	return nil
+}
 
 func (m *memorySender) Send(_ context.Context, o Outbound) error {
 	if m.block != nil && (o.Kind == EventAudio || o.Kind == EventData) {
@@ -84,6 +93,30 @@ func TestMediaBackpressure(t *testing.T) {
 	}
 	_ = c.Close()
 }
+func TestEndWaitsForAcceptedMedia(t *testing.T) {
+	s := &memorySender{block: make(chan struct{}), entered: make(chan struct{})}
+	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	_ = c.Connect(context.Background())
+	_ = c.RequestStream(context.Background(), "N")
+	_ = c.SendAudio(context.Background(), 960, []byte{1})
+	<-s.entered
+	done := make(chan error, 1)
+	go func() { done <- c.EndStream(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("end passed blocked media: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(s.block)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sent[len(s.sent)-1].Kind != EventStreamEnd {
+		t.Fatalf("order: %#v", s.sent)
+	}
+}
 
 type blockingRequester struct {
 	memorySender
@@ -110,6 +143,21 @@ func TestConcurrentFloorRequestIsRejected(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
+}
+func TestConcurrentConnectIsRejected(t *testing.T) {
+	s := &blockingConnectSender{entered: make(chan struct{}), release: make(chan struct{})}
+	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	first := make(chan error, 1)
+	go func() { first <- c.Connect(context.Background()) }()
+	<-s.entered
+	if err := c.Connect(context.Background()); !errors.Is(err, ErrConnectInProgress) {
+		t.Fatalf("got %v", err)
+	}
+	close(s.release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
 }
 func TestPublishCopiesEventPayload(t *testing.T) {
 	s := &memorySender{}

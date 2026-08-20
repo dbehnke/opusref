@@ -3,12 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"github.com/dbehnke/opusref/pkg/monitor"
 	"github.com/dbehnke/opusref/pkg/wire"
 	"net"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -131,8 +134,10 @@ func TestReflectorReplaysDuplicateAndRejectsConflictingHello(t *testing.T) {
 	two, _ := wire.Callsign("N0TWO")
 	hello.Extensions[1].Value = two
 	sendPacket(t, c, serverConn.LocalAddr(), hello)
-	if got := readPacket(t, c); got.Header.Type != wire.PacketError {
-		t.Fatalf("got %v", got.Header.Type)
+	_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buffer := make([]byte, 1200)
+	if _, _, err := c.ReadFrom(buffer); err == nil {
+		t.Fatal("unauthenticated conflict received amplified response")
 	}
 }
 func TestDrainRejectsMalformedAndMismatchedAcknowledgements(t *testing.T) {
@@ -187,6 +192,179 @@ func TestOwnerControlOverloadNotifiesListeners(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("owner overload omitted revoke")
+	}
+}
+func TestProtectedHMACAdmissionAndRejection(t *testing.T) {
+	serverConn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer serverConn.Close()
+	r, _ := NewReflector(serverConn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", SharedKey: []byte("0123456789abcdef")})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+	defer r.Close()
+	admit := func(t *testing.T, valid bool) {
+		c, _ := net.ListenPacket("udp", "127.0.0.1:0")
+		defer c.Close()
+		tx := wire.Uint64TLV(wire.TLVTransactionID, 42)
+		nonce := bytes.Repeat([]byte{3}, 32)
+		call, _ := wire.Callsign("N0AUTH")
+		sendPacket(t, c, serverConn.LocalAddr(), wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketHello}, Extensions: []wire.TLV{tx, {Type: wire.TLVNodeCallsign, Value: call}, {Type: wire.TLVClientNonce, Value: nonce}}})
+		challenge := readPacket(t, c)
+		serverNonce, _ := wire.Find(challenge, wire.TLVServerNonce)
+		id, _ := wire.Find(challenge, wire.TLVReflectorID)
+		mac := hmac.New(sha256.New, []byte("0123456789abcdef"))
+		mac.Write([]byte("OPRF-AUTH-V1"))
+		mac.Write(call)
+		mac.Write(nonce)
+		mac.Write(serverNonce)
+		mac.Write(id)
+		tag := mac.Sum(nil)
+		if !valid {
+			tag[0] ^= 1
+		}
+		sendPacket(t, c, serverConn.LocalAddr(), wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAuthenticate}, Extensions: []wire.TLV{tx, {Type: wire.TLVClientNonce, Value: nonce}, {Type: wire.TLVServerNonce, Value: serverNonce}, {Type: wire.TLVAuthenticationTag, Value: tag}}})
+		_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		buffer := make([]byte, 1200)
+		n, _, err := c.ReadFrom(buffer)
+		if valid {
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, _ := wire.Decode(buffer[:n])
+			if p.Header.Type != wire.PacketWelcome {
+				t.Fatalf("got %v", p.Header.Type)
+			}
+		} else if err == nil {
+			t.Fatal("invalid HMAC admitted")
+		}
+	}
+	t.Run("valid", func(t *testing.T) { admit(t, true) })
+	t.Run("invalid", func(t *testing.T) { admit(t, false) })
+}
+func TestUnauthenticatedMinimalPacketIsSilent(t *testing.T) {
+	serverConn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer serverConn.Close()
+	r, _ := NewReflector(serverConn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+	defer r.Close()
+	c, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer c.Close()
+	packet, _ := wire.Encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketHello}})
+	if _, err := c.WriteTo(packet, serverConn.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, _, err := c.ReadFrom(make([]byte, 1200)); err == nil {
+		t.Fatal("minimal unauthenticated packet received a response")
+	}
+}
+func TestChallengeExpiryUsesInjectedClock(t *testing.T) {
+	var unix atomic.Int64
+	unix.Store(100)
+	serverConn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer serverConn.Close()
+	r, _ := NewReflector(serverConn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Clock: func() time.Time { return time.Unix(unix.Load(), 0) }})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+	defer r.Close()
+	c, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer c.Close()
+	tx := wire.Uint64TLV(wire.TLVTransactionID, 5)
+	nonce := bytes.Repeat([]byte{4}, 32)
+	call, _ := wire.Callsign("N0TIME")
+	sendPacket(t, c, serverConn.LocalAddr(), wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketHello}, Extensions: []wire.TLV{tx, {Type: wire.TLVNodeCallsign, Value: call}, {Type: wire.TLVClientNonce, Value: nonce}}})
+	challenge := readPacket(t, c)
+	sn, _ := wire.Find(challenge, wire.TLVServerNonce)
+	unix.Add(11)
+	sendPacket(t, c, serverConn.LocalAddr(), wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAuthenticate}, Extensions: []wire.TLV{tx, {Type: wire.TLVClientNonce, Value: nonce}, {Type: wire.TLVServerNonce, Value: sn}}})
+	_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := c.ReadFrom(make([]byte, 1200)); err == nil {
+		t.Fatal("expired challenge admitted")
+	}
+}
+func TestRejectedStatefulPacketDoesNotRefreshActivity(t *testing.T) {
+	now := time.Unix(100, 0)
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Clock: func() time.Time { return now }, Limits: Limits{SessionTimeout: 5 * time.Second}})
+	ownerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}
+	badAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2}
+	r.engine.AddSession(1, ownerAddr.String(), "N0ONE", true)
+	r.engine.AddSession(2, badAddr.String(), "N0BAD", true)
+	r.engine.RequestFloor(1, 7, "N0ONE")
+	r.peers[2] = &peer{id: 2, address: badAddr, node: "N0BAD", ready: true, connected: now, last: now}
+	p := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: 2, StreamID: 7}, Payload: []byte{1}}
+	data, _ := wire.Encode(p)
+	now = now.Add(4 * time.Second)
+	r.handle(badAddr, data)
+	ack := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamStart, Flags: wire.FlagResponse, SessionID: 2, StreamID: 7}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 9)}}
+	ackData, _ := wire.Encode(ack)
+	r.handle(badAddr, ackData)
+	now = now.Add(2 * time.Second)
+	r.tick(false)
+	if r.peers[2] != nil {
+		t.Fatal("invalid media refreshed session")
+	}
+}
+func TestInvalidStreamEndReturnsBoundedError(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test"})
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}
+	r.engine.AddSession(1, addr.String(), "N", true)
+	r.engine.RequestFloor(1, 7, "N")
+	p := &peer{id: 1, address: addr, ready: true}
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamEnd, SessionID: 1, StreamID: 8}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 1)}}
+	response := r.control(p, request)
+	encodedRequest, _ := wire.Encode(request)
+	encodedResponse, _ := wire.Encode(response)
+	if response.Header.Type != wire.PacketError || len(encodedResponse) > len(encodedRequest) || !r.engine.Snapshot().Floor.Active {
+		t.Fatalf("response=%#v sizes=%d/%d", response, len(encodedResponse), len(encodedRequest))
+	}
+}
+func TestDuplicateReplayControlOverloadClosesSession(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", OutboundControlQueuePackets: 1})
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}
+	r.engine.AddSession(1, addr.String(), "N", false)
+	r.peers[1] = &peer{id: 1, address: addr}
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketKeepalive, SessionID: 1}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 1)}}
+	if !r.transact(addr, request, func() wire.Packet { return r.control(r.peers[1], request) }) {
+		t.Fatal("first request failed")
+	}
+	if r.transact(addr, request, func() wire.Packet { return wire.Packet{} }) {
+		t.Fatal("overloaded duplicate accepted")
+	}
+	if r.peers[1] != nil || r.transport.ControlFailures.Load() != 1 {
+		t.Fatal("overload did not close admitted session")
+	}
+}
+func TestInjectedClockControlsChallengeRetentionAndNotificationRetry(t *testing.T) {
+	now := time.Unix(100, 0)
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Clock: func() time.Time { return now }, Limits: Limits{SessionTimeout: time.Hour}})
+	r.challenges["old"] = challenge{at: now}
+	r.transactions["old"] = completed{at: now}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}
+	listener := &peer{id: 1, address: addr, last: now}
+	r.peers[1] = listener
+	notice := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: 1}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 9)}}
+	r.startNotification(listener, notice)
+	key := notificationKey{listener: 1, typ: wire.PacketDisconnect, tx: 9}
+	now = now.Add(600 * time.Millisecond)
+	r.tick(false)
+	if r.pending[key].attempt != 2 {
+		t.Fatalf("notification attempt=%d", r.pending[key].attempt)
+	}
+	now = now.Add(31 * time.Second)
+	r.tick(false)
+	if len(r.challenges) != 0 || len(r.transactions) != 0 {
+		t.Fatal("retention ignored injected clock")
 	}
 }
 

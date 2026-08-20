@@ -18,19 +18,20 @@ import (
 var ErrBusy = errors.New("reflector floor is busy")
 
 type udpSender struct {
-	conn               *net.UDPConn
-	options            Options
-	owner              *QueueClient
-	session            uint64
-	writeMu, pendingMu sync.Mutex
-	pending            map[requestKey]pendingRequest
-	inbound            chan []byte
-	closed             atomic.Bool
-	inboundDrops       atomic.Uint64
-	remoteStream       uint32
-	remoteLast         time.Time
-	remoteMu           sync.Mutex
-	controlTokens      chan struct{}
+	conn                      *net.UDPConn
+	options                   Options
+	owner                     *QueueClient
+	session                   uint64
+	writeMu, pendingMu        sync.Mutex
+	pending                   map[requestKey]pendingRequest
+	inbound                   chan []byte
+	closed                    atomic.Bool
+	inboundDrops              atomic.Uint64
+	remote                    remoteStream
+	retired                   [8]remoteKey
+	retiredCount, retiredNext int
+	remoteMu                  sync.Mutex
+	controlTokens             chan struct{}
 }
 type requestKey struct {
 	tx     uint64
@@ -39,6 +40,15 @@ type requestKey struct {
 type pendingRequest struct {
 	responses chan wire.Packet
 	types     map[wire.PacketType]bool
+}
+type remoteStream struct {
+	owner     uint64
+	stream    uint32
+	lastMedia time.Time
+}
+type remoteKey struct {
+	owner  uint64
+	stream uint32
 }
 
 func (s *udpSender) Close() error {
@@ -182,37 +192,45 @@ func (s *udpSender) exchange(ctx context.Context, p wire.Packet, want wire.Packe
 		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 			deadline = d
 		}
-		_ = s.conn.SetReadDeadline(deadline)
-		buf := make([]byte, wire.MaxDatagramSize+1)
-		n, err := s.conn.Read(buf)
-		if err != nil {
-			if ctx.Err() != nil {
-				return wire.Packet{}, ctx.Err()
+		for {
+			if !time.Now().Before(deadline) {
+				break
 			}
-			continue
+			_ = s.conn.SetReadDeadline(deadline)
+			buf := make([]byte, wire.MaxDatagramSize+1)
+			n, err := s.conn.Read(buf)
+			if err != nil {
+				if ctx.Err() != nil {
+					return wire.Packet{}, ctx.Err()
+				}
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					break
+				}
+				continue
+			}
+			if n > wire.MaxDatagramSize {
+				continue
+			}
+			reply, err := wire.Decode(buf[:n])
+			if err != nil {
+				continue
+			}
+			phase := wire.PreAdmission
+			if want == wire.PacketKeepalive {
+				phase = wire.Connected
+			}
+			if wire.Validate(reply, wire.ValidationContext{Direction: wire.ServerToClient, Phase: phase}) != nil || reply.Header.Type != want {
+				continue
+			}
+			if want == wire.PacketKeepalive && reply.Header.SessionID != s.session {
+				continue
+			}
+			raw, ok := wire.Find(reply, wire.TLVTransactionID)
+			if !ok || binary.BigEndian.Uint64(raw) != tx {
+				continue
+			}
+			return reply, nil
 		}
-		if n > wire.MaxDatagramSize {
-			continue
-		}
-		reply, err := wire.Decode(buf[:n])
-		if err != nil {
-			continue
-		}
-		phase := wire.PreAdmission
-		if want == wire.PacketKeepalive {
-			phase = wire.Connected
-		}
-		if wire.Validate(reply, wire.ValidationContext{Direction: wire.ServerToClient, Phase: phase}) != nil || reply.Header.Type != want {
-			continue
-		}
-		if want == wire.PacketKeepalive && reply.Header.SessionID != s.session {
-			continue
-		}
-		raw, ok := wire.Find(reply, wire.TLVTransactionID)
-		if !ok || binary.BigEndian.Uint64(raw) != tx {
-			continue
-		}
-		return reply, nil
 	}
 	return wire.Packet{}, errors.New("protocol request timed out")
 }
@@ -283,13 +301,6 @@ func (s *udpSender) readLoop() {
 				return
 			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				s.remoteMu.Lock()
-				if s.remoteStream != 0 && time.Since(s.remoteLast) > 2*time.Second {
-					stream := s.remoteStream
-					s.remoteStream = 0
-					_ = s.owner.Publish(Event{Kind: EventStreamEnd, StreamID: stream, Message: "receive state expired"})
-				}
-				s.remoteMu.Unlock()
 				continue
 			}
 			s.owner.fail(err)
@@ -310,10 +321,15 @@ func (s *udpSender) enqueueInbound(data []byte) {
 	}
 }
 func (s *udpSender) processLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		var data []byte
 		select {
 		case data = <-s.inbound:
+		case <-ticker.C:
+			s.expireRemote(time.Now())
+			continue
 		case <-s.owner.Done():
 			return
 		}
@@ -344,30 +360,37 @@ func (s *udpSender) processLoop() {
 		s.remoteMu.Lock()
 		switch p.Header.Type {
 		case wire.PacketAudio:
-			if s.remoteStream != p.Header.StreamID {
+			if s.remote.owner != p.Header.SessionID || s.remote.stream != p.Header.StreamID {
 				s.remoteMu.Unlock()
 				continue
 			}
-			s.remoteLast = time.Now()
+			s.remote.lastMedia = time.Now()
 			event.Kind = EventAudio
 		case wire.PacketData:
-			if s.remoteStream != p.Header.StreamID {
+			if s.remote.owner != p.Header.SessionID || s.remote.stream != p.Header.StreamID {
 				s.remoteMu.Unlock()
 				continue
 			}
-			s.remoteLast = time.Now()
+			s.remote.lastMedia = time.Now()
 			event.Kind = EventData
 			if raw, ok := wire.Find(p, wire.TLVDataType); ok {
 				event.DataType = binary.BigEndian.Uint16(raw)
 			}
 		case wire.PacketStreamStart:
 			s.ack(p)
-			if s.remoteStream == p.Header.StreamID {
+			key := remoteKey{p.Header.SessionID, p.Header.StreamID}
+			if s.remote.owner == key.owner && s.remote.stream == key.stream {
 				s.remoteMu.Unlock()
 				continue
 			}
-			s.remoteStream = p.Header.StreamID
-			s.remoteLast = time.Now()
+			if s.isRetiredLocked(key) {
+				s.remoteMu.Unlock()
+				continue
+			}
+			if s.remote.stream != 0 {
+				s.retireLocked(remoteKey{s.remote.owner, s.remote.stream})
+			}
+			s.remote = remoteStream{owner: p.Header.SessionID, stream: p.Header.StreamID, lastMedia: time.Now()}
 			event.Kind = EventStreamStart
 			if v, ok := wire.Find(p, wire.TLVNodeCallsign); ok {
 				event.NodeCallsign = strings.TrimSpace(string(v))
@@ -377,13 +400,16 @@ func (s *udpSender) processLoop() {
 			}
 		case wire.PacketStreamRevoke:
 			s.ack(p)
-			local := s.owner.revoke(p.Header.StreamID)
-			if s.remoteStream != p.Header.StreamID && !local {
+			local := p.Header.SessionID == s.session && s.owner.revoke(p.Header.StreamID)
+			key := remoteKey{p.Header.SessionID, p.Header.StreamID}
+			matches := s.remote.owner == key.owner && s.remote.stream == key.stream
+			s.retireLocked(key)
+			if !matches && !local {
 				s.remoteMu.Unlock()
 				continue
 			}
-			if s.remoteStream == p.Header.StreamID {
-				s.remoteStream = 0
+			if matches {
+				s.remote = remoteStream{}
 			}
 			event.Kind = EventStreamEnd
 		case wire.PacketDisconnect:
@@ -400,6 +426,38 @@ func (s *udpSender) processLoop() {
 		s.remoteMu.Unlock()
 		_ = s.owner.Publish(event)
 	}
+}
+func (s *udpSender) expireRemote(now time.Time) {
+	s.remoteMu.Lock()
+	if s.remote.stream == 0 || now.Sub(s.remote.lastMedia) <= 2*time.Second {
+		s.remoteMu.Unlock()
+		return
+	}
+	expired := s.remote
+	s.retireLocked(remoteKey{expired.owner, expired.stream})
+	s.remote = remoteStream{}
+	s.remoteMu.Unlock()
+	_ = s.owner.Publish(Event{Kind: EventStreamEnd, SessionID: expired.owner, StreamID: expired.stream, Message: "receive state expired"})
+}
+func (s *udpSender) isRetiredLocked(key remoteKey) bool {
+	for index := 0; index < s.retiredCount; index++ {
+		if s.retired[index] == key {
+			return true
+		}
+	}
+	return false
+}
+func (s *udpSender) retireLocked(key remoteKey) {
+	if key.stream == 0 || s.isRetiredLocked(key) {
+		return
+	}
+	if s.retiredCount < len(s.retired) {
+		s.retired[s.retiredCount] = key
+		s.retiredCount++
+		return
+	}
+	s.retired[s.retiredNext] = key
+	s.retiredNext = (s.retiredNext + 1) % len(s.retired)
 }
 func (s *udpSender) ack(p wire.Packet) {
 	tx, ok := wire.Find(p, wire.TLVTransactionID)

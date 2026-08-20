@@ -122,3 +122,36 @@ func TestShutdownRejectsNewWorkAndReleasesFloor(t *testing.T) {
 		t.Fatal("bad shutdown snapshot")
 	}
 }
+func TestEndRequiresOwnerAndExactStream(t *testing.T) {
+	e := NewEngine(Limits{}, time.Now)
+	e.AddSession(1, "a", "N0ONE", true)
+	e.AddSession(2, "b", "N0TWO", true)
+	e.RequestFloor(1, 7, "N0ONE")
+	if _, err := e.End(1, 8, 0, 0, EndNormal); err != ErrInvalidStream {
+		t.Fatalf("wrong stream: %v", err)
+	}
+	if _, err := e.End(2, 7, 0, 0, EndNormal); err != ErrInvalidStream {
+		t.Fatalf("wrong owner: %v", err)
+	}
+	if !e.Snapshot().Floor.Active {
+		t.Fatal("invalid end released floor")
+	}
+	if end, err := e.End(1, 7, 0, 0, EndNormal); err != nil || end.StreamID != 7 {
+		t.Fatalf("valid end: %#v %v", end, err)
+	}
+}
+func TestEndRequiresCurrentSequenceAndTimestamp(t *testing.T) {
+	e := NewEngine(Limits{}, time.Now)
+	e.AddSession(1, "a", "N", true)
+	e.RequestFloor(1, 7, "N")
+	_, _ = e.Media(1, "a", 7, 0, 48000, []byte{1})
+	if _, err := e.End(1, 7, 0, 48000, EndNormal); err != ErrInvalidStream {
+		t.Fatalf("accepted stale sequence: %v", err)
+	}
+	if _, err := e.End(1, 7, 1, 1, EndNormal); err != ErrInvalidStream {
+		t.Fatalf("accepted stale timestamp: %v", err)
+	}
+	if _, err := e.End(1, 7, 1, 48000, EndNormal); err != nil {
+		t.Fatal(err)
+	}
+}

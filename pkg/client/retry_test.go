@@ -87,6 +87,90 @@ func TestInboundDatagramQueueIsBounded(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+func TestHandshakeIgnoresUnrelatedPacketUntilRetryDeadline(t *testing.T) {
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	defer serverConn.Close()
+	clientConn, _ := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	defer clientConn.Close()
+	s := &udpSender{conn: clientConn}
+	tx := uint64(9)
+	times := make(chan time.Time, 2)
+	go func() {
+		buf := make([]byte, 1200)
+		for attempt := 0; attempt < 2; attempt++ {
+			n, addr, _ := serverConn.ReadFromUDP(buf)
+			_, _ = wire.Decode(buf[:n])
+			times <- time.Now()
+			value := tx
+			if attempt == 0 {
+				value++
+			}
+			id, _ := wire.ReflectorID("OPUSREF")
+			_ = sendUDP(serverConn, addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketChallenge, Flags: wire.FlagResponse}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, value), {Type: wire.TLVServerNonce, Value: make([]byte, 32)}, {Type: wire.TLVReflectorID, Value: id}, {Type: wire.TLVDisplayName, Value: []byte("test")}}})
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketHello}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx)}}
+	if _, err := s.exchange(ctx, p, wire.PacketChallenge, tx); err != nil {
+		t.Fatal(err)
+	}
+	first, second := <-times, <-times
+	if elapsed := second.Sub(first); elapsed < 400*time.Millisecond {
+		t.Fatalf("unrelated packet accelerated retry: %s", elapsed)
+	}
+}
+func TestReceiveStateUsesOwnerAndStreamIdentity(t *testing.T) {
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	defer serverConn.Close()
+	clientConn, _ := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	s := &udpSender{conn: clientConn, session: 99, pending: map[requestKey]pendingRequest{}, inbound: make(chan []byte, 8), controlTokens: make(chan struct{}, 1)}
+	owner, _ := New(Options{ServerAddress: "x", NodeCallsign: "N0LISTEN"}, s)
+	s.owner = owner
+	go s.processLoop()
+	defer owner.Close()
+	call, _ := wire.Callsign("N0OWNER")
+	source, _ := wire.Callsign("N0SRC")
+	start := func(session uint64) wire.Packet {
+		return wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamStart, SessionID: session, StreamID: 7}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, session), {Type: wire.TLVNodeCallsign, Value: call}, {Type: wire.TLVSourceCallsign, Value: source}, wire.Uint32TLV(wire.TLVTransmitTimeLimit, 180)}}
+	}
+	encode := func(p wire.Packet) []byte { data, _ := wire.Encode(p); return data }
+	s.enqueueInbound(encode(start(11)))
+	if event := <-owner.Events(); event.SessionID != 11 {
+		t.Fatalf("first start: %#v", event)
+	}
+	s.enqueueInbound(encode(start(22)))
+	if event := <-owner.Events(); event.SessionID != 22 {
+		t.Fatalf("turnover start suppressed: %#v", event)
+	}
+	oldRevoke := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, SessionID: 11, StreamID: 7}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 77), wire.Uint16TLV(wire.TLVEndReason, 0)}}
+	s.enqueueInbound(encode(oldRevoke))
+	s.enqueueInbound(encode(start(11)))
+	s.enqueueInbound(encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: 11, StreamID: 7}, Payload: []byte{9}}))
+	s.enqueueInbound(encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: 22, StreamID: 7}, Payload: []byte{1}}))
+	select {
+	case event := <-owner.Events():
+		if event.Kind != EventAudio || event.SessionID != 22 {
+			t.Fatalf("stale revoke changed owner: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new owner media rejected")
+	}
+}
+func TestRemoteExpiryUsesItsOwnLastMediaTime(t *testing.T) {
+	s := &udpSender{remote: remoteStream{owner: 11, stream: 7, lastMedia: time.Unix(1, 0)}}
+	owner, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	s.owner = owner
+	s.expireRemote(time.Unix(4, 0))
+	select {
+	case event := <-owner.Events():
+		if event.SessionID != 11 || event.StreamID != 7 {
+			t.Fatalf("expiry: %#v", event)
+		}
+	default:
+		t.Fatal("remote did not expire")
+	}
+}
 func sendUDP(conn *net.UDPConn, addr *net.UDPAddr, p wire.Packet) error {
 	data, err := wire.Encode(p)
 	if err != nil {

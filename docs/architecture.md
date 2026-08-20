@@ -92,8 +92,9 @@ event and one listener revoke operation.
 
 ## 5. Client architecture
 
-The client package accepts a packet transport, clock, random source, and event
-sink. It owns one connection state machine and at most one local stream. It
+The client package accepts an injected sender for unit tests. Its UDP adapter
+owns the socket, secure random source, receive timer, and event sink. It owns one
+connection state machine and at most one local stream. It
 performs control retries and keepalives. It exposes received stream metadata,
 opaque audio, typed data, busy, revoke, and error events.
 
@@ -109,6 +110,12 @@ a response with a different session ID, stream ID, packet type, or transaction
 ID. It rejects overlapping floor requests. It advances sequence and timestamp
 state only after it accepts a frame into the bounded send queue. It acknowledges
 each notification retry and publishes one lifecycle event for the state change.
+Before it sends `STREAM_END`, it waits until the transport has sent every
+accepted media frame. This preserves media, sequence, and timestamp order.
+
+One connect attempt owns the pre-admission socket reader. The client rejects a
+concurrent connect attempt. An unrelated datagram does not advance the retry
+schedule. The reader continues until the current attempt deadline.
 
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send
@@ -131,6 +138,14 @@ datagram queue. It drops a new datagram when this queue is full. If a required
 lifecycle event cannot enter the application queue, the client closes its UDP
 transport and reports a terminal error.
 
+If the server cannot enqueue a required control response or a retained duplicate
+response, it closes the admitted session. If that session owns the floor, the
+server sends owner-disconnect revoke semantics to the listeners.
+
+The receive state identity contains the owner session ID and stream ID. A
+periodic receive-state timer uses the last-media time for that stream. Unrelated
+socket traffic does not delay expiry.
+
 ```mermaid
 sequenceDiagram
     participant Command
@@ -150,6 +165,10 @@ sequenceDiagram
 The server reads YAML once at startup. It validates all addresses, limits,
 identifiers, and timer relationships before it opens a socket. Defaults match
 `config.example.yaml`.
+
+The live reflector supplies one clock to the engine, challenges, retained
+transactions, notification retries, session timeouts, and monitoring snapshots.
+Tests replace this clock to control policy time.
 
 An environment variable has priority over a shared-key file. The server uses the
 UTF-8 bytes of a nonempty environment value. If the environment variable is not

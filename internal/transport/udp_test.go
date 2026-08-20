@@ -1,8 +1,10 @@
 package transport
 
 import (
+	"context"
 	"net"
 	"testing"
+	"time"
 )
 
 type addr string
@@ -30,5 +32,33 @@ func TestBoundedQueuesCountDropsAndCopy(t *testing.T) {
 	}
 	if u.ControlFailures.Load() != 1 {
 		t.Fatal("control counter")
+	}
+}
+func TestLiveUDPReadDropsWhenInboundQueueIsFull(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	u := NewUDP(conn, 1, 1, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = u.Read(ctx, 1201) }()
+	client, err := net.Dial("udp", conn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	for index := 0; index < 100; index++ {
+		if _, err = client.Write([]byte{byte(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for u.InboundDrops.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(u.Inbound) != 1 || u.InboundDrops.Load() == 0 {
+		t.Fatalf("queue=%d drops=%d", len(u.Inbound), u.InboundDrops.Load())
 	}
 }

@@ -25,6 +25,7 @@ type ReflectorOptions struct {
 	SharedKey                                                                                                                                                                                       []byte
 	Limits                                                                                                                                                                                          Limits
 	Random                                                                                                                                                                                          io.Reader
+	Clock                                                                                                                                                                                           func() time.Time
 	InboundQueuePackets, OutboundControlQueuePackets, OutboundMediaQueueFrames, MaxPendingChallenges, MaxPendingNotifications, MaxPendingNotificationsPerClient, MaxCompletedTransactionsPerSession int
 	MaxDatagramBytes                                                                                                                                                                                int
 	ShutdownGrace                                                                                                                                                                                   time.Duration
@@ -42,6 +43,9 @@ type EventRecord struct {
 func (o ReflectorOptions) defaults() ReflectorOptions {
 	if o.Random == nil {
 		o.Random = rand.Reader
+	}
+	if o.Clock == nil {
+		o.Clock = time.Now
 	}
 	if o.InboundQueuePackets == 0 {
 		o.InboundQueuePackets = 256
@@ -141,7 +145,7 @@ func NewReflector(conn net.PacketConn, options ReflectorOptions) (*Reflector, er
 	if options.MaxDatagramBytes < wire.BaseHeaderSize || options.MaxDatagramBytes > wire.MaxDatagramSize {
 		return nil, errors.New("maximum datagram size is invalid")
 	}
-	r := &Reflector{conn: conn, options: options, engine: NewEngine(options.Limits, time.Now), transport: transport.NewUDP(conn, options.InboundQueuePackets, options.OutboundControlQueuePackets, options.OutboundMediaQueueFrames), challenges: map[string]challenge{}, peers: map[uint64]*peer{}, transactions: map[string]completed{}, pending: map[notificationKey]*notification{}}
+	r := &Reflector{conn: conn, options: options, engine: NewEngine(options.Limits, options.Clock), transport: transport.NewUDP(conn, options.InboundQueuePackets, options.OutboundControlQueuePackets, options.OutboundMediaQueueFrames), challenges: map[string]challenge{}, peers: map[uint64]*peer{}, transactions: map[string]completed{}, pending: map[notificationKey]*notification{}}
 	r.publish()
 	return r, nil
 }
@@ -181,8 +185,9 @@ func (r *Reflector) drain(ctx context.Context) error {
 		r.notifyEnd(end)
 	}
 	r.publish()
-	deadline := time.Now().Add(r.options.ShutdownGrace)
-	r.drainPending(deadline)
+	drainCtx, cancel := context.WithTimeout(ctx, r.options.ShutdownGrace)
+	defer cancel()
+	r.drainPending(drainCtx)
 	if len(r.pending) > 0 {
 		r.metric("opusref_timeouts_total", map[string]string{"kind": "shutdown"}, 1)
 	}
@@ -190,16 +195,18 @@ func (r *Reflector) drain(ctx context.Context) error {
 		packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: p.id}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, r.transactionID())}}
 		r.startNotification(p, packet)
 	}
-	r.drainPending(deadline)
+	r.drainPending(drainCtx)
 	select {
 	case <-time.After(25 * time.Millisecond):
 	case <-ctx.Done():
 	}
 	return nil
 }
-func (r *Reflector) drainPending(deadline time.Time) {
-	for time.Now().Before(deadline) && len(r.pending) > 0 {
+func (r *Reflector) drainPending(ctx context.Context) {
+	for len(r.pending) > 0 {
 		select {
+		case <-ctx.Done():
+			return
 		case d := <-r.transport.Inbound:
 			r.handleDrain(d.Address, d.Data)
 		case <-time.After(50 * time.Millisecond):
@@ -261,15 +268,18 @@ func (r *Reflector) handle(addr net.Addr, data []byte) {
 		r.event("malformed_packet", "warn", nil)
 		return
 	}
-	peer.last = time.Now()
-	r.engine.Touch(peer.id, addr.String())
+	accepted := false
 	switch p.Header.Type {
 	case wire.PacketKeepalive, wire.PacketDisconnect, wire.PacketStreamRequest, wire.PacketStreamEnd:
-		r.transact(addr, p, func() wire.Packet { return r.control(peer, p) })
+		accepted = r.transact(addr, p, func() wire.Packet { return r.control(peer, p) })
 	case wire.PacketStreamStart, wire.PacketStreamRevoke:
-		r.ack(peer, p)
+		accepted = r.ack(peer, p)
 	case wire.PacketAudio, wire.PacketData:
-		r.media(peer, p, data)
+		accepted = r.media(peer, p, data)
+	}
+	if accepted && r.peers[peer.id] != nil {
+		peer.last = r.options.Clock()
+		r.engine.Touch(peer.id, addr.String())
 	}
 }
 func (r *Reflector) handleDrain(addr net.Addr, data []byte) {
@@ -293,10 +303,10 @@ func (r *Reflector) handleDrain(addr net.Addr, data []byte) {
 		r.transact(addr, p, func() wire.Packet { return r.control(peer, p) })
 	}
 }
-func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Packet) {
+func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Packet) bool {
 	tx, ok := wire.Find(p, wire.TLVTransactionID)
 	if !ok {
-		return
+		return false
 	}
 	key := r.transactionKey(addr, p, binary.BigEndian.Uint64(tx))
 	normalized := p
@@ -305,17 +315,22 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 	fingerprint, _ := wire.Encode(normalized)
 	if old, ok := r.transactions[key]; ok {
 		if bytes.Equal(old.fingerprint, fingerprint) {
-			r.enqueueRaw(addr, old.response)
+			if !r.enqueueRaw(addr, old.response) {
+				r.replayOverload(addr, old.response)
+				return false
+			}
+			response, err := wire.Decode(old.response)
+			return err == nil && response.Header.Type != wire.PacketError
 		} else {
 			r.metric("opusref_packet_errors_total", map[string]string{"reason": "transaction_conflict"}, 1)
 			r.sendError(addr, p, wire.ErrorMalformedPacket)
 		}
-		return
+		return false
 	}
 	if len(r.transactions) >= r.engine.limits.MaxCompletedTransactions {
 		r.metric("opusref_packet_errors_total", map[string]string{"reason": "limit_exceeded"}, 1)
 		r.sendError(addr, p, wire.ErrorLimitExceeded)
-		return
+		return false
 	}
 	if p.Header.SessionID != 0 {
 		prefix := fmt.Sprintf("%d/", p.Header.SessionID)
@@ -328,18 +343,18 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 		if count >= r.options.MaxCompletedTransactionsPerSession {
 			r.metric("opusref_packet_errors_total", map[string]string{"reason": "limit_exceeded"}, 1)
 			r.sendError(addr, p, wire.ErrorLimitExceeded)
-			return
+			return false
 		}
 	}
 	response := apply()
 	if response.Header.Type == 0 {
-		return
+		return false
 	}
 	data, err := wire.Encode(response)
 	if err != nil {
-		return
+		return false
 	}
-	r.transactions[key] = completed{fingerprint, data, time.Now()}
+	r.transactions[key] = completed{fingerprint, data, r.options.Clock()}
 	if !r.enqueueRaw(addr, data) {
 		delete(r.transactions, key)
 		if p.Header.SessionID == 0 {
@@ -357,12 +372,23 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 		} else if peer := r.peers[p.Header.SessionID]; peer != nil {
 			r.controlOverload(peer)
 		}
+		return false
 	} else if p.Header.Type == wire.PacketKeepalive && p.Header.SessionID != 0 {
 		if peer := r.peers[p.Header.SessionID]; peer != nil {
 			if floor := r.engine.Snapshot().Floor; floor.Active && floor.SessionID != peer.id && !peer.notified {
 				r.notifyStart(peer, floor)
 			}
 		}
+	}
+	return response.Header.Type != wire.PacketError
+}
+func (r *Reflector) replayOverload(addr net.Addr, response []byte) {
+	p, err := wire.Decode(response)
+	if err != nil || p.Header.SessionID == 0 {
+		return
+	}
+	if peer := r.peers[p.Header.SessionID]; peer != nil && peer.address.String() == addr.String() {
+		r.controlOverload(peer)
 	}
 }
 func (r *Reflector) transactionKey(addr net.Addr, p wire.Packet, tx uint64) string {
@@ -388,7 +414,7 @@ func (r *Reflector) hello(addr net.Addr, p wire.Packet) wire.Packet {
 	if _, err := io.ReadFull(r.options.Random, server); err != nil {
 		return wire.Packet{}
 	}
-	r.challenges[key] = challenge{strings.TrimSpace(string(node)), client, server, time.Now()}
+	r.challenges[key] = challenge{strings.TrimSpace(string(node)), client, server, r.options.Clock()}
 	id, _ := wire.ReflectorID(r.options.ID)
 	return wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketChallenge, Flags: wire.FlagResponse}, Extensions: []wire.TLV{{Type: wire.TLVTransactionID, Value: tx}, {Type: wire.TLVServerNonce, Value: server}, {Type: wire.TLVReflectorID, Value: id}, {Type: wire.TLVDisplayName, Value: []byte(r.options.DisplayName)}}}
 }
@@ -396,7 +422,7 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 	tx, _ := wire.Find(p, wire.TLVTransactionID)
 	key := addr.String() + string(tx)
 	c, ok := r.challenges[key]
-	if !ok || time.Since(c.at) > 10*time.Second {
+	if !ok || r.options.Clock().Sub(c.at) > 10*time.Second {
 		return wire.Packet{}
 	}
 	client, _ := wire.Find(p, wire.TLVClientNonce)
@@ -449,7 +475,7 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 			}
 			r.metric("opusref_authentication_total", map[string]string{"result": "accepted", "mode": mode}, 1)
 			r.event("client_connected", "info", map[string]any{"session_id": sid, "node_callsign": c.node})
-			now := time.Now()
+			now := r.options.Clock()
 			r.peers[sid] = &peer{sid, addr, c.node, false, false, false, now, now}
 			delete(r.challenges, key)
 			id, _ := wire.ReflectorID(r.options.ID)
@@ -492,12 +518,27 @@ func (r *Reflector) control(p *peer, packet wire.Packet) wire.Packet {
 			base.Type = wire.PacketStreamBusy
 		}
 	case wire.PacketStreamEnd:
-		if end := r.engine.End(p.id, EndNormal); end != nil {
-			r.notifyEnd(end)
+		end, err := r.engine.End(p.id, packet.Header.StreamID, packet.Header.Sequence, packet.Header.Timestamp, EndNormal)
+		if err != nil {
+			return r.errorResponse(packet, wire.ErrorInvalidStream)
 		}
+		r.notifyEnd(end)
 		ext = append(ext, wire.Uint16TLV(wire.TLVEndReason, uint16(wire.EndReasonNormal)))
 	}
 	return wire.Packet{Header: base, Extensions: ext}
+}
+func (r *Reflector) errorResponse(request wire.Packet, code wire.ErrorCode) wire.Packet {
+	ext := []wire.TLV{wire.Uint16TLV(wire.TLVErrorCode, uint16(code))}
+	if tx, ok := wire.Find(request, wire.TLVTransactionID); ok {
+		ext = append(ext, wire.TLV{Type: wire.TLVTransactionID, Value: tx})
+	}
+	response := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketError, Flags: wire.FlagResponse, SessionID: request.Header.SessionID, StreamID: request.Header.StreamID}, Extensions: ext}
+	encoded, _ := wire.Encode(response)
+	original, _ := wire.Encode(request)
+	if len(encoded) > len(original) {
+		response.Extensions = response.Extensions[:1]
+	}
+	return response
 }
 func (r *Reflector) notifyStart(listener *peer, floor FloorSnapshot) {
 	owner := r.peers[floor.SessionID]
@@ -570,21 +611,21 @@ func (r *Reflector) startNotification(listener *peer, p wire.Packet) {
 		return
 	}
 	key := notificationKey{listener.id, p.Header.Type, binary.BigEndian.Uint64(raw)}
-	r.pending[key] = &notification{p, 1, time.Now().Add(500 * time.Millisecond)}
+	r.pending[key] = &notification{p, 1, r.options.Clock().Add(500 * time.Millisecond)}
 	if p.Header.Type == wire.PacketStreamStart {
 		listener.receiving = true
 	}
 	r.sendControl(listener.address, p)
 }
-func (r *Reflector) ack(peer *peer, p wire.Packet) {
+func (r *Reflector) ack(peer *peer, p wire.Packet) bool {
 	raw, ok := wire.Find(p, wire.TLVTransactionID)
 	if !ok || len(raw) != 8 {
-		return
+		return false
 	}
 	key := notificationKey{peer.id, p.Header.Type, binary.BigEndian.Uint64(raw)}
 	n, ok := r.pending[key]
 	if !ok || p.Header.StreamID != n.packet.Header.StreamID || p.Header.Sequence != n.packet.Header.Sequence || p.Header.Timestamp != n.packet.Header.Timestamp {
-		return
+		return false
 	}
 	delete(r.pending, key)
 	if p.Header.Type == wire.PacketStreamStart {
@@ -596,11 +637,12 @@ func (r *Reflector) ack(peer *peer, p wire.Packet) {
 		r.engine.Disconnect(peer.id)
 		delete(r.peers, peer.id)
 	}
+	return true
 }
-func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) {
+func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) bool {
 	effects, err := r.engine.Media(owner.id, owner.address.String(), p.Header.StreamID, p.Header.Sequence, p.Header.Timestamp, p.Payload)
 	if err != nil {
-		return
+		return false
 	}
 	recipients := make([]net.Addr, 0, len(effects))
 	for _, effect := range effects {
@@ -621,10 +663,11 @@ func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) {
 			r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": item}, uint64(len(recipients)))
 		}
 	}
+	return true
 }
 func (r *Reflector) tick(draining bool) {
 	defer r.publish()
-	now := time.Now()
+	now := r.options.Clock()
 	for key, c := range r.challenges {
 		if now.Sub(c.at) > 10*time.Second {
 			r.metric("opusref_timeouts_total", map[string]string{"kind": "challenge"}, 1)
@@ -685,11 +728,13 @@ func (r *Reflector) tick(draining bool) {
 	_ = draining
 }
 func (r *Reflector) sendError(addr net.Addr, p wire.Packet, code wire.ErrorCode) {
-	ext := []wire.TLV{wire.Uint16TLV(wire.TLVErrorCode, uint16(code))}
-	if tx, ok := wire.Find(p, wire.TLVTransactionID); ok {
-		ext = append(ext, wire.TLV{Type: wire.TLVTransactionID, Value: tx})
+	response := r.errorResponse(p, code)
+	original, _ := wire.Encode(p)
+	encoded, _ := wire.Encode(response)
+	if p.Header.SessionID == 0 || len(encoded) > len(original) {
+		return
 	}
-	r.sendControl(addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketError, Flags: wire.FlagResponse, SessionID: p.Header.SessionID, StreamID: p.Header.StreamID}, Extensions: ext})
+	r.sendControl(addr, response)
 }
 func (r *Reflector) sendControl(addr net.Addr, p wire.Packet) bool {
 	data, err := wire.Encode(p)
@@ -767,7 +812,7 @@ func (r *Reflector) publish() {
 		clients = append(clients, ClientView{p.id, p.node, masked, p.ready, p.connected, p.last})
 	}
 	engineSnapshot := r.engine.Snapshot()
-	s := &RuntimeSnapshot{Ready: !r.engine.draining, Clients: clients, Floor: engineSnapshot.Floor, Updated: time.Now(), InboundDrops: r.transport.InboundDrops.Load(), MediaDrops: r.transport.MediaDrops.Load(), MediaDropRecipients: r.transport.MediaDropRecipients.Load(), ControlFailures: r.transport.ControlFailures.Load(), SequenceGaps: engineSnapshot.SequenceGaps}
+	s := &RuntimeSnapshot{Ready: !r.engine.draining, Clients: clients, Floor: engineSnapshot.Floor, Updated: r.options.Clock(), InboundDrops: r.transport.InboundDrops.Load(), MediaDrops: r.transport.MediaDrops.Load(), MediaDropRecipients: r.transport.MediaDropRecipients.Load(), ControlFailures: r.transport.ControlFailures.Load(), SequenceGaps: engineSnapshot.SequenceGaps}
 	r.snapshot.Store(s)
 }
 func (r *Reflector) Snapshot() RuntimeSnapshot {

@@ -195,7 +195,6 @@ func (e *Engine) Media(id uint64, address string, stream, sequence, timestamp ui
 		return nil, ErrInvalidStream
 	}
 	now := e.now()
-	s.last = now
 	if e.floor.firstMedia.IsZero() {
 		if sequence != 0 {
 			return nil, ErrInvalidStream
@@ -207,9 +206,10 @@ func (e *Engine) Media(id uint64, address string, stream, sequence, timestamp ui
 		if delta > 0 && delta < 1<<31 {
 			e.gaps += uint64(delta)
 		} else if delta >= 1<<31 {
-			return nil, nil
+			return nil, ErrInvalidStream
 		}
 	}
+	s.last = now
 	e.floor.prior = sequence
 	e.floor.timestamp = timestamp
 	e.floor.hasPrior = true
@@ -222,10 +222,20 @@ func (e *Engine) Media(id uint64, address string, stream, sequence, timestamp ui
 	}
 	return result, nil
 }
-func (e *Engine) End(id uint64, reason EndReason) *StreamEnd {
+func (e *Engine) End(id uint64, stream, sequence, timestamp uint32, reason EndReason) (*StreamEnd, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.releaseLocked(id, reason)
+	if e.floor == nil || e.floor.owner != id || e.floor.stream != stream {
+		return nil, ErrInvalidStream
+	}
+	expectedSequence, expectedTimestamp := uint32(0), uint32(0)
+	if e.floor.hasPrior {
+		expectedSequence, expectedTimestamp = e.floor.prior+1, e.floor.timestamp
+	}
+	if sequence != expectedSequence || timestamp != expectedTimestamp {
+		return nil, ErrInvalidStream
+	}
+	return e.releaseLocked(id, reason), nil
 }
 func (e *Engine) releaseLocked(id uint64, reason EndReason) *StreamEnd {
 	if e.floor == nil || e.floor.owner != id {

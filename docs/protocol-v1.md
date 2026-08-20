@@ -265,6 +265,10 @@ The receiver rejects the same cache key with a different fingerprint as a
 malformed transaction conflict. The server does not evict a retained result
 before its retention time ends. Only a packet that passes semantic validation
 and the session address check refreshes session activity.
+Wire validation alone does not refresh activity. The server first accepts the
+packet in the floor, sequence, transaction, or notification state machine. A
+wrong-owner packet, wrong-stream packet, stale first sequence, or mismatched
+notification acknowledgement does not refresh activity.
 
 ## 11. Diagnostic record format
 
@@ -317,14 +321,18 @@ floor is not free, the server sends `STREAM_BUSY`.
 The client MUST wait for `STREAM_GRANT` before it sends media. It MUST reject a
 second or concurrent floor request while a request or local stream is active.
 It correlates the response transaction ID, session ID, stream ID, and packet
-type before it changes local state. The grant expires
-if no media arrives in two seconds. The server releases the floor after one
+type before it changes local state. The grant expires if no media arrives in two
+seconds. The server releases the floor after one
 second with no valid media. The default transmit time limit releases the floor
 after 180 seconds. These three values are server configuration values.
 
-The owner sends `STREAM_END` to release the floor. The server acknowledges it
-with `STREAM_END` and `RESPONSE`, then sends a transactional `STREAM_REVOKE` to
-each listener. Each listener acknowledges it. The server also sends
+The owner sends `STREAM_END` to release the floor. The request stream ID MUST
+match the active stream. Its sequence and timestamp MUST match the next sequence
+and final endpoint timestamp. The server returns `ERROR` with invalid stream for
+a wrong owner, stream, sequence, timestamp, or inactive floor. The server
+acknowledges a valid request with `STREAM_END` and `RESPONSE`, then sends a
+transactional `STREAM_REVOKE` to each listener. Each listener acknowledges it.
+The server also sends
 `STREAM_REVOKE` to the owner and listeners after a timeout, owner disconnect,
 server shutdown, or required control-delivery failure. The end reason states
 why the server released the floor.
@@ -343,9 +351,12 @@ to that listener. It does not wait for the acknowledgement before it sends
 media. A client MUST discard media for a stream until it has the stream
 metadata. If the first notification is lost, a retry supplies the metadata.
 
-A listener releases its receive state when it receives `STREAM_REVOKE`. It also
-releases stale receive state after two seconds with no media or when it accepts
-a new `STREAM_START`. These rules provide recovery when all revoke attempts are
+A listener keys receive state by the owner session ID and stream ID. It keeps a
+bounded set of retired identities so a delayed start or revoke cannot replace a
+new owner that reused the same stream ID. A listener releases its receive state
+when it receives `STREAM_REVOKE`. It also releases stale receive state after two
+seconds with no media or when it accepts a new `STREAM_START`. These rules
+provide recovery when all revoke attempts are
 lost.
 
 ## 10. Audio and data
@@ -372,6 +383,7 @@ The defined error codes are: malformed packet (1), unsupported version (2),
 authentication failed (3), invalid session (4), invalid stream (5), limit
 exceeded (6), unsupported type (7), and internal error (8).
 
-The server SHOULD silently drop an invalid unauthenticated packet. This rule
+The server MUST silently drop an invalid unauthenticated packet. This rule
 prevents reflection amplification. It MAY send a bounded `ERROR` for a valid
-session. An error response MUST NOT be larger than the request.
+session. An error response MUST NOT be larger than the request. The server omits
+the optional transaction ID when it must make a minimal error fit this limit.
