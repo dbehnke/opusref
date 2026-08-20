@@ -248,6 +248,11 @@ func (c *QueueClient) fail(err error) {
 }
 func (c *QueueClient) Close() error {
 	c.mu.Lock()
+	if c.closeResult == nil {
+		if closer, ok := c.sender.(interface{ Close() error }); ok {
+			c.closeResult = closer.Close()
+		}
+	}
 	result := c.closeResult
 	c.connected = false
 	c.stream = false
