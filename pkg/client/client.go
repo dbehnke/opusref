@@ -118,7 +118,6 @@ type Client interface {
 	Events() <-chan Event
 	Done() <-chan struct{}
 	Err() error
-	CloseContext(context.Context) error
 	Close() error
 }
 
@@ -169,7 +168,9 @@ func (c *QueueClient) Connect(ctx context.Context) error {
 	c.connecting = true
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); c.connecting = false; c.mu.Unlock() }()
-	if err := c.sender.Send(ctx, Outbound{Kind: EventStatus}); err != nil {
+	connectCtx, cancel := context.WithTimeout(ctx, c.options.ConnectTimeout)
+	defer cancel()
+	if err := c.sender.Send(connectCtx, Outbound{Kind: EventStatus}); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -373,10 +374,10 @@ func (c *QueueClient) fail(err error) {
 func (c *QueueClient) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.options.OperationTimeout)
 	defer cancel()
-	return c.CloseContext(ctx)
+	return c.closeContext(ctx)
 }
 
-func (c *QueueClient) CloseContext(ctx context.Context) error {
+func (c *QueueClient) closeContext(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closeCalled {
 		wait := c.closeDone

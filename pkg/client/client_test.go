@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +28,13 @@ func (s *blockingConnectSender) Send(context.Context, Outbound) error {
 	close(s.entered)
 	<-s.release
 	return nil
+}
+
+type deadlineConnectSender struct{}
+
+func (*deadlineConnectSender) Send(ctx context.Context, _ Outbound) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (m *memorySender) Send(_ context.Context, o Outbound) error {
@@ -54,6 +62,49 @@ func (s *disconnectSender) Disconnect(context.Context) error {
 	return nil
 }
 
+func TestClientInterfaceHasExactIssueMethodSet(t *testing.T) {
+	typ := reflect.TypeOf((*Client)(nil)).Elem()
+	want := []string{"Close", "Connect", "Done", "EndStream", "Err", "Events", "RequestStream", "SendAudio", "SendData"}
+	if typ.NumMethod() != len(want) {
+		t.Fatalf("Client has %d methods, want %d", typ.NumMethod(), len(want))
+	}
+	for index, name := range want {
+		if method := typ.Method(index); method.Name != name {
+			t.Fatalf("method %d is %s, want %s", index, method.Name, name)
+		}
+	}
+}
+
+func TestConnectUsesEarlierConfiguredOrCallerDeadline(t *testing.T) {
+	tests := []struct {
+		name           string
+		connectTimeout time.Duration
+		callerTimeout  time.Duration
+		minimum        time.Duration
+		maximum        time.Duration
+	}{
+		{name: "configured", connectTimeout: 20 * time.Millisecond, callerTimeout: time.Second, minimum: 10 * time.Millisecond, maximum: 150 * time.Millisecond},
+		{name: "caller", connectTimeout: time.Second, callerTimeout: 20 * time.Millisecond, minimum: 10 * time.Millisecond, maximum: 150 * time.Millisecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, err := New(Options{ServerAddress: "x", NodeCallsign: "N", ConnectTimeout: test.connectTimeout}, &deadlineConnectSender{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), test.callerTimeout)
+			defer cancel()
+			started := time.Now()
+			if err = c.Connect(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Connect error=%v", err)
+			}
+			if elapsed := time.Since(started); elapsed < test.minimum || elapsed > test.maximum {
+				t.Fatalf("Connect returned after %s, want %s through %s", elapsed, test.minimum, test.maximum)
+			}
+		})
+	}
+}
+
 func TestOptionsRejectInvalidCapacitiesBeforeAllocation(t *testing.T) {
 	for _, options := range []Options{
 		{ServerAddress: "x", NodeCallsign: "N", InboundQueuePackets: -1},
@@ -79,7 +130,7 @@ func TestCloseUsesTransactionalDisconnectBeforeTransportClose(t *testing.T) {
 	if err = c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err = c.CloseContext(context.Background()); err != nil {
+	if err = c.closeContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	select {

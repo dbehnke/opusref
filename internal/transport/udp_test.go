@@ -82,12 +82,12 @@ func TestDisableMediaDiscardsQueuedAndFutureBatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !u.EnqueueMedia(MediaBatch{Data: []byte{1}, Recipients: []net.Addr{addr("a"), addr("b")}}) {
+	if !u.EnqueueMedia(MediaBatch{Kind: MediaAudio, Data: []byte{1}, Recipients: []net.Addr{addr("a"), addr("b")}}) || !u.EnqueueMedia(MediaBatch{Kind: MediaData, Data: []byte{2}, Recipients: []net.Addr{addr("a"), addr("b"), addr("c")}}) {
 		t.Fatal("initial media rejected")
 	}
-	frames, recipients := u.DisableMedia()
-	if frames != 1 || recipients != 2 || len(u.Media) != 0 {
-		t.Fatalf("frames=%d recipients=%d queued=%d", frames, recipients, len(u.Media))
+	drops := u.DisableMedia()
+	if drops[MediaAudio].Frames != 1 || drops[MediaAudio].Recipients != 2 || drops[MediaData].Frames != 1 || drops[MediaData].Recipients != 3 || len(u.Media) != 0 {
+		t.Fatalf("drops=%#v queued=%d", drops, len(u.Media))
 	}
 	if u.EnqueueMedia(MediaBatch{Data: []byte{2}, Recipients: []net.Addr{addr("a")}}) {
 		t.Fatal("media accepted after disable")

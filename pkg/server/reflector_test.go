@@ -448,6 +448,34 @@ func TestShutdownDiscardsQueuedMediaBeforeControlDrain(t *testing.T) {
 	}
 }
 
+func TestShutdownClassifiesMixedQueuedMediaDrops(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	metrics := monitor.New(8, 0, nil)
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", ShutdownGrace: time.Millisecond, Metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.transport.EnqueueMedia(transport.MediaBatch{Kind: transport.MediaAudio, Data: []byte{1}, Recipients: []net.Addr{conn.LocalAddr(), conn.LocalAddr()}})
+	r.transport.EnqueueMedia(transport.MediaBatch{Kind: transport.MediaData, Data: []byte{2}, Recipients: []net.Addr{conn.LocalAddr(), conn.LocalAddr(), conn.LocalAddr()}})
+	if err = r.drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(w, httptest.NewRequest("GET", monitor.RouteMetrics, nil))
+	body := w.Body.String()
+	for _, want := range []string{
+		`opusref_queue_drops_total{item_type="audio",queue="server_media"} 1`,
+		`opusref_queue_drops_total{item_type="data",queue="server_media"} 1`,
+		`opusref_queue_drop_recipients_total{item_type="audio",queue="server_media"} 2`,
+		`opusref_queue_drop_recipients_total{item_type="data",queue="server_media"} 3`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in metrics:\n%s", want, body)
+		}
+	}
+}
+
 func TestReflectorRejectsInvalidCapacities(t *testing.T) {
 	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
 	defer conn.Close()

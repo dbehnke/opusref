@@ -70,7 +70,7 @@ func TestCloseRetriesTransactionalDisconnect(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := owner.CloseContext(ctx); err != nil {
+	if err := owner.closeContext(ctx); err != nil {
 		t.Fatal(err)
 	}
 	packets := <-received

@@ -276,24 +276,6 @@ packet in the floor, sequence, transaction, or notification state machine. A
 wrong-owner packet, wrong-stream packet, stale first sequence, or mismatched
 notification acknowledgement does not refresh activity.
 
-## 11. Diagnostic record format
-
-The diagnostic client uses this local record format. It is not an OpusRef UDP
-datagram.
-
-| Offset | Size | Field |
-|---:|---:|---|
-| 0 | 4 | ASCII `ORR1` |
-| 4 | 1 | Kind: 1 audio, 2 data |
-| 5 | 1 | Flags: zero |
-| 6 | 2 | Data type: zero for audio, nonzero for data |
-| 8 | 4 | Endpoint-supplied 48 kHz timestamp |
-| 12 | 4 | Payload length |
-
-Audio payload length is 1 through 1,168 bytes. Data payload length is 1 through
-1,160 bytes. A reader validates the complete header and length before it
-allocates payload memory.
-
 ## 9. Half-duplex stream procedure
 
 ```mermaid
@@ -396,3 +378,21 @@ the optional transaction ID when it must make a minimal error fit this limit.
 When `ERROR` contains a transaction ID, the client completes the matching
 request immediately. It publishes the error code and optional error text to the
 application. It does not wait for another retry deadline.
+
+## 12. Diagnostic record format
+
+The diagnostic client uses this local record format. It is not an OpusRef UDP
+datagram.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `ORR1` |
+| 4 | 1 | Kind: 1 audio, 2 data |
+| 5 | 1 | Flags: zero |
+| 6 | 2 | Data type: zero for audio, nonzero for data |
+| 8 | 4 | Endpoint-supplied 48 kHz timestamp |
+| 12 | 4 | Payload length |
+
+Audio payload length is 1 through 1,168 bytes. Data payload length is 1 through
+1,160 bytes. A reader validates the complete header and length before it
+allocates payload memory.

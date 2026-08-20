@@ -205,10 +205,16 @@ func (r *Reflector) Run(ctx context.Context) error {
 	}
 }
 func (r *Reflector) drain(ctx context.Context) error {
-	frames, recipients := r.transport.DisableMedia()
-	if frames > 0 {
-		r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_media", "item_type": "audio"}, frames)
-		r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": "audio"}, recipients)
+	drops := r.transport.DisableMedia()
+	for kind, count := range drops {
+		item := "audio"
+		if kind == transport.MediaData {
+			item = "data"
+		}
+		if count.Frames > 0 {
+			r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_media", "item_type": item}, count.Frames)
+			r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": item}, count.Recipients)
+		}
 	}
 	end := r.engine.BeginShutdown()
 	if end != nil {
@@ -718,7 +724,11 @@ func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) bool {
 		if p.Header.Type == wire.PacketData {
 			item = "data"
 		}
-		if r.transport.EnqueueMedia(transport.MediaBatch{Data: raw, Recipients: recipients}) {
+		kind := transport.MediaAudio
+		if p.Header.Type == wire.PacketData {
+			kind = transport.MediaData
+		}
+		if r.transport.EnqueueMedia(transport.MediaBatch{Data: raw, Recipients: recipients, Kind: kind}) {
 			r.metric("opusref_fanout_frames_total", map[string]string{"item_type": item}, 1)
 			r.metric("opusref_fanout_recipients_total", map[string]string{"item_type": item}, uint64(len(recipients)))
 		} else {

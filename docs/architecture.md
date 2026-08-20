@@ -113,11 +113,12 @@ each notification retry and publishes one lifecycle event for the state change.
 Before it sends `STREAM_END`, it waits until the transport has sent every
 accepted media frame. This preserves media, sequence, and timestamp order.
 
-`CloseContext` sends a transactional `DISCONNECT` when the client has an active
-session. It uses the control retry schedule and the caller deadline. `Close`
-uses the configured operation timeout. Both methods close the UDP socket after
-the response, timeout, or cancellation. A server-initiated disconnect is
-acknowledged and closes the socket without starting a second exchange.
+`Close` sends a transactional `DISCONNECT` when the client has an active
+session. It uses the control retry schedule and the configured operation
+timeout. It closes the UDP socket after the response or timeout. A
+server-initiated disconnect is acknowledged and closes the socket without
+starting a second exchange. The public `Client` interface has nine methods. It
+does not include a context-specific close method.
 
 A correlated `ERROR` completes a pending request. The client publishes one
 protocol-error event with the session ID, stream ID, error code, and optional
@@ -125,7 +126,9 @@ error text.
 
 One connect attempt owns the pre-admission socket reader. The client rejects a
 concurrent connect attempt. An unrelated datagram does not advance the retry
-schedule. The reader continues until the current attempt deadline.
+schedule. The library limits the full connection procedure to the configured
+connect timeout or an earlier caller deadline. The reader continues until that
+deadline.
 
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send

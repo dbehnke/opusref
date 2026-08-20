@@ -14,9 +14,20 @@ type Datagram struct {
 	Address net.Addr
 	Data    []byte
 }
+type MediaKind uint8
+
+const (
+	MediaAudio MediaKind = iota
+	MediaData
+)
+
 type MediaBatch struct {
 	Data       []byte
 	Recipients []net.Addr
+	Kind       MediaKind
+}
+type MediaDrops struct {
+	Frames, Recipients uint64
 }
 type UDP struct {
 	Conn                                                           net.PacketConn
@@ -67,17 +78,20 @@ func (u *UDP) EnqueueMedia(b MediaBatch) bool {
 }
 
 // DisableMedia rejects future media and removes every queued media batch.
-func (u *UDP) DisableMedia() (frames, recipients uint64) {
+func (u *UDP) DisableMedia() map[MediaKind]MediaDrops {
 	u.mediaMu.Lock()
 	defer u.mediaMu.Unlock()
 	u.mediaEnabled.Store(false)
+	drops := map[MediaKind]MediaDrops{}
 	for {
 		select {
 		case batch := <-u.Media:
-			frames++
-			recipients += uint64(len(batch.Recipients))
+			count := drops[batch.Kind]
+			count.Frames++
+			count.Recipients += uint64(len(batch.Recipients))
+			drops[batch.Kind] = count
 		default:
-			return frames, recipients
+			return drops
 		}
 	}
 }
