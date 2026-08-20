@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,57 @@ func (m *memorySender) Send(_ context.Context, o Outbound) error {
 	return nil
 }
 func (m *memorySender) Close() error { m.mu.Lock(); m.closed = true; m.mu.Unlock(); return nil }
+
+type disconnectSender struct {
+	memorySender
+	disconnected chan struct{}
+}
+
+func (s *disconnectSender) Disconnect(context.Context) error {
+	close(s.disconnected)
+	return nil
+}
+
+func TestOptionsRejectInvalidCapacitiesBeforeAllocation(t *testing.T) {
+	for _, options := range []Options{
+		{ServerAddress: "x", NodeCallsign: "N", InboundQueuePackets: -1},
+		{ServerAddress: "x", NodeCallsign: "N", ApplicationQueueEvents: -1},
+		{ServerAddress: "x", NodeCallsign: "N", MediaSendQueueFrames: -1},
+		{ServerAddress: "x", NodeCallsign: "N", ControlSendQueuePackets: -1},
+	} {
+		if _, err := New(options, &memorySender{}); err == nil {
+			t.Fatalf("accepted options %#v", options)
+		}
+	}
+	if _, err := NewUDP(Options{ServerAddress: "invalid.invalid:1", NodeCallsign: "N", InboundQueuePackets: -1}); err == nil || !strings.Contains(err.Error(), "queue") {
+		t.Fatalf("NewUDP did not validate before resolving: %v", err)
+	}
+}
+
+func TestCloseUsesTransactionalDisconnectBeforeTransportClose(t *testing.T) {
+	s := &disconnectSender{disconnected: make(chan struct{})}
+	c, err := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.disconnected:
+	default:
+		t.Fatal("disconnect was not sent")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if !closed {
+		t.Fatal("transport remained open")
+	}
+}
 func TestClientContractCopiesAndSequencesPayload(t *testing.T) {
 	s := &memorySender{}
 	c, err := New(Options{ServerAddress: "x", NodeCallsign: "N0CALL"}, s)

@@ -91,6 +91,7 @@ type peer struct {
 }
 type completed struct {
 	fingerprint, response []byte
+	address               string
 	at                    time.Time
 }
 type notificationKey struct {
@@ -142,12 +143,36 @@ func NewReflector(conn net.PacketConn, options ReflectorOptions) (*Reflector, er
 		return nil, errors.New("display name is required")
 	}
 	options = options.defaults()
+	options.Limits = options.Limits.defaults()
+	if err := options.validate(); err != nil {
+		return nil, err
+	}
 	if options.MaxDatagramBytes < wire.BaseHeaderSize || options.MaxDatagramBytes > wire.MaxDatagramSize {
 		return nil, errors.New("maximum datagram size is invalid")
 	}
-	r := &Reflector{conn: conn, options: options, engine: NewEngine(options.Limits, options.Clock), transport: transport.NewUDP(conn, options.InboundQueuePackets, options.OutboundControlQueuePackets, options.OutboundMediaQueueFrames), challenges: map[string]challenge{}, peers: map[uint64]*peer{}, transactions: map[string]completed{}, pending: map[notificationKey]*notification{}}
+	udp, err := transport.NewUDP(conn, options.InboundQueuePackets, options.OutboundControlQueuePackets, options.OutboundMediaQueueFrames)
+	if err != nil {
+		return nil, err
+	}
+	r := &Reflector{conn: conn, options: options, engine: NewEngine(options.Limits, options.Clock), transport: udp, challenges: map[string]challenge{}, peers: map[uint64]*peer{}, transactions: map[string]completed{}, pending: map[notificationKey]*notification{}}
 	r.publish()
 	return r, nil
+}
+
+func (o ReflectorOptions) validate() error {
+	capacities := []int{o.InboundQueuePackets, o.OutboundControlQueuePackets, o.OutboundMediaQueueFrames, o.MaxPendingChallenges, o.MaxPendingNotifications, o.MaxPendingNotificationsPerClient, o.MaxCompletedTransactionsPerSession, o.Limits.MaxClients, o.Limits.MaxCompletedTransactions}
+	for _, capacity := range capacities {
+		if capacity <= 0 {
+			return errors.New("all queue and state capacities must be positive")
+		}
+	}
+	if o.MaxPendingNotificationsPerClient > o.MaxPendingNotifications || o.MaxCompletedTransactionsPerSession > o.Limits.MaxCompletedTransactions {
+		return errors.New("per-session capacity exceeds the global capacity")
+	}
+	if o.ShutdownGrace <= 0 || o.Limits.SessionTimeout <= 0 || o.Limits.GrantTimeout <= 0 || o.Limits.MediaTimeout <= 0 || o.Limits.TransmitTimeLimit <= 0 {
+		return errors.New("all timers must be positive")
+	}
+	return nil
 }
 func (r *Reflector) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -180,6 +205,11 @@ func (r *Reflector) Run(ctx context.Context) error {
 	}
 }
 func (r *Reflector) drain(ctx context.Context) error {
+	frames, recipients := r.transport.DisableMedia()
+	if frames > 0 {
+		r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_media", "item_type": "audio"}, frames)
+		r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": "audio"}, recipients)
+	}
 	end := r.engine.BeginShutdown()
 	if end != nil {
 		r.notifyEnd(end)
@@ -250,6 +280,9 @@ func (r *Reflector) handle(addr net.Addr, data []byte) {
 		}
 		return
 	}
+	if p.Header.Type == wire.PacketDisconnect && r.replayDisconnect(addr, p) {
+		return
+	}
 	peer := r.peers[p.Header.SessionID]
 	if peer == nil || peer.address.String() != addr.String() {
 		reason := "invalid_session"
@@ -281,6 +314,33 @@ func (r *Reflector) handle(addr net.Addr, data []byte) {
 		peer.last = r.options.Clock()
 		r.engine.Touch(peer.id, addr.String())
 	}
+}
+
+func (r *Reflector) replayDisconnect(addr net.Addr, p wire.Packet) bool {
+	if err := wire.Validate(p, wire.ValidationContext{Direction: wire.ClientToServer, Phase: wire.Ready}); err != nil {
+		return false
+	}
+	tx, ok := wire.Find(p, wire.TLVTransactionID)
+	if !ok {
+		return false
+	}
+	key := r.transactionKey(addr, p, binary.BigEndian.Uint64(tx))
+	old, ok := r.transactions[key]
+	if !ok || old.address != addr.String() {
+		return false
+	}
+	normalized := p
+	normalized.Header.Flags &^= wire.FlagRetry
+	sort.Slice(normalized.Extensions, func(i, j int) bool { return normalized.Extensions[i].Type < normalized.Extensions[j].Type })
+	fingerprint, err := wire.Encode(normalized)
+	if err != nil || !bytes.Equal(old.fingerprint, fingerprint) {
+		return false
+	}
+	if !r.enqueueRaw(addr, old.response) {
+		r.replayOverload(addr, old.response)
+		return false
+	}
+	return true
 }
 func (r *Reflector) handleDrain(addr net.Addr, data []byte) {
 	if len(data) > r.options.MaxDatagramBytes {
@@ -354,9 +414,12 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 	if err != nil {
 		return false
 	}
-	r.transactions[key] = completed{fingerprint, data, r.options.Clock()}
+	r.transactions[key] = completed{fingerprint: fingerprint, response: data, address: addr.String(), at: r.options.Clock()}
 	if !r.enqueueRaw(addr, data) {
-		delete(r.transactions, key)
+		retainDisconnect := p.Header.Type == wire.PacketDisconnect && p.Header.SessionID != 0
+		if !retainDisconnect {
+			delete(r.transactions, key)
+		}
 		if p.Header.SessionID == 0 {
 			if p.Header.Type == wire.PacketHello {
 				tx, _ := wire.Find(p, wire.TLVTransactionID)

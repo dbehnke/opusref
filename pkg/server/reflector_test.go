@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"github.com/dbehnke/opusref/internal/transport"
 	"github.com/dbehnke/opusref/pkg/monitor"
 	"github.com/dbehnke/opusref/pkg/wire"
 	"net"
@@ -365,6 +366,101 @@ func TestInjectedClockControlsChallengeRetentionAndNotificationRetry(t *testing.
 	r.tick(false)
 	if len(r.challenges) != 0 || len(r.transactions) != 0 {
 		t.Fatal("retention ignored injected clock")
+	}
+}
+
+func TestDisconnectResponseReplaysAfterSessionRemoval(t *testing.T) {
+	now := time.Unix(100, 0)
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Clock: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
+	r.engine.AddSession(9, addr.String(), "N0ONE", true)
+	r.peers[9] = &peer{id: 9, address: addr, ready: true, connected: now, last: now}
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: 9}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 77)}}
+	data, _ := wire.Encode(request)
+	r.handle(addr, data)
+	first := <-r.transport.Control
+	if r.peers[9] != nil || r.engine.Snapshot().Sessions != 0 {
+		t.Fatal("disconnect retained live session")
+	}
+	request.Header.Flags = wire.FlagRetry
+	retry, _ := wire.Encode(request)
+	r.handle(addr, retry)
+	second := <-r.transport.Control
+	if !bytes.Equal(first.Data, second.Data) || r.engine.Snapshot().Sessions != 0 {
+		t.Fatal("retry did not replay response without restoring session")
+	}
+	wrong := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4321}
+	r.handle(wrong, retry)
+	if len(r.transport.Control) != 0 {
+		t.Fatal("response replayed to a different address")
+	}
+	now = now.Add(31 * time.Second)
+	r.tick(false)
+	r.handle(addr, retry)
+	if len(r.transport.Control) != 0 {
+		t.Fatal("expired disconnect response replayed")
+	}
+}
+
+func TestDisconnectRetainsResponseWhenInitialControlQueueIsFull(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", OutboundControlQueuePackets: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
+	r.engine.AddSession(9, addr.String(), "N0ONE", true)
+	r.peers[9] = &peer{id: 9, address: addr, ready: true}
+	r.transport.Control <- transport.Datagram{Address: addr, Data: []byte{0}}
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: 9}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 77)}}
+	data, _ := wire.Encode(request)
+	r.handle(addr, data)
+	<-r.transport.Control
+	request.Header.Flags = wire.FlagRetry
+	retry, _ := wire.Encode(request)
+	r.handle(addr, retry)
+	if len(r.transport.Control) != 1 || r.engine.Snapshot().Sessions != 0 {
+		t.Fatal("disconnect response was not retained across control overload")
+	}
+}
+
+func TestShutdownDiscardsQueuedMediaBeforeControlDrain(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", ShutdownGrace: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.transport.EnqueueMedia(transport.MediaBatch{Data: []byte{1}, Recipients: []net.Addr{conn.LocalAddr()}}) {
+		t.Fatal("could not arrange queued media")
+	}
+	if err = r.drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.transport.Media) != 0 || r.transport.EnqueueMedia(transport.MediaBatch{Data: []byte{2}, Recipients: []net.Addr{conn.LocalAddr()}}) {
+		t.Fatal("shutdown left media enabled")
+	}
+}
+
+func TestReflectorRejectsInvalidCapacities(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	for _, options := range []ReflectorOptions{
+		{ID: "OPUSREF", DisplayName: "Test", InboundQueuePackets: -1},
+		{ID: "OPUSREF", DisplayName: "Test", OutboundControlQueuePackets: -1},
+		{ID: "OPUSREF", DisplayName: "Test", OutboundMediaQueueFrames: -1},
+		{ID: "OPUSREF", DisplayName: "Test", MaxPendingNotificationsPerClient: -1},
+		{ID: "OPUSREF", DisplayName: "Test", Limits: Limits{MaxClients: -1}},
+	} {
+		if _, err := NewReflector(conn, options); err == nil {
+			t.Fatalf("accepted options %#v", options)
+		}
 	}
 }
 

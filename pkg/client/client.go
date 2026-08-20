@@ -17,6 +17,19 @@ var (
 	ErrConnectInProgress       = errors.New("client connection is in progress")
 )
 
+// ProtocolError is a correlated ERROR response from the reflector.
+type ProtocolError struct {
+	Code    uint16
+	Message string
+}
+
+func (e *ProtocolError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return "reflector returned protocol error"
+}
+
 type EventKind uint8
 
 const (
@@ -67,6 +80,16 @@ func (o Options) defaults() Options {
 	return o
 }
 
+func (o Options) validate() error {
+	if o.InboundQueuePackets <= 0 || o.ApplicationQueueEvents <= 0 || o.MediaSendQueueFrames <= 0 || o.ControlSendQueuePackets <= 0 {
+		return errors.New("all client queue capacities must be positive")
+	}
+	if o.ConnectTimeout <= 0 || o.OperationTimeout <= 0 {
+		return errors.New("all client timeouts must be positive")
+	}
+	return nil
+}
+
 type Outbound struct {
 	Kind                          EventKind
 	StreamID, Sequence, Timestamp uint32
@@ -83,6 +106,9 @@ type floorRequester interface {
 type streamEnder interface {
 	EndFloor(context.Context, Outbound) error
 }
+type disconnecter interface {
+	Disconnect(context.Context) error
+}
 type Client interface {
 	Connect(context.Context) error
 	RequestStream(context.Context, string) error
@@ -92,6 +118,7 @@ type Client interface {
 	Events() <-chan Event
 	Done() <-chan struct{}
 	Err() error
+	CloseContext(context.Context) error
 	Close() error
 }
 
@@ -112,18 +139,22 @@ type QueueClient struct {
 	mediaAccepted, mediaSent              uint64
 	terminal, closeResult                 error
 	closeCalled                           bool
+	closeDone                             chan struct{}
 	once                                  sync.Once
 }
 
 func New(options Options, sender Sender) (*QueueClient, error) {
 	options = options.defaults()
+	if err := options.validate(); err != nil {
+		return nil, err
+	}
 	if options.ServerAddress == "" || options.NodeCallsign == "" {
 		return nil, errors.New("server address and node callsign are required")
 	}
 	if sender == nil {
 		return nil, errors.New("sender is required")
 	}
-	return &QueueClient{options: options, sender: sender, events: make(chan Event, options.ApplicationQueueEvents), media: make(chan Outbound, options.MediaSendQueueFrames), mediaProgress: make(chan struct{}, 1), control: make(chan Outbound, options.ControlSendQueuePackets), done: make(chan struct{})}, nil
+	return &QueueClient{options: options, sender: sender, events: make(chan Event, options.ApplicationQueueEvents), media: make(chan Outbound, options.MediaSendQueueFrames), mediaProgress: make(chan struct{}, 1), control: make(chan Outbound, options.ControlSendQueuePackets), done: make(chan struct{}), closeDone: make(chan struct{})}, nil
 }
 func (c *QueueClient) Connect(ctx context.Context) error {
 	c.mu.Lock()
@@ -331,6 +362,8 @@ func (c *QueueClient) fail(err error) {
 	if c.terminal == nil {
 		c.terminal = err
 	}
+	c.connected = false
+	c.stream = false
 	c.mu.Unlock()
 	c.once.Do(func() { close(c.done) })
 	if closer, ok := c.sender.(interface{ Close() error }); ok {
@@ -338,17 +371,65 @@ func (c *QueueClient) fail(err error) {
 	}
 }
 func (c *QueueClient) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.options.OperationTimeout)
+	defer cancel()
+	return c.CloseContext(ctx)
+}
+
+func (c *QueueClient) CloseContext(ctx context.Context) error {
 	c.mu.Lock()
-	if !c.closeCalled {
-		c.closeCalled = true
-		if closer, ok := c.sender.(interface{ Close() error }); ok {
-			c.closeResult = closer.Close()
+	if c.closeCalled {
+		wait := c.closeDone
+		c.mu.Unlock()
+		select {
+		case <-wait:
+			c.mu.Lock()
+			result := c.closeResult
+			c.mu.Unlock()
+			return result
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	result := c.closeResult
+	c.closeCalled = true
+	connected := c.connected && c.terminal == nil
 	c.connected = false
 	c.stream = false
 	c.mu.Unlock()
+	var result error
+	if connected {
+		if disconnect, ok := c.sender.(disconnecter); ok {
+			result = disconnect.Disconnect(ctx)
+		}
+	}
+	if closer, ok := c.sender.(interface{ Close() error }); ok {
+		result = errors.Join(result, closer.Close())
+	}
+	c.mu.Lock()
+	c.closeResult = result
+	c.mu.Unlock()
 	c.once.Do(func() { close(c.done) })
+	close(c.closeDone)
 	return result
+}
+
+func (c *QueueClient) remoteClose() {
+	c.mu.Lock()
+	if c.closeCalled {
+		c.mu.Unlock()
+		return
+	}
+	c.closeCalled = true
+	c.connected = false
+	c.stream = false
+	c.mu.Unlock()
+	var result error
+	if closer, ok := c.sender.(interface{ Close() error }); ok {
+		result = closer.Close()
+	}
+	c.mu.Lock()
+	c.closeResult = result
+	c.mu.Unlock()
+	c.once.Do(func() { close(c.done) })
+	close(c.closeDone)
 }

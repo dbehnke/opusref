@@ -258,6 +258,12 @@ cancels its outstanding start transactions before it starts revoke transactions.
 The server keeps a completed result for at least 30 seconds. When it receives a
 duplicate request, it returns the prior logical result and does not repeat the
 state change. A response copies the transaction ID and sets `RESPONSE`.
+The server keeps a completed `DISCONNECT` result after it removes the session.
+During the retention time, it replays that result only to the same UDP address
+and for the same session, transaction, and normalized request. Replay does not
+restore the session. The server is silent after the result expires.
+The server also retains this result when the first response cannot enter the
+control queue.
 
 The normalized request fingerprint contains the packet type, flags with only
 `RETRY` removed, all state header fields, canonical ordered TLVs, and payload.
@@ -387,3 +393,6 @@ The server MUST silently drop an invalid unauthenticated packet. This rule
 prevents reflection amplification. It MAY send a bounded `ERROR` for a valid
 session. An error response MUST NOT be larger than the request. The server omits
 the optional transaction ID when it must make a minimal error fit this limit.
+When `ERROR` contains a transaction ID, the client completes the matching
+request immediately. It publishes the error code and optional error text to the
+application. It does not wait for another retry deadline.

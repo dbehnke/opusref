@@ -3,11 +3,83 @@ package client
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"github.com/dbehnke/opusref/pkg/wire"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestCorrelatedProtocolErrorCompletesRequestAndPublishesFields(t *testing.T) {
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	defer serverConn.Close()
+	clientConn, _ := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	s := &udpSender{conn: clientConn, options: Options{OperationTimeout: time.Second}, session: 1, pending: map[requestKey]pendingRequest{}, inbound: make(chan []byte, 2), controlTokens: make(chan struct{}, 1)}
+	owner, _ := New(Options{ServerAddress: "x", NodeCallsign: "N0CALL"}, s)
+	s.owner = owner
+	go s.readLoop()
+	defer s.Close()
+	go func() {
+		buf := make([]byte, wire.MaxDatagramSize)
+		n, addr, _ := serverConn.ReadFromUDP(buf)
+		request, _ := wire.Decode(buf[:n])
+		tx, _ := wire.Find(request, wire.TLVTransactionID)
+		_ = sendUDP(serverConn, addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketError, Flags: wire.FlagResponse, SessionID: 1, StreamID: request.Header.StreamID}, Extensions: []wire.TLV{wire.Uint16TLV(wire.TLVErrorCode, uint16(wire.ErrorInvalidStream)), {Type: wire.TLVTransactionID, Value: tx}, {Type: wire.TLVErrorText, Value: []byte("floor rejected")}}})
+	}()
+	started := time.Now()
+	err := s.RequestFloor(context.Background(), Outbound{StreamID: 7, SourceCallsign: "N0CALL"})
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) || protocolErr.Code != uint16(wire.ErrorInvalidStream) || protocolErr.Message != "floor rejected" {
+		t.Fatalf("error=%#v", err)
+	}
+	if time.Since(started) >= 400*time.Millisecond {
+		t.Fatal("correlated ERROR waited for retry")
+	}
+	select {
+	case event := <-owner.Events():
+		if event.Kind != EventProtocolError || event.ProtocolErrorCode != uint16(wire.ErrorInvalidStream) || event.Message != "floor rejected" || event.StreamID != 7 {
+			t.Fatalf("event=%#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("protocol error event not published")
+	}
+}
+
+func TestCloseRetriesTransactionalDisconnect(t *testing.T) {
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	defer serverConn.Close()
+	clientConn, _ := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	s := &udpSender{conn: clientConn, options: Options{OperationTimeout: 2 * time.Second}, session: 9, pending: map[requestKey]pendingRequest{}, inbound: make(chan []byte, 2), controlTokens: make(chan struct{}, 1)}
+	owner, _ := New(Options{ServerAddress: "x", NodeCallsign: "N0CALL", OperationTimeout: 2 * time.Second}, s)
+	s.owner = owner
+	owner.connected = true
+	go s.readLoop()
+	received := make(chan [2]wire.Packet, 1)
+	go func() {
+		var packets [2]wire.Packet
+		buf := make([]byte, wire.MaxDatagramSize)
+		var addr *net.UDPAddr
+		for index := range packets {
+			n, remote, _ := serverConn.ReadFromUDP(buf)
+			addr = remote
+			packets[index], _ = wire.Decode(buf[:n])
+		}
+		tx, _ := wire.Find(packets[1], wire.TLVTransactionID)
+		_ = sendUDP(serverConn, addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, Flags: wire.FlagResponse, SessionID: 9}, Extensions: []wire.TLV{{Type: wire.TLVTransactionID, Value: tx}}})
+		received <- packets
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := owner.CloseContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	packets := <-received
+	one, _ := wire.Find(packets[0], wire.TLVTransactionID)
+	two, _ := wire.Find(packets[1], wire.TLVTransactionID)
+	if packets[0].Header.Type != wire.PacketDisconnect || packets[1].Header.Flags != wire.FlagRetry || string(one) != string(two) {
+		t.Fatalf("disconnect attempts=%#v", packets)
+	}
+}
 
 func TestFloorRequestRetriesAndIgnoresMismatchedTransaction(t *testing.T) {
 	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})

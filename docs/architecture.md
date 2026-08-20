@@ -113,6 +113,16 @@ each notification retry and publishes one lifecycle event for the state change.
 Before it sends `STREAM_END`, it waits until the transport has sent every
 accepted media frame. This preserves media, sequence, and timestamp order.
 
+`CloseContext` sends a transactional `DISCONNECT` when the client has an active
+session. It uses the control retry schedule and the caller deadline. `Close`
+uses the configured operation timeout. Both methods close the UDP socket after
+the response, timeout, or cancellation. A server-initiated disconnect is
+acknowledged and closes the socket without starting a second exchange.
+
+A correlated `ERROR` completes a pending request. The client publishes one
+protocol-error event with the session ID, stream ID, error code, and optional
+error text.
+
 One connect attempt owns the pre-admission socket reader. The client rejects a
 concurrent connect attempt. An unrelated datagram does not advance the retry
 schedule. The reader continues until the current attempt deadline.
@@ -153,6 +163,7 @@ sequenceDiagram
     participant Writer
     Command->>State: Start restricted drain
     State->>State: Reject admission, floor, and media
+    State->>Writer: Disable and discard queued media
     State->>Writer: STREAM_REVOKE transactions
     Writer-->>State: Acknowledgement or retry exhaustion
     State->>Writer: DISCONNECT transactions
@@ -165,6 +176,9 @@ sequenceDiagram
 The server reads YAML once at startup. It validates all addresses, limits,
 identifiers, and timer relationships before it opens a socket. Defaults match
 `config.example.yaml`.
+The server and client constructors reject zero or negative effective queue and
+state capacities before they allocate channels. They reject negative timer
+values instead of treating them as defaults.
 
 The live reflector supplies one clock to the engine, challenges, retained
 transactions, notification retries, session timeouts, and monitoring snapshots.

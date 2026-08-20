@@ -26,6 +26,7 @@ type udpSender struct {
 	pending                   map[requestKey]pendingRequest
 	inbound                   chan []byte
 	closed                    atomic.Bool
+	closing                   atomic.Bool
 	inboundDrops              atomic.Uint64
 	remote                    remoteStream
 	retired                   [8]remoteKey
@@ -59,6 +60,9 @@ func (s *udpSender) Close() error {
 }
 func NewUDP(options Options) (Client, error) {
 	options = options.defaults()
+	if err := options.validate(); err != nil {
+		return nil, err
+	}
 	addr, err := net.ResolveUDPAddr("udp", options.ServerAddress)
 	if err != nil {
 		return nil, err
@@ -75,6 +79,18 @@ func NewUDP(options Options) (Client, error) {
 	}
 	s.owner = c
 	return c, nil
+}
+func (s *udpSender) Disconnect(ctx context.Context) error {
+	if s.session == 0 || s.closed.Load() {
+		return nil
+	}
+	s.closing.Store(true)
+	tx, err := s.nextTx()
+	if err != nil {
+		return err
+	}
+	_, err = s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: s.session}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx)}}, wire.PacketDisconnect)
+	return err
 }
 func (s *udpSender) Send(ctx context.Context, out Outbound) error {
 	switch out.Kind {
@@ -245,10 +261,11 @@ func (s *udpSender) request(ctx context.Context, p wire.Packet, wants ...wire.Pa
 	raw, _ := wire.Find(p, wire.TLVTransactionID)
 	tx := binary.BigEndian.Uint64(raw)
 	responses := make(chan wire.Packet, 1)
-	types := make(map[wire.PacketType]bool, len(wants))
+	types := make(map[wire.PacketType]bool, len(wants)+1)
 	for _, typ := range wants {
 		types[typ] = true
 	}
+	types[wire.PacketError] = true
 	s.pendingMu.Lock()
 	key := requestKey{tx: tx, stream: p.Header.StreamID}
 	s.pending[key] = pendingRequest{responses: responses, types: types}
@@ -269,6 +286,11 @@ func (s *udpSender) request(ctx context.Context, p wire.Packet, wants ...wire.Pa
 			return wire.Packet{}, ctx.Err()
 		case reply := <-responses:
 			timer.Stop()
+			if reply.Header.Type == wire.PacketError {
+				event := protocolErrorEvent(reply)
+				_ = s.owner.Publish(event)
+				return wire.Packet{}, &ProtocolError{Code: event.ProtocolErrorCode, Message: event.Message}
+			}
 			for _, want := range wants {
 				if reply.Header.Type == want {
 					return reply, nil
@@ -414,11 +436,11 @@ func (s *udpSender) processLoop() {
 			event.Kind = EventStreamEnd
 		case wire.PacketDisconnect:
 			s.ack(p)
-			go s.owner.Close()
+			go s.owner.remoteClose()
 			s.remoteMu.Unlock()
 			return
 		case wire.PacketError:
-			event.Kind = EventProtocolError
+			event = protocolErrorEvent(p)
 		default:
 			s.remoteMu.Unlock()
 			continue
@@ -426,6 +448,17 @@ func (s *udpSender) processLoop() {
 		s.remoteMu.Unlock()
 		_ = s.owner.Publish(event)
 	}
+}
+
+func protocolErrorEvent(p wire.Packet) Event {
+	event := Event{Kind: EventProtocolError, SessionID: p.Header.SessionID, StreamID: p.Header.StreamID, Sequence: p.Header.Sequence, Timestamp: p.Header.Timestamp}
+	if raw, ok := wire.Find(p, wire.TLVErrorCode); ok && len(raw) == 2 {
+		event.ProtocolErrorCode = binary.BigEndian.Uint16(raw)
+	}
+	if raw, ok := wire.Find(p, wire.TLVErrorText); ok {
+		event.Message = string(raw)
+	}
+	return event
 }
 func (s *udpSender) expireRemote(now time.Time) {
 	s.remoteMu.Lock()
@@ -470,7 +503,7 @@ func (s *udpSender) keepalive() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if s.closed.Load() {
+		if s.closed.Load() || s.closing.Load() {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), s.options.OperationTimeout)
