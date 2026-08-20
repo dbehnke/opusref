@@ -18,23 +18,25 @@ static int read_hex(const char *path, unsigned char *packet, int capacity) {
 }
 
 int main(int argc, char **argv) {
-    unsigned char prior[1200], recovery[1200];
+	unsigned char context[1200], prior[1200], recovery[1200];
     opus_int16 pcm[960];
     int error = OPUS_OK;
-    if (argc != 3) return 2;
-    int prior_length = read_hex(argv[1], prior, (int)sizeof(prior));
-    int recovery_length = read_hex(argv[2], recovery, (int)sizeof(recovery));
-    OpusDecoder *decoder = opus_decoder_create(48000, 1, &error);
-    if (decoder == NULL || error != OPUS_OK || prior_length <= 0 || recovery_length <= 0) return 3;
-    if (opus_decode(decoder, prior, prior_length, pcm, 960, 0) != 960) return 4;
-    if (opus_decoder_ctl(decoder, OPUS_RESET_STATE) != OPUS_OK) return 5;
-    if (opus_decode(decoder, NULL, 0, pcm, 960, 0) != 960) return 6;
-    if (opus_decode(decoder, recovery, recovery_length, pcm, 960, 1) != 960) return 7;
+	if (argc != 4) return 2;
+	int context_length = read_hex(argv[1], context, (int)sizeof(context));
+	int prior_length = read_hex(argv[2], prior, (int)sizeof(prior));
+	int recovery_length = read_hex(argv[3], recovery, (int)sizeof(recovery));
+	OpusDecoder *decoder = opus_decoder_create(48000, 1, &error);
+	if (decoder == NULL || error != OPUS_OK || context_length <= 0 || prior_length <= 0 || recovery_length <= 0) return 3;
+	if (opus_decode(decoder, context, context_length, pcm, 960, 0) != 960) return 4;
+	if (opus_decode(decoder, prior, prior_length, pcm, 960, 0) != 960) return 5;
+	if (opus_decoder_ctl(decoder, OPUS_RESET_STATE) != OPUS_OK) return 6;
+	if (opus_decode(decoder, context, context_length, pcm, 960, 0) != 960) return 7;
+	if (opus_decode(decoder, recovery, recovery_length, pcm, 960, 1) != 960) return 8;
 	int64_t energy = 0;
 	for (int index = 0; index < 960; index++) {
 		energy += pcm[index] < 0 ? -(int64_t)pcm[index] : pcm[index];
 	}
-	if (energy < 1000) return 8;
+	if (energy < 1000) return 9;
     opus_decoder_destroy(decoder);
     return 0;
 }
