@@ -76,6 +76,12 @@ type Outbound struct {
 type Sender interface {
 	Send(context.Context, Outbound) error
 }
+type floorRequester interface {
+	RequestFloor(context.Context, Outbound) error
+}
+type streamEnder interface {
+	EndFloor(context.Context, Outbound) error
+}
 type Client interface {
 	Connect(context.Context) error
 	RequestStream(context.Context, string) error
@@ -100,6 +106,7 @@ type QueueClient struct {
 	connected, stream     bool
 	streamID, sequence    uint32
 	terminal, closeResult error
+	closeCalled           bool
 	once                  sync.Once
 }
 
@@ -129,13 +136,17 @@ func (c *QueueClient) Connect(ctx context.Context) error {
 	go c.run()
 	return c.publish(Event{Kind: EventStatus, Message: "connected"}, true)
 }
-func (c *QueueClient) RequestStream(_ context.Context, source string) error {
+func (c *QueueClient) RequestStream(ctx context.Context, source string) error {
+	return c.requestStream(ctx, source)
+}
+func (c *QueueClient) requestStream(ctx context.Context, source string) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.connected {
+		c.mu.Unlock()
 		return ErrNotConnected
 	}
 	if source == "" {
+		c.mu.Unlock()
 		return errors.New("source callsign is required")
 	}
 	c.streamID++
@@ -143,8 +154,23 @@ func (c *QueueClient) RequestStream(_ context.Context, source string) error {
 		c.streamID++
 	}
 	c.sequence = 0
+	out := Outbound{Kind: EventStreamStart, StreamID: c.streamID, SourceCallsign: source}
+	c.mu.Unlock()
+	if err := c.acquireControl(out); err != nil {
+		return err
+	}
+	defer c.releaseControl()
+	if requester, ok := c.sender.(floorRequester); ok {
+		if err := requester.RequestFloor(ctx, out); err != nil {
+			return err
+		}
+	} else if err := c.sender.Send(ctx, out); err != nil {
+		return err
+	}
+	c.mu.Lock()
 	c.stream = true
-	return c.enqueueControlLocked(Outbound{Kind: EventStreamStart, StreamID: c.streamID, SourceCallsign: source})
+	c.mu.Unlock()
+	return nil
 }
 func (c *QueueClient) SendAudio(_ context.Context, timestamp uint32, payload []byte) error {
 	if len(payload) < 1 || len(payload) > 1168 {
@@ -175,45 +201,43 @@ func (c *QueueClient) enqueueMedia(out Outbound) error {
 		return ErrBackpressure
 	}
 }
-func (c *QueueClient) enqueueControlLocked(out Outbound) error {
+func (c *QueueClient) acquireControl(out Outbound) error {
 	select {
 	case c.control <- out:
 		return nil
 	default:
-		go c.fail(ErrControlBackpressure)
+		c.fail(ErrControlBackpressure)
 		return ErrControlBackpressure
 	}
 }
-func (c *QueueClient) EndStream(context.Context) error {
+func (c *QueueClient) releaseControl() { <-c.control }
+func (c *QueueClient) EndStream(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.stream {
+		c.mu.Unlock()
 		return ErrStreamInactive
 	}
 	out := Outbound{Kind: EventStreamEnd, StreamID: c.streamID, Sequence: c.sequence}
 	c.stream = false
-	return c.enqueueControlLocked(out)
+	c.mu.Unlock()
+	if err := c.acquireControl(out); err != nil {
+		return err
+	}
+	defer c.releaseControl()
+	if ender, ok := c.sender.(streamEnder); ok {
+		return ender.EndFloor(ctx, out)
+	}
+	return c.sender.Send(ctx, out)
 }
 func (c *QueueClient) run() {
 	for {
-		var out Outbound
 		select {
-		case <-c.done:
-			return
-		default:
-		}
-		select {
-		case out = <-c.control:
-		default:
-			select {
-			case out = <-c.control:
-			case out = <-c.media:
-			case <-c.done:
+		case out := <-c.media:
+			if err := c.sender.Send(context.Background(), out); err != nil {
+				c.fail(err)
 				return
 			}
-		}
-		if err := c.sender.Send(context.Background(), out); err != nil {
-			c.fail(err)
+		case <-c.done:
 			return
 		}
 	}
@@ -248,7 +272,8 @@ func (c *QueueClient) fail(err error) {
 }
 func (c *QueueClient) Close() error {
 	c.mu.Lock()
-	if c.closeResult == nil {
+	if !c.closeCalled {
+		c.closeCalled = true
 		if closer, ok := c.sender.(interface{ Close() error }); ok {
 			c.closeResult = closer.Close()
 		}

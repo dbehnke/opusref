@@ -46,6 +46,38 @@ func TestValidateRejectsKnownTLVOnWrongPacket(t *testing.T) {
 	}
 }
 
+func TestValidateFlagsPhasesAndNotificationForms(t *testing.T) {
+	tx := Uint64TLV(TLVTransactionID, 1)
+	call := TLV{Type: TLVNodeCallsign, Value: []byte("N0CALL    ")}
+	source := TLV{Type: TLVSourceCallsign, Value: []byte("N0CALL    ")}
+	tot := Uint32TLV(TLVTransmitTimeLimit, 180)
+	tests := []struct {
+		name string
+		p    Packet
+		ctx  ValidationContext
+		ok   bool
+	}{
+		{"retry request", Packet{Header: Header{Version: 1, Type: PacketKeepalive, Flags: FlagRetry, SessionID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, true},
+		{"retry response", Packet{Header: Header{Version: 1, Type: PacketKeepalive, Flags: FlagResponse | FlagRetry, SessionID: 1}, Extensions: []TLV{tx}}, ValidationContext{ServerToClient, Ready}, false},
+		{"response request", Packet{Header: Header{Version: 1, Type: PacketStreamRequest, Flags: FlagResponse, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx, source}}, ValidationContext{ClientToServer, Ready}, false},
+		{"full start", Packet{Header: Header{Version: 1, Type: PacketStreamStart, SessionID: 2, StreamID: 1}, Extensions: []TLV{tx, call, source, tot}}, ValidationContext{ServerToClient, Ready}, true},
+		{"short start", Packet{Header: Header{Version: 1, Type: PacketStreamStart, SessionID: 2, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ServerToClient, Ready}, false},
+		{"start ack", Packet{Header: Header{Version: 1, Type: PacketStreamStart, Flags: FlagResponse, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, true},
+		{"start ack missing response", Packet{Header: Header{Version: 1, Type: PacketStreamStart, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, false},
+		{"media connected", Packet{Header: Header{Version: 1, Type: PacketAudio, SessionID: 1, StreamID: 1}, Payload: []byte{1}}, ValidationContext{ClientToServer, Connected}, false},
+		{"end request", Packet{Header: Header{Version: 1, Type: PacketStreamEnd, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, true},
+		{"end response", Packet{Header: Header{Version: 1, Type: PacketStreamEnd, Flags: FlagResponse, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx, Uint16TLV(TLVEndReason, 0)}}, ValidationContext{ServerToClient, Ready}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Validate(tc.p, tc.ctx)
+			if (err == nil) != tc.ok {
+				t.Fatalf("got %v, ok=%v", err, tc.ok)
+			}
+		})
+	}
+}
+
 func FuzzValidate(f *testing.F) {
 	f.Add([]byte(goldenAudioHex))
 	f.Fuzz(func(t *testing.T, text []byte) {

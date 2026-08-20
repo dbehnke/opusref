@@ -12,9 +12,12 @@ type memorySender struct {
 	sent  []Outbound
 	block chan struct{}
 }
+type busySender struct{ memorySender }
+
+func (*busySender) RequestFloor(context.Context, Outbound) error { return ErrBusy }
 
 func (m *memorySender) Send(_ context.Context, o Outbound) error {
-	if m.block != nil && o.Kind != EventStatus {
+	if m.block != nil && (o.Kind == EventAudio || o.Kind == EventData) {
 		<-m.block
 	}
 	m.mu.Lock()
@@ -93,4 +96,18 @@ func TestRequiredEventBackpressureIsTerminal(t *testing.T) {
 	if c.Close() != c.Close() {
 		t.Fatal("Close result changed")
 	}
+}
+func TestClientDoesNotActivateStreamBeforeGrant(t *testing.T) {
+	s := &busySender{}
+	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RequestStream(context.Background(), "N"); !errors.Is(err, ErrBusy) {
+		t.Fatalf("got %v", err)
+	}
+	if err := c.SendAudio(context.Background(), 0, []byte{1}); !errors.Is(err, ErrStreamInactive) {
+		t.Fatalf("media accepted: %v", err)
+	}
+	_ = c.Close()
 }

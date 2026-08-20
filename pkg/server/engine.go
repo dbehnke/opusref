@@ -68,6 +68,7 @@ type FloorSnapshot struct {
 	SessionID      uint64 `json:"session_id,omitempty"`
 	StreamID       uint32 `json:"stream_id,omitempty"`
 	SourceCallsign string `json:"source_callsign,omitempty"`
+	NodeCallsign   string `json:"node_callsign,omitempty"`
 }
 type Snapshot struct {
 	Ready        bool          `json:"ready"`
@@ -84,6 +85,9 @@ type StreamEnd struct {
 	SessionID uint64
 	StreamID  uint32
 	Reason    EndReason
+	Sequence  uint32
+	Timestamp uint32
+	Duration  time.Duration
 }
 type floor struct {
 	owner                          uint64
@@ -91,6 +95,7 @@ type floor struct {
 	source                         string
 	granted, firstMedia, lastMedia time.Time
 	prior                          uint32
+	timestamp                      uint32
 	hasPrior                       bool
 }
 type TransactionKey struct {
@@ -149,6 +154,16 @@ func (e *Engine) SetReady(id uint64) bool {
 	s.last = e.now()
 	return true
 }
+func (e *Engine) Touch(id uint64, address string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s := e.sessions[id]
+	if s == nil || s.address != address {
+		return false
+	}
+	s.last = e.now()
+	return true
+}
 func (e *Engine) RequestFloor(id uint64, stream uint32, source string) FloorResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -190,6 +205,7 @@ func (e *Engine) Media(id uint64, address string, stream, sequence, timestamp ui
 		}
 	}
 	e.floor.prior = sequence
+	e.floor.timestamp = timestamp
 	e.floor.hasPrior = true
 	e.floor.lastMedia = now
 	result := make([]Fanout, 0, len(e.sessions)-1)
@@ -210,6 +226,11 @@ func (e *Engine) releaseLocked(id uint64, reason EndReason) *StreamEnd {
 		return nil
 	}
 	end := &StreamEnd{SessionID: id, StreamID: e.floor.stream, Reason: reason}
+	if !e.floor.firstMedia.IsZero() {
+		end.Sequence = e.floor.prior + 1
+		end.Timestamp = e.floor.timestamp
+		end.Duration = e.now().Sub(e.floor.firstMedia)
+	}
 	e.floor = nil
 	return end
 }
@@ -262,7 +283,11 @@ func (e *Engine) Snapshot() Snapshot {
 	defer e.mu.Unlock()
 	s := Snapshot{Ready: !e.draining, Sessions: len(e.sessions), SequenceGaps: e.gaps}
 	if e.floor != nil {
-		s.Floor = FloorSnapshot{Active: true, SessionID: e.floor.owner, StreamID: e.floor.stream, SourceCallsign: e.floor.source}
+		node := ""
+		if owner := e.sessions[e.floor.owner]; owner != nil {
+			node = owner.callsign
+		}
+		s.Floor = FloorSnapshot{Active: true, SessionID: e.floor.owner, StreamID: e.floor.stream, SourceCallsign: e.floor.source, NodeCallsign: node}
 	}
 	return s
 }

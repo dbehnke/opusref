@@ -53,6 +53,9 @@ The server uses one UDP socket. A session key contains the random session ID and
 the remote IP address and port. The session store has configured client and
 challenge limits. Expiration uses an injected monotonic clock.
 
+The UDP reader uses a 1,201-byte detection buffer. It rejects a datagram that is
+larger than 1,200 bytes. It does not accept a truncated prefix as a packet.
+
 ## 4. State model
 
 ```mermaid
@@ -99,6 +102,11 @@ stream-revoke notification. The listener acknowledges the notification. The
 server retries an unacknowledged notification with the standard bounded retry
 schedule. A new session does not enter the fan-out set until its immediate
 post-welcome keepalive confirms the session ID.
+
+The client waits for `STREAM_GRANT` before it activates its send state. It uses
+the same transaction ID for attempts at 0, 0.5, 1.5, and 3.5 seconds. It rejects
+a response with a different session ID or transaction ID. It acknowledges each
+notification retry and publishes one lifecycle event for the state change.
 
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send

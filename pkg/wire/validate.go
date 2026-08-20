@@ -24,12 +24,13 @@ type ValidationContext struct {
 type Reason string
 
 const (
-	ReasonMalformed          Reason = "malformed"
-	ReasonUnsupportedVersion Reason = "unsupported_version"
-	ReasonInvalidSession     Reason = "invalid_session"
-	ReasonInvalidStream      Reason = "invalid_stream"
-	ReasonUnsupportedType    Reason = "unsupported_type"
-	ReasonLimitExceeded      Reason = "limit_exceeded"
+	ReasonMalformed           Reason = "malformed"
+	ReasonUnsupportedVersion  Reason = "unsupported_version"
+	ReasonInvalidSession      Reason = "invalid_session"
+	ReasonInvalidStream       Reason = "invalid_stream"
+	ReasonUnsupportedType     Reason = "unsupported_type"
+	ReasonLimitExceeded       Reason = "limit_exceeded"
+	ReasonTransactionConflict Reason = "transaction_conflict"
 )
 
 type ValidationError struct {
@@ -37,113 +38,107 @@ type ValidationError struct {
 	Field  string
 }
 
-func (e *ValidationError) Error() string { return fmt.Sprintf("%s: %s", e.Reason, e.Field) }
-func invalid(reason Reason, field string) error {
-	return &ValidationError{Reason: reason, Field: field}
+func (e *ValidationError) Error() string        { return fmt.Sprintf("%s: %s", e.Reason, e.Field) }
+func invalid(reason Reason, field string) error { return &ValidationError{reason, field} }
+
+type packetRule struct {
+	directions                                  uint8
+	phases                                      uint8
+	request, response                           bool
+	session, stream                             string
+	sequence                                    string
+	payload                                     string
+	requestRequired, responseRequired, optional []TLVType
 }
 
-// Validate checks packet semantics that do not depend on mutable peer state.
+const (
+	dirC           = 1
+	dirS           = 2
+	phasePre       = 1
+	phaseConnected = 2
+	phaseReady     = 4
+)
+
+var rules = map[PacketType]packetRule{
+	PacketHello:         {dirC, phasePre, true, false, "zero", "zero", "zero", "empty", []TLVType{TLVTransactionID, TLVNodeCallsign, TLVClientNonce}, nil, nil},
+	PacketChallenge:     {dirS, phasePre, false, true, "zero", "zero", "zero", "empty", nil, []TLVType{TLVTransactionID, TLVServerNonce, TLVReflectorID, TLVDisplayName}, nil},
+	PacketAuthenticate:  {dirC, phasePre, true, false, "zero", "zero", "zero", "empty", []TLVType{TLVTransactionID, TLVClientNonce, TLVServerNonce}, nil, []TLVType{TLVAuthenticationTag}},
+	PacketWelcome:       {dirS, phasePre | phaseConnected, false, true, "nonzero", "zero", "zero", "empty", nil, []TLVType{TLVTransactionID, TLVReflectorID, TLVDisplayName}, nil},
+	PacketKeepalive:     {dirC | dirS, phaseConnected | phaseReady, true, true, "nonzero", "zero", "zero", "empty", []TLVType{TLVTransactionID}, []TLVType{TLVTransactionID}, nil},
+	PacketDisconnect:    {dirC | dirS, phaseConnected | phaseReady, true, true, "nonzero", "zero", "zero", "empty", []TLVType{TLVTransactionID}, []TLVType{TLVTransactionID}, nil},
+	PacketError:         {dirC | dirS, phasePre | phaseConnected | phaseReady, false, true, "any", "any", "zero", "empty", nil, []TLVType{TLVErrorCode}, []TLVType{TLVTransactionID, TLVErrorText}},
+	PacketStreamRequest: {dirC, phaseReady, true, false, "nonzero", "nonzero", "zero", "empty", []TLVType{TLVTransactionID, TLVSourceCallsign}, nil, nil},
+	PacketStreamGrant:   {dirS, phaseReady, false, true, "nonzero", "nonzero", "zero", "empty", nil, []TLVType{TLVTransactionID, TLVTransmitTimeLimit}, nil},
+	PacketStreamBusy:    {dirS, phaseReady, false, true, "nonzero", "nonzero", "zero", "empty", nil, []TLVType{TLVTransactionID}, nil},
+	PacketStreamStart:   {dirC | dirS, phaseReady, true, true, "nonzero", "nonzero", "zero", "empty", []TLVType{TLVTransactionID, TLVNodeCallsign, TLVSourceCallsign, TLVTransmitTimeLimit}, []TLVType{TLVTransactionID}, nil},
+	PacketStreamEnd:     {dirC | dirS, phaseReady, true, true, "nonzero", "nonzero", "any", "empty", []TLVType{TLVTransactionID}, []TLVType{TLVTransactionID, TLVEndReason}, nil},
+	PacketStreamRevoke:  {dirC | dirS, phaseReady, true, true, "nonzero", "nonzero", "any", "empty", []TLVType{TLVTransactionID, TLVEndReason}, []TLVType{TLVTransactionID}, nil},
+	PacketAudio:         {dirC | dirS, phaseReady, true, false, "nonzero", "nonzero", "any", "nonempty", nil, nil, nil},
+	PacketData:          {dirC | dirS, phaseReady, true, false, "nonzero", "nonzero", "any", "nonempty", []TLVType{TLVDataType}, nil, nil},
+}
+
+// Validate checks all stateless rules in the v1 packet matrix.
 func Validate(p Packet, c ValidationContext) error {
 	if p.Header.Version != Version1 {
 		return invalid(ReasonUnsupportedVersion, "version")
 	}
-	if c.Direction != ClientToServer && c.Direction != ServerToClient {
-		return invalid(ReasonMalformed, "direction")
-	}
-	if c.Phase < PreAdmission || c.Phase > Ready {
-		return invalid(ReasonMalformed, "phase")
-	}
-	allowed := map[TLVType]bool{}
-	require := func(types ...TLVType) {
-		for _, typ := range types {
-			allowed[typ] = true
-		}
-	}
-	need := []TLVType{}
-	fieldsZero := true
-	emptyPayload := true
-	clientOnly, serverOnly := false, false
-	switch p.Header.Type {
-	case PacketHello:
-		clientOnly = true
-		require(TLVTransactionID, TLVNodeCallsign, TLVClientNonce)
-		need = []TLVType{TLVTransactionID, TLVNodeCallsign, TLVClientNonce}
-	case PacketChallenge:
-		serverOnly = true
-		require(TLVTransactionID, TLVServerNonce, TLVReflectorID, TLVDisplayName)
-		need = []TLVType{TLVTransactionID, TLVServerNonce, TLVReflectorID, TLVDisplayName}
-	case PacketAuthenticate:
-		clientOnly = true
-		require(TLVTransactionID, TLVClientNonce, TLVServerNonce, TLVAuthenticationTag)
-		need = []TLVType{TLVTransactionID, TLVClientNonce, TLVServerNonce}
-	case PacketWelcome:
-		serverOnly = true
-		fieldsZero = false
-		require(TLVTransactionID, TLVReflectorID, TLVDisplayName)
-		need = []TLVType{TLVTransactionID, TLVReflectorID, TLVDisplayName}
-	case PacketKeepalive, PacketDisconnect:
-		fieldsZero = false
-		require(TLVTransactionID)
-		need = []TLVType{TLVTransactionID}
-	case PacketError:
-		fieldsZero = false
-		require(TLVErrorCode, TLVTransactionID, TLVErrorText)
-		need = []TLVType{TLVErrorCode}
-	case PacketStreamRequest:
-		clientOnly = true
-		fieldsZero = false
-		require(TLVTransactionID, TLVSourceCallsign)
-		need = []TLVType{TLVTransactionID, TLVSourceCallsign}
-	case PacketStreamGrant:
-		serverOnly = true
-		fieldsZero = false
-		require(TLVTransactionID, TLVTransmitTimeLimit)
-		need = []TLVType{TLVTransactionID, TLVTransmitTimeLimit}
-	case PacketStreamBusy:
-		serverOnly = true
-		fieldsZero = false
-		require(TLVTransactionID)
-		need = []TLVType{TLVTransactionID}
-	case PacketStreamStart:
-		fieldsZero = false
-		require(TLVTransactionID, TLVNodeCallsign, TLVSourceCallsign, TLVTransmitTimeLimit)
-		need = []TLVType{TLVTransactionID}
-	case PacketStreamEnd:
-		fieldsZero = false
-		require(TLVTransactionID, TLVEndReason)
-		need = []TLVType{TLVTransactionID}
-	case PacketStreamRevoke:
-		fieldsZero = false
-		require(TLVTransactionID, TLVEndReason)
-		need = []TLVType{TLVTransactionID}
-	case PacketAudio:
-		fieldsZero = false
-		emptyPayload = false
-	case PacketData:
-		fieldsZero = false
-		emptyPayload = false
-		require(TLVDataType)
-		need = []TLVType{TLVDataType}
-	default:
+	rule, ok := rules[p.Header.Type]
+	if !ok {
 		return invalid(ReasonUnsupportedType, "type")
 	}
-	if clientOnly && c.Direction != ClientToServer || serverOnly && c.Direction != ServerToClient {
+	direction := uint8(0)
+	if c.Direction == ClientToServer {
+		direction = dirC
+	} else if c.Direction == ServerToClient {
+		direction = dirS
+	} else {
+		return invalid(ReasonMalformed, "direction")
+	}
+	phase := uint8(0)
+	if c.Phase == PreAdmission {
+		phase = phasePre
+	} else if c.Phase == Connected {
+		phase = phaseConnected
+	} else if c.Phase == Ready {
+		phase = phaseReady
+	} else {
+		return invalid(ReasonMalformed, "phase")
+	}
+	if rule.directions&direction == 0 {
 		return invalid(ReasonUnsupportedType, "direction")
 	}
-	if (p.Header.Type == PacketAudio || p.Header.Type == PacketData) && c.Phase != Ready {
+	if rule.phases&phase == 0 {
 		return invalid(ReasonInvalidSession, "phase")
 	}
-	if fieldsZero && (p.Header.SessionID != 0 || p.Header.StreamID != 0 || p.Header.Sequence != 0 || p.Header.Timestamp != 0) {
-		return invalid(ReasonMalformed, "header")
+	response := p.Header.Flags&FlagResponse != 0
+	if p.Header.Flags&FlagReservedMask != 0 || response && p.Header.Flags&FlagRetry != 0 || response && !rule.response || !response && !rule.request {
+		return invalid(ReasonMalformed, "flags")
 	}
-	if !fieldsZero && p.Header.Type != PacketError && p.Header.SessionID == 0 {
+	if (p.Header.Type == PacketStreamStart || p.Header.Type == PacketStreamRevoke) && ((direction == dirC) != response) {
+		return invalid(ReasonMalformed, "flags")
+	}
+	if p.Header.Type == PacketStreamEnd && ((direction == dirS) != response) {
+		return invalid(ReasonMalformed, "flags")
+	}
+	if checkNumber(rule.session, p.Header.SessionID) != nil {
 		return invalid(ReasonInvalidSession, "session_id")
 	}
-	if p.Header.Type >= PacketStreamRequest && p.Header.Type <= PacketData && p.Header.StreamID == 0 {
+	if checkNumber(rule.stream, uint64(p.Header.StreamID)) != nil {
 		return invalid(ReasonInvalidStream, "stream_id")
 	}
-	if emptyPayload && len(p.Payload) != 0 || !emptyPayload && len(p.Payload) == 0 {
+	if rule.sequence == "zero" && (p.Header.Sequence != 0 || p.Header.Timestamp != 0) {
+		return invalid(ReasonMalformed, "sequence")
+	}
+	if rule.payload == "empty" && len(p.Payload) != 0 || rule.payload == "nonempty" && len(p.Payload) == 0 {
 		return invalid(ReasonMalformed, "payload")
+	}
+	required := rule.requestRequired
+	if response {
+		required = rule.responseRequired
+	}
+	allowed := map[TLVType]bool{}
+	for _, typ := range append(append([]TLVType{}, required...), rule.optional...) {
+		allowed[typ] = true
 	}
 	present := map[TLVType]bool{}
 	for _, tlv := range p.Extensions {
@@ -153,10 +148,19 @@ func Validate(p Packet, c ValidationContext) error {
 		}
 		present[base] = true
 	}
-	for _, typ := range need {
+	for _, typ := range required {
 		if !present[typ] {
 			return invalid(ReasonMalformed, "extensions")
 		}
+	}
+	return nil
+}
+func checkNumber(rule string, value uint64) error {
+	if rule == "zero" && value != 0 {
+		return fmt.Errorf("nonzero")
+	}
+	if rule == "nonzero" && value == 0 {
+		return fmt.Errorf("zero")
 	}
 	return nil
 }

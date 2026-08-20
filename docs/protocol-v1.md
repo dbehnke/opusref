@@ -44,13 +44,10 @@ stream uses stream ID, sequence, and timestamp zero. Audio and data packets use
 one shared sequence space for the stream. The first media packet uses sequence
 zero. The value increases by one modulo 2^32 for each audio or data packet.
 
-The first media timestamp MAY have any value. This rule applies when the first
-media packet is audio or data. The value establishes the current stream
-position. A data packet uses the current stream position and does not change it.
-The first audio packet uses the current stream position. After an audio packet
-with timestamp T and duration D, the current stream position becomes T plus D
-modulo 2^32. Thus, the next audio packet uses T plus D even when data packets
-occur between the audio packets.
+The endpoint supplies each media timestamp. The first timestamp MAY have any
+value. The endpoint uses one 48 kHz timeline for audio and data. The reflector
+does not calculate packet duration or check timestamp continuity. It forwards
+the timestamp without modification.
 
 ### 3.1 Flags
 

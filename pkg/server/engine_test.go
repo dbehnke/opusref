@@ -27,7 +27,7 @@ func TestFloorLifecycleAndOpaqueFanout(t *testing.T) {
 	}
 	now = now.Add(time.Second + time.Nanosecond)
 	ended := e.Tick()
-	if ended == nil || ended.Reason != EndMediaInactivity || e.Snapshot().Floor.Active {
+	if ended == nil || ended.Reason != EndMediaInactivity || ended.Sequence != 1 || ended.Timestamp != 48000 || e.Snapshot().Floor.Active {
 		t.Fatalf("bad release: %#v", ended)
 	}
 }

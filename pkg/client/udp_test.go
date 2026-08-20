@@ -51,6 +51,9 @@ func TestUDPClientsExchangeOpaqueFrame(t *testing.T) {
 	}
 	select {
 	case event := <-listener.Events():
+		if event.Kind == client.EventStreamStart {
+			event = <-listener.Events()
+		}
 		if event.Kind != client.EventAudio || event.Timestamp != 48000 || !bytes.Equal(event.Payload, payload) {
 			t.Fatalf("bad event %#v", event)
 		}

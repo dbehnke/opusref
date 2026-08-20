@@ -1,15 +1,9 @@
-// Package server defines the future reflector service boundaries.
+// Package server implements reflector policy and UDP composition.
 package server
 
-import (
-	"context"
-	"errors"
-)
+import "context"
 
-// ErrNotImplemented marks bootstrap-only operations.
-var ErrNotImplemented = errors.New("opusref server networking is not implemented")
-
-// Service is the lifecycle contract for the future reflector.
+// Service is the reflector lifecycle contract.
 type Service interface {
 	Run(context.Context) error
 	Close() error
