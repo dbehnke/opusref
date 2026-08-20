@@ -2,12 +2,16 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"github.com/dbehnke/opusref/pkg/wire"
 	"gopkg.in/yaml.v3"
+	"net"
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -69,14 +73,54 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if err = yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err = decoder.Decode(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.Network.UDPListen == "" || cfg.Reflector.ID == "" || cfg.Reflector.DisplayName == "" {
 		return Config{}, errors.New("network and reflector identity are required")
 	}
+	if _, err := wire.ReflectorID(cfg.Reflector.ID); err != nil {
+		return Config{}, err
+	}
+	if len(cfg.Reflector.DisplayName) > 64 || !utf8.ValidString(cfg.Reflector.DisplayName) {
+		return Config{}, errors.New("reflector display name is invalid")
+	}
 	if cfg.Limits.MaxDatagramBytes < 32 || cfg.Limits.MaxDatagramBytes > 1200 {
 		return Config{}, errors.New("max datagram bytes must be 32 through 1200")
+	}
+	if _, err := net.ResolveUDPAddr("udp", cfg.Network.UDPListen); err != nil {
+		return Config{}, fmt.Errorf("invalid UDP address: %w", err)
+	}
+	if cfg.Monitoring.HTTPListen != "" {
+		if _, err := net.ResolveTCPAddr("tcp", cfg.Monitoring.HTTPListen); err != nil {
+			return Config{}, fmt.Errorf("invalid monitoring address: %w", err)
+		}
+	}
+	capacities := []int{cfg.Limits.MaxClients, cfg.Limits.InboundQueuePackets, cfg.Limits.OutboundMediaQueueFrames, cfg.Limits.OutboundControlQueuePackets, cfg.Limits.MaxPendingChallenges, cfg.Limits.MaxCompletedTransactions, cfg.Limits.MaxCompletedTransactionsPerSession, cfg.Limits.MaxPendingNotifications, cfg.Limits.MaxPendingNotificationsPerClient, cfg.Limits.RecentEvents}
+	for _, value := range capacities {
+		if value <= 0 {
+			return Config{}, errors.New("all capacity limits must be positive")
+		}
+	}
+	if cfg.Limits.MaxCompletedTransactionsPerSession > cfg.Limits.MaxCompletedTransactions || cfg.Limits.MaxPendingNotificationsPerClient > cfg.Limits.MaxPendingNotifications {
+		return Config{}, errors.New("a per-client limit exceeds its global limit")
+	}
+	timers := []time.Duration{cfg.Timers.KeepaliveInterval, cfg.Timers.SessionTimeout, cfg.Timers.GrantTimeout, cfg.Timers.StreamInactivityTimeout, cfg.Timers.TransmitTimeLimit, cfg.Timers.HealthDeadline, cfg.Timers.ShutdownGrace}
+	for _, value := range timers {
+		if value <= 0 {
+			return Config{}, errors.New("all timers must be positive")
+		}
+	}
+	if cfg.Timers.KeepaliveInterval >= cfg.Timers.SessionTimeout {
+		return Config{}, errors.New("keepalive interval must be less than session timeout")
+	}
+	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
+		return Config{}, errors.New("logging level is invalid")
+	}
+	if cfg.Logging.Format != "json" && cfg.Logging.Format != "text" {
+		return Config{}, errors.New("logging format is invalid")
 	}
 	return cfg, nil
 }

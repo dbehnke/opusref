@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,22 @@ func TestLoadExample(t *testing.T) {
 	}
 	if cfg.Limits.OutboundControlQueuePackets != 64 || cfg.Timers.HealthDeadline == 0 {
 		t.Fatalf("bad defaults: %#v", cfg)
+	}
+}
+func TestLoadRejectsUnknownAndInvalidConfiguration(t *testing.T) {
+	base, err := os.ReadFile("../../config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []string{string(base) + "\nunknown: true\n", strings.Replace(string(base), "udp_listen: \":46000\"", "udp_listen: \":bad\"", 1), strings.Replace(string(base), "max_clients: 100", "max_clients: 0", 1), strings.Replace(string(base), "keepalive_interval: 10s", "keepalive_interval: 40s", 1), strings.Replace(string(base), "level: \"info\"", "level: \"verbose\"", 1)}
+	for _, content := range tests {
+		name := filepath.Join(t.TempDir(), "bad.yaml")
+		if err := os.WriteFile(name, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(name); err == nil {
+			t.Fatalf("accepted invalid configuration")
+		}
 	}
 }
 func TestEnvironmentKeyPrecedesFile(t *testing.T) {

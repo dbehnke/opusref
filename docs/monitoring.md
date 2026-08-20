@@ -80,6 +80,14 @@ The fixed `direction` values are `rx` and `tx`. The fixed `item_type` values are
 `client_events`, `client_media`, and `client_control`. The implementation MUST
 reject any other label value.
 
+Packet error reasons are `malformed`, `unsupported_version`, `invalid_session`,
+`address_mismatch`, `invalid_stream`, `unsupported_type`, `limit_exceeded`, and
+`transaction_conflict`. Authentication results are `accepted`, `rejected`, and
+`overloaded`. Authentication modes are `open` and `shared_key`. Stream results
+are `granted`, `busy`, `rejected`, and `overloaded`. Stream-end reasons and
+timeout kinds use the values that the protocol specification defines. Packet
+type labels use the lowercase names in the packet-type registry.
+
 ## 5. Snapshot design
 
 ```mermaid

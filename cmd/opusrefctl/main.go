@@ -88,7 +88,19 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		return err
 	}
 	for {
-		rec, err := record.Read(in)
+		type readResult struct {
+			rec record.Record
+			err error
+		}
+		results := make(chan readResult, 1)
+		go func() { rec, err := record.Read(in); results <- readResult{rec, err} }()
+		var rec record.Record
+		select {
+		case <-ctx.Done():
+			return nil
+		case result := <-results:
+			rec, err = result.rec, result.err
+		}
 		if errors.Is(err, io.EOF) {
 			opCtx, cancel = context.WithTimeout(ctx, c.operationTimeout)
 			err = cli.EndStream(opCtx)
@@ -151,6 +163,9 @@ func readKey(c common) (string, error) {
 	data, err := os.ReadFile(c.keyFile)
 	if err != nil {
 		return "", err
+	}
+	if len(data) > 65 {
+		return "", errors.New("shared key file is too large")
 	}
 	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
 	if len(value) < 16 || len(value) > 64 {
