@@ -24,7 +24,7 @@ field. Unknown JSON fields can be added in a compatible release.
 | `/readyz` | `200` after UDP bind and state-loop start; otherwise `503` |
 | `/api/v1/status` | Reflector identity, version, uptime, readiness, client count, and floor summary |
 | `/api/v1/clients` | Connected node callsign, masked remote address, session ID, connect time, and last activity |
-| `/api/v1/stream` | Idle state or owner/session/stream callsigns, start time, last frame time, and remaining TOT |
+| `/api/v1/stream` | Idle state or owner/session/stream callsigns, start time, last frame time, and remaining transmit time |
 | `/api/v1/events` | Newest-first bounded connection, authentication, stream, timeout, and error events |
 | `/metrics` | Prometheus text exposition |
 
@@ -38,7 +38,7 @@ Each event contains an event ID, UTC timestamp, event type, severity, and a
 small set of typed details. Event IDs increase for the process lifetime. The
 defined event types are client connected, client disconnected, authentication
 failed, stream granted, stream busy, stream active, stream ended, stream
-timeout, transmit timeout, malformed packet, and queue drop.
+timeout, transmit time limit, malformed packet, and queue drop.
 
 An event must not contain media or typed-data payload bytes. Error text must not
 contain secret material.

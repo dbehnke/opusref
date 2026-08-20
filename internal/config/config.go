@@ -19,7 +19,7 @@ type Reflector struct{ ID, DisplayName string }
 type Limits struct{ MaxClients, MaxDatagramBytes, OutboundQueueFrames, RecentEvents int }
 type Timers struct {
 	KeepaliveInterval, SessionTimeout, GrantTimeout time.Duration
-	StreamInactivityTimeout, TransmitTimeout        time.Duration
+	StreamInactivityTimeout, TransmitTimeLimit      time.Duration
 }
 type Authentication struct{ SharedKeyEnv, SharedKeyFile string }
 type Monitoring struct{ HTTPListen string }

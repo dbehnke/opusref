@@ -1,6 +1,7 @@
 // Package wire defines the public OpusRef v1 wire vocabulary.
 //
-// Encoding and decoding are intentionally not implemented in the bootstrap.
+// The bootstrap implements structural encoding and decoding. Packet-specific
+// semantic validation remains part of later protocol implementation.
 package wire
 
 const (
@@ -76,7 +77,8 @@ const (
 	TLVDataType
 	TLVErrorCode
 	TLVErrorText
-	TLVTransmitLimit
+	TLVTransmitTimeLimit
+	TLVEndReason
 )
 
 // ErrorCode identifies a protocol error without exposing implementation text.
@@ -91,6 +93,18 @@ const (
 	ErrorLimitExceeded
 	ErrorUnsupportedType
 	ErrorInternal
+)
+
+// EndReason identifies why the server released the floor.
+type EndReason uint16
+
+const (
+	EndReasonNormal EndReason = iota
+	EndReasonOwnerDisconnect
+	EndReasonGrantTimeout
+	EndReasonMediaInactivity
+	EndReasonTransmitTimeLimit
+	EndReasonServerShutdown
 )
 
 const (

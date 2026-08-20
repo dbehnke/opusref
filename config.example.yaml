@@ -16,7 +16,7 @@ timers:
   session_timeout: 30s
   grant_timeout: 2s
   stream_inactivity_timeout: 1s
-  transmit_timeout: 180s
+  transmit_time_limit: 180s
 
 authentication:
   # Open admission is used when both values are empty. Environment wins.
@@ -29,4 +29,3 @@ monitoring:
 logging:
   level: "info"
   format: "json"
-

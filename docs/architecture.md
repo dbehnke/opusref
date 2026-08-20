@@ -78,7 +78,7 @@ result. A second client receives `STREAM_BUSY`. A grant becomes active on the
 first valid audio or data packet.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
-inactivity timeout, and transmit timeout. Each release produces one monitor
+inactivity timeout, and transmit time limit. Each release produces one monitor
 event and one listener revoke operation.
 
 ## 5. Client architecture
@@ -104,10 +104,20 @@ The server reads YAML once at startup. It validates all addresses, limits,
 identifiers, and timer relationships before it opens a socket. Defaults match
 `config.example.yaml`.
 
-An environment variable has priority over a shared-key file. An empty value in
-both sources selects open admission. The key never enters a configuration
-snapshot, log field, error, metric, or HTTP response. The server refuses a key
-file that is not a regular file.
+An environment variable has priority over a shared-key file. The server uses the
+UTF-8 bytes of a nonempty environment value. If the environment variable is not
+set or is empty, the server reads the configured file. It reads at most 65 bytes
+and removes one final LF or CRLF line ending. The remaining key MUST contain 16
+through 64 bytes. The server does not trim other bytes.
+
+The key file MUST be a regular file. On a system that reports POSIX permission
+bits, group and other permissions MUST be zero. The server refuses a file when
+it cannot verify these restrictions. An operator on an unsupported file system
+must use the environment variable. If neither source supplies a key, the server
+uses open admission.
+
+The key never enters a configuration snapshot, log field, error, metric, or
+HTTP response.
 
 ## 7. Development method
 

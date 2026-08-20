@@ -82,7 +82,8 @@ document permits it.
 | `0x0009` | Data type | 2-byte unsigned integer |
 | `0x000a` | Error code | 2-byte unsigned integer |
 | `0x000b` | Error text | 1-128 bytes of UTF-8 |
-| `0x000c` | Transmit limit | 4-byte seconds value |
+| `0x000c` | Transmit time limit | 4-byte seconds value |
+| `0x000d` | End reason | 2-byte unsigned integer |
 
 A reflector ID uses uppercase ASCII, is left-aligned, and is padded with
 spaces. Its permitted characters are the same as callsign characters.
@@ -122,6 +123,45 @@ Values `0x08-0x1f`, `0x26-0x3f`, and `0x42-0x7f` are reserved. Values
 `0x80-0xff` are private experiments. A v1 server MUST NOT forward an unknown
 packet type.
 
+### 6.1 Packet field rules
+
+The table lists all known TLVs that a packet can contain. `Required` TLVs MUST
+occur one time. `Optional` TLVs MAY occur one time. A receiver MUST reject a
+known TLV that is not permitted for the packet type. A receiver handles an
+unknown TLV as specified in section 4.
+
+`Zero` means that the field MUST be zero. `Session` means the connected client's
+session ID. `Owner` means the floor owner's session ID. All control packets have
+an empty payload.
+
+| Packet | Session ID | Stream ID | Sequence and timestamp | Flags | Required TLVs | Optional TLVs | Payload |
+|---|---|---|---|---|---|---|---|
+| HELLO | Zero | Zero | Zero | RETRY on a retry only | Transaction ID, node callsign, client nonce | None | Empty |
+| CHALLENGE | Zero | Zero | Zero | RESPONSE | Transaction ID, server nonce, reflector ID, display name | None | Empty |
+| AUTHENTICATE | Zero | Zero | Zero | RETRY on a retry only | Transaction ID, client nonce, server nonce | Authentication tag in protected mode | Empty |
+| WELCOME | New session | Zero | Zero | RESPONSE | Transaction ID, reflector ID, display name | None | Empty |
+| KEEPALIVE request | Session | Zero | Zero | RETRY on a retry only | Transaction ID | None | Empty |
+| KEEPALIVE response | Session | Zero | Zero | RESPONSE | Transaction ID | None | Empty |
+| DISCONNECT request | Session | Zero | Zero | RETRY on a retry only | Transaction ID | None | Empty |
+| DISCONNECT response | Session | Zero | Zero | RESPONSE | Transaction ID | None | Empty |
+| ERROR | Session, or zero before admission | Related stream, or zero | Zero | RESPONSE | Error code | Transaction ID, error text | Empty |
+| STREAM_REQUEST | Session | New stream | Zero | RETRY on a retry only | Transaction ID, source callsign | None | Empty |
+| STREAM_GRANT | Session | Requested stream | Zero | RESPONSE | Transaction ID, transmit time limit | None | Empty |
+| STREAM_BUSY | Session | Requested stream | Zero | RESPONSE | Transaction ID | None | Empty |
+| STREAM_START | Owner | Active stream | Zero | Zero | Node callsign, source callsign, transmit time limit | None | Empty |
+| STREAM_END request | Session | Active stream | Next sequence and current timestamp | RETRY on a retry only | Transaction ID | None | Empty |
+| STREAM_END response | Session | Ended stream | Request values | RESPONSE | Transaction ID, end reason | None | Empty |
+| STREAM_REVOKE | Owner | Ended stream | Next sequence and final timestamp | Zero | End reason | None | Empty |
+| AUDIO | Owner | Active stream | Current media values | Zero | None | Future optional TLVs | One Opus packet |
+| DATA | Owner | Active stream | Current media values | Zero | Data type | Future optional TLVs | Opaque data |
+
+An audio or data payload MUST contain at least one byte. Header and TLV lengths
+set its maximum size. A server-to-client `AUDIO` or `DATA` packet keeps the floor
+owner's session ID. It does not replace that value with a listener's session ID.
+The server still validates an inbound packet against the remote address that is
+bound to the session. A listener MUST NOT use an observed owner session ID as
+its local session ID.
+
 ## 7. Connection procedure
 
 ```mermaid
@@ -138,12 +178,13 @@ sequenceDiagram
     end
 ```
 
-The client sends `HELLO` with a transaction ID, node callsign, and client
-nonce. The server sends `CHALLENGE` with the same transaction ID, a server
+The client sends `HELLO` with a connection transaction ID, node callsign, and
+client nonce. The server sends `CHALLENGE` with the same transaction ID, a server
 nonce, the reflector ID, and the display name. A challenge expires after 10
 seconds and is valid one time.
 
-The client sends `AUTHENTICATE` with both nonces and the same transaction ID.
+The client sends `AUTHENTICATE` with both nonces and the same connection
+transaction ID.
 In open mode, it omits the authentication tag. In protected mode, it includes
 this HMAC-SHA-256 value:
 
@@ -168,13 +209,22 @@ no valid packet.
 
 ## 8. Transactions and retries
 
-A control request that changes state MUST contain a transaction ID. The client
-waits 500 ms for its response. It then retries at 1 second and 2 seconds. It
-uses the same transaction ID and sets `RETRY`. It stops after the third retry.
+A control request that expects a response MUST contain a transaction ID. The
+client sends the first attempt at time zero. If no response arrives, it sends
+three retries. The retries occur 500 ms, 1.5 seconds, and 3.5 seconds after the
+first attempt. Thus, the delay after each attempt is 500 ms, 1 second, and 2
+seconds. Each retry uses the same transaction ID and sets `RETRY`. The client
+stops after four total attempts.
 
-The server keeps completed transaction results for at least 30 seconds. When it
-receives a duplicate, it returns the prior logical result and does not repeat
-the state change. A response copies the transaction ID and sets `RESPONSE`.
+Before admission, the server cache key is the remote IP address and port, the
+request packet type, and the transaction ID. After admission, the cache key is
+the session ID, the request packet type, and the transaction ID. Packet type is
+part of both keys. Thus, `HELLO` and `AUTHENTICATE` can use the same connection
+transaction ID and cannot collide in the cache.
+
+The server keeps a completed result for at least 30 seconds. When it receives a
+duplicate request, it returns the prior logical result and does not repeat the
+state change. A response copies the transaction ID and sets `RESPONSE`.
 
 ## 9. Half-duplex stream procedure
 
@@ -200,18 +250,18 @@ sequenceDiagram
 One server has one channel and one floor owner. A client sends `STREAM_REQUEST`
 with a new nonzero stream ID, a transaction ID, and a source callsign. If the
 floor is free, the server sends `STREAM_GRANT` to the requester. It also sends
-`STREAM_START` with node callsign, source callsign, and transmit limit to all
+`STREAM_START` with node callsign, source callsign, and transmit time limit to all
 listeners. If the floor is not free, it sends `STREAM_BUSY`.
 
 The client MUST wait for `STREAM_GRANT` before it sends media. The grant expires
 if no media arrives in two seconds. The server releases the floor after one
-second with no valid media. It also releases the floor after 180 seconds by
-default. These three values are server configuration values.
+second with no valid media. The default transmit time limit releases the floor
+after 180 seconds. These three values are server configuration values.
 
 The owner sends `STREAM_END` to release the floor. The server acknowledges it
 with `STREAM_END` and `RESPONSE`, then sends `STREAM_REVOKE` to listeners. The
-server also sends `STREAM_REVOKE` after a timeout or owner disconnect. Its error
-code states the reason.
+server also sends `STREAM_REVOKE` after a timeout or owner disconnect. The end
+reason states why the server released the floor.
 
 The server forwards only valid media from the floor owner's bound session and
 stream ID. It forwards the original sequence, timestamp, TLVs, and payload. It
@@ -236,6 +286,10 @@ Data is unreliable. It uses the active stream sequence space and arbitration.
 The server MUST reject data outside the active stream.
 
 ## 11. Error handling
+
+The end-reason values are: normal end (0), owner disconnect (1), grant timeout
+(2), media inactivity (3), transmit time limit (4), and server shutdown (5).
+An end reason is not an error code.
 
 The defined error codes are: malformed packet (1), unsupported version (2),
 authentication failed (3), invalid session (4), invalid stream (5), limit
