@@ -98,6 +98,10 @@ connection state machine and at most one local stream. It
 performs control retries and keepalives. It exposes received stream metadata,
 opaque audio, typed data, busy, revoke, and error events.
 
+A correlated `STREAM_BUSY` completes the pending floor request, returns the
+busy error, and publishes a populated busy event. The event contains the local
+session ID and requested stream ID.
+
 The server uses a per-listener transaction for each stream-start and
 stream-revoke notification. The listener acknowledges the notification. The
 server retries an unacknowledged notification with the standard bounded retry
@@ -186,6 +190,12 @@ values instead of treating them as defaults.
 The live reflector supplies one clock to the engine, challenges, retained
 transactions, notification retries, session timeouts, and monitoring snapshots.
 Tests replace this clock to control policy time.
+
+`opusrefd` applies the configured log level and format to its runtime logger.
+The supported levels are debug, info, warn, and error. The supported formats
+are JSON and text. Runtime log fields can contain the reflector ID and listen
+addresses. They do not contain shared-key values, key-source settings, nonces,
+authentication tags, or HMAC input.
 
 An environment variable has priority over a shared-key file. The server uses the
 UTF-8 bytes of a nonempty environment value. If the environment variable is not

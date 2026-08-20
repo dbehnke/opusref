@@ -36,13 +36,40 @@ paths, or shared-key values.
 
 Each event contains an event ID, UTC timestamp, event type, severity, and a
 small set of typed details. Event IDs increase for the process lifetime. The
-defined event types are client connected, client disconnected, authentication
-failed, stream granted, stream busy, stream active, stream ended, stream
-timeout, transmit time limit, malformed packet, queue drop, and
-`control_overload`.
+defined event types are `client_connected`, `client_disconnected`,
+`authentication_failed`, `stream_granted`, `stream_busy`, `stream_active`,
+`stream_ended`, `stream_timeout`, `transmit_time_limit`, `malformed_packet`,
+`queue_drop`, and `control_overload`.
+
+| Event type | Required details |
+|---|---|
+| `client_connected` | Session ID and node callsign |
+| `client_disconnected` | Session ID, node callsign, and bounded reason |
+| `authentication_failed` | None |
+| `stream_granted` | Session ID and stream ID |
+| `stream_busy` | None |
+| `stream_active` | Session ID and stream ID |
+| `stream_ended` | Session ID, stream ID, and end reason |
+| `stream_timeout` | Session ID, stream ID, and grant or media-inactivity reason |
+| `transmit_time_limit` | Session ID, stream ID, and transmit-time-limit reason |
+| `malformed_packet` | None |
+| `queue_drop` | Fixed queue, fixed item type, frame count, and recipient count |
+| `control_overload` | Session ID |
+
+The server emits `stream_active` for the first accepted media frame. It emits a
+specific timeout event and `stream_ended` for a timeout. It emits
+`client_disconnected` on each path that removes a session. It emits
+`queue_drop` when it observes an inbound drop or rejects queued media or
+control work.
+
+The bounded disconnect reasons are `client_request`, `server_shutdown`,
+`session_timeout`, `control_overload`, and
+`admission_delivery_failure`.
 
 An event must not contain media or typed-data payload bytes. Error text must not
-contain secret material.
+contain secret material. Event details use bounded protocol identifiers, fixed
+reason strings, fixed queue names, fixed item types, and integer counts. They do
+not contain a shared key, nonce, authentication tag, or HMAC input.
 
 ## 4. Prometheus metrics
 

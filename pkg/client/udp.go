@@ -125,6 +125,7 @@ func (s *udpSender) RequestFloor(ctx context.Context, out Outbound) error {
 		return err
 	}
 	if reply.Header.Type == wire.PacketStreamBusy {
+		_ = s.owner.Publish(Event{Kind: EventBusy, SessionID: reply.Header.SessionID, StreamID: reply.Header.StreamID, Message: "reflector floor is busy"})
 		return ErrBusy
 	}
 	return nil

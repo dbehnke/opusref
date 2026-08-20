@@ -492,6 +492,131 @@ func TestReflectorRejectsInvalidCapacities(t *testing.T) {
 	}
 }
 
+func TestLifecycleMonitoringEventsFollowStateTransitions(t *testing.T) {
+	t.Run("authentication failure", func(t *testing.T) {
+		r, addr, events := eventReflector(t, Limits{})
+		r.authenticate(addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAuthenticate}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 1)}})
+		for _, event := range *events {
+			if event.Type == "authentication_failed" {
+				if len(event.Details) != 0 {
+					t.Fatalf("authentication event exposed details: %#v", event.Details)
+				}
+				return
+			}
+		}
+		t.Fatal("authentication failure event missing")
+	})
+	t.Run("disconnect", func(t *testing.T) {
+		r, addr, events := eventReflector(t, Limits{})
+		r.engine.AddSession(1, addr.String(), "N0ONE", true)
+		r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true}
+		request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: 1}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 1)}}
+		r.control(r.peers[1], request)
+		assertEvent(t, *events, "client_disconnected", "reason", "client_request")
+	})
+	t.Run("active and media timeout", func(t *testing.T) {
+		now := time.Unix(100, 0)
+		r, addr, events := eventReflectorAt(t, Limits{MediaTimeout: time.Second, TransmitTimeLimit: time.Hour}, func() time.Time { return now })
+		r.engine.AddSession(1, addr.String(), "N0ONE", true)
+		r.engine.RequestFloor(1, 7, "N0ONE")
+		r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true, connected: now, last: now}
+		packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: 1, StreamID: 7}, Payload: []byte{1}}
+		raw, _ := wire.Encode(packet)
+		if !r.media(r.peers[1], packet, raw) {
+			t.Fatal("media rejected")
+		}
+		assertEvent(t, *events, "stream_active", "stream_id", uint32(7))
+		now = now.Add(2 * time.Second)
+		r.tick(false)
+		assertEvent(t, *events, "stream_timeout", "reason", EndMediaInactivity)
+	})
+	t.Run("transmit time limit", func(t *testing.T) {
+		now := time.Unix(100, 0)
+		r, addr, events := eventReflectorAt(t, Limits{MediaTimeout: time.Hour, TransmitTimeLimit: time.Second}, func() time.Time { return now })
+		r.engine.AddSession(1, addr.String(), "N0ONE", true)
+		r.engine.RequestFloor(1, 7, "N0ONE")
+		r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true, connected: now, last: now}
+		packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: 1, StreamID: 7}, Payload: []byte{1}}
+		raw, _ := wire.Encode(packet)
+		r.media(r.peers[1], packet, raw)
+		now = now.Add(2 * time.Second)
+		r.tick(false)
+		assertEvent(t, *events, "transmit_time_limit", "reason", EndTransmitTimeLimit)
+	})
+}
+
+func TestQueueDropEventsClassifyMediaAndControl(t *testing.T) {
+	r, addr, events := eventReflector(t, Limits{})
+	listener := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4321}
+	r.engine.AddSession(1, addr.String(), "N0ONE", true)
+	r.engine.AddSession(2, listener.String(), "N0TWO", true)
+	r.engine.RequestFloor(1, 7, "N0ONE")
+	r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true}
+	r.peers[2] = &peer{id: 2, address: listener, node: "N0TWO", ready: true, receiving: true}
+	for len(r.transport.Media) < cap(r.transport.Media) {
+		r.transport.Media <- transport.MediaBatch{Kind: transport.MediaAudio}
+	}
+	packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketData, SessionID: 1, StreamID: 7}, Extensions: []wire.TLV{wire.Uint16TLV(wire.TLVDataType, 1)}, Payload: []byte{1}}
+	raw, _ := wire.Encode(packet)
+	r.media(r.peers[1], packet, raw)
+	assertEvent(t, *events, "queue_drop", "item_type", "data")
+	for len(r.transport.Control) < cap(r.transport.Control) {
+		r.transport.Control <- transport.Datagram{}
+	}
+	r.sendControl(listener, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketKeepalive, Flags: wire.FlagResponse, SessionID: 2}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 2)}})
+	assertEvent(t, *events, "queue_drop", "queue", "server_control")
+	assertEvent(t, *events, "control_overload", "session_id", uint64(2))
+	assertEvent(t, *events, "client_disconnected", "reason", "control_overload")
+}
+
+func TestLifecycleEventsReachMonitoringAPI(t *testing.T) {
+	r, addr, _ := eventReflector(t, Limits{})
+	registry := monitor.New(8, 0, nil)
+	r.SetEventSink(func(event EventRecord) {
+		registry.AddEvent(monitor.Event{Type: event.Type, Severity: event.Severity, Details: event.Details})
+	})
+	r.engine.AddSession(1, addr.String(), "N0ONE", true)
+	r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true}
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketDisconnect, SessionID: 1}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 1)}}
+	r.control(r.peers[1], request)
+	w := httptest.NewRecorder()
+	registry.Handler().ServeHTTP(w, httptest.NewRequest("GET", monitor.RouteEvents, nil))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"type":"client_disconnected"`) || !strings.Contains(w.Body.String(), `"reason":"client_request"`) {
+		t.Fatalf("events response %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func eventReflector(t *testing.T, limits Limits) (*Reflector, net.Addr, *[]EventRecord) {
+	t.Helper()
+	return eventReflectorAt(t, limits, time.Now)
+}
+
+func eventReflectorAt(t *testing.T, limits Limits, clock func() time.Time) (*Reflector, net.Addr, *[]EventRecord) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Clock: clock, Limits: limits, OutboundMediaQueueFrames: 1, OutboundControlQueuePackets: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []EventRecord{}
+	r.SetEventSink(func(event EventRecord) { events = append(events, event) })
+	return r, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}, &events
+}
+
+func assertEvent(t *testing.T, events []EventRecord, typ, key string, value any) {
+	t.Helper()
+	for _, event := range events {
+		if event.Type == typ && event.Details != nil && event.Details[key] == value {
+			return
+		}
+	}
+	t.Fatalf("missing %s with %s=%v in %#v", typ, key, value, events)
+}
+
 func sendPacket(t *testing.T, c net.PacketConn, addr net.Addr, p wire.Packet) {
 	t.Helper()
 	data, err := wire.Encode(p)

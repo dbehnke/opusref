@@ -9,6 +9,8 @@ import (
 	"github.com/dbehnke/opusref/internal/config"
 	"github.com/dbehnke/opusref/pkg/monitor"
 	"github.com/dbehnke/opusref/pkg/server"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +32,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
+	logger := newLogger(cfg.Logging, os.Stderr)
 	key, err := cfg.SharedKey()
 	if err != nil {
 		return fmt.Errorf("load shared key: %w", err)
@@ -48,6 +51,7 @@ func run() error {
 	reflector.SetEventSink(func(event server.EventRecord) {
 		registry.AddEvent(monitor.Event{Type: event.Type, Severity: event.Severity, Details: event.Details})
 	})
+	logRuntimeStart(logger, cfg)
 	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID})
 	httpServer := &http.Server{Addr: cfg.Monitoring.HTTPListen, Handler: registry.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	errHTTP := make(chan error, 1)
@@ -72,7 +76,9 @@ func run() error {
 			case <-ticker.C:
 				s := reflector.Snapshot()
 				if s.InboundDrops > priorInbound {
-					_ = registry.Add("opusref_queue_drops_total", map[string]string{"queue": "server_inbound", "item_type": "datagram"}, s.InboundDrops-priorInbound)
+					dropped := s.InboundDrops - priorInbound
+					_ = registry.Add("opusref_queue_drops_total", map[string]string{"queue": "server_inbound", "item_type": "datagram"}, dropped)
+					registry.AddEvent(monitor.Event{Type: "queue_drop", Severity: "warn", Details: map[string]any{"queue": "server_inbound", "item_type": "datagram", "frame_count": dropped, "recipient_count": uint64(0)}})
 					priorInbound = s.InboundDrops
 				}
 				if s.SequenceGaps > priorGaps {
@@ -95,9 +101,32 @@ func run() error {
 	_ = httpServer.Shutdown(shutdownCtx)
 	_ = reflector.Close()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("reflector stopped with an error", "error", err)
 		return err
 	}
+	logger.Info("reflector stopped")
 	return nil
+}
+
+func newLogger(logging config.Logging, output io.Writer) *slog.Logger {
+	level := slog.LevelInfo
+	switch logging.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	options := &slog.HandlerOptions{Level: level}
+	if logging.Format == "text" {
+		return slog.New(slog.NewTextHandler(output, options))
+	}
+	return slog.New(slog.NewJSONHandler(output, options))
+}
+
+func logRuntimeStart(logger *slog.Logger, cfg config.Config) {
+	logger.Info("reflector started", "reflector_id", cfg.Reflector.ID, "udp_listen", cfg.Network.UDPListen, "monitoring_listen", cfg.Monitoring.HTTPListen)
 }
 func waitForTermination(ctx context.Context, stop context.CancelFunc, httpErrors, runErrors <-chan error) error {
 	select {

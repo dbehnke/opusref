@@ -212,8 +212,7 @@ func (r *Reflector) drain(ctx context.Context) error {
 			item = "data"
 		}
 		if count.Frames > 0 {
-			r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_media", "item_type": item}, count.Frames)
-			r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": item}, count.Recipients)
+			r.queueDrop("server_media", item, count.Frames, count.Recipients)
 		}
 	}
 	end := r.engine.BeginShutdown()
@@ -232,6 +231,11 @@ func (r *Reflector) drain(ctx context.Context) error {
 		r.startNotification(p, packet)
 	}
 	r.drainPending(drainCtx)
+	for _, peer := range r.peers {
+		if end := r.disconnectPeer(peer, "server_shutdown"); end != nil {
+			r.notifyEnd(end)
+		}
+	}
 	select {
 	case <-time.After(25 * time.Millisecond):
 	case <-ctx.Done():
@@ -275,6 +279,7 @@ func (r *Reflector) handle(addr net.Addr, data []byte) {
 			r.transact(addr, p, func() wire.Packet { return r.hello(addr, p) })
 		} else {
 			r.metric("opusref_packet_errors_total", map[string]string{"reason": validationReason(err)}, 1)
+			r.event("malformed_packet", "warn", nil)
 		}
 		return
 	}
@@ -283,6 +288,7 @@ func (r *Reflector) handle(addr net.Addr, data []byte) {
 			r.transact(addr, p, func() wire.Packet { return r.authenticate(addr, p) })
 		} else {
 			r.metric("opusref_packet_errors_total", map[string]string{"reason": validationReason(err)}, 1)
+			r.event("malformed_packet", "warn", nil)
 		}
 		return
 	}
@@ -433,8 +439,7 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 			} else if p.Header.Type == wire.PacketAuthenticate {
 				for id, peer := range r.peers {
 					if peer.address.String() == addr.String() {
-						r.engine.Disconnect(id)
-						delete(r.peers, id)
+						r.disconnectPeer(r.peers[id], "admission_delivery_failure")
 					}
 				}
 			}
@@ -492,21 +497,19 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 	key := addr.String() + string(tx)
 	c, ok := r.challenges[key]
 	if !ok || r.options.Clock().Sub(c.at) > 10*time.Second {
+		r.authenticationFailure("rejected")
 		return wire.Packet{}
 	}
 	client, _ := wire.Find(p, wire.TLVClientNonce)
 	serverNonce, _ := wire.Find(p, wire.TLVServerNonce)
 	if !hmac.Equal(client, c.client) || !hmac.Equal(serverNonce, c.server) {
-		mode := "open"
-		if len(r.options.SharedKey) > 0 {
-			mode = "shared_key"
-		}
-		r.metric("opusref_authentication_total", map[string]string{"result": "rejected", "mode": mode}, 1)
+		r.authenticationFailure("rejected")
 		return wire.Packet{}
 	}
 	if len(r.options.SharedKey) > 0 {
 		tag, ok := wire.Find(p, wire.TLVAuthenticationTag)
 		if !ok {
+			r.authenticationFailure("rejected")
 			return wire.Packet{}
 		}
 		id, _ := wire.ReflectorID(r.options.ID)
@@ -518,8 +521,7 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 		mac.Write(c.server)
 		mac.Write(id)
 		if !hmac.Equal(tag, mac.Sum(nil)) {
-			r.metric("opusref_authentication_total", map[string]string{"result": "rejected", "mode": "shared_key"}, 1)
-			r.event("authentication_failed", "warn", nil)
+			r.authenticationFailure("rejected")
 			return wire.Packet{}
 		}
 	}
@@ -530,6 +532,7 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 			mode = "shared_key"
 		}
 		r.metric("opusref_authentication_total", map[string]string{"result": "overloaded", "mode": mode}, 1)
+		r.event("authentication_failed", "warn", nil)
 		return wire.Packet{}
 	}
 	for {
@@ -552,6 +555,15 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 		}
 	}
 }
+
+func (r *Reflector) authenticationFailure(result string) {
+	mode := "open"
+	if len(r.options.SharedKey) > 0 {
+		mode = "shared_key"
+	}
+	r.metric("opusref_authentication_total", map[string]string{"result": result, "mode": mode}, 1)
+	r.event("authentication_failed", "warn", nil)
+}
 func (r *Reflector) control(p *peer, packet wire.Packet) wire.Packet {
 	tx, _ := wire.Find(packet, wire.TLVTransactionID)
 	base := wire.Header{Version: 1, Type: packet.Header.Type, Flags: wire.FlagResponse, SessionID: p.id, StreamID: packet.Header.StreamID, Sequence: packet.Header.Sequence, Timestamp: packet.Header.Timestamp}
@@ -561,8 +573,7 @@ func (r *Reflector) control(p *peer, packet wire.Packet) wire.Packet {
 		p.ready = true
 		r.engine.SetReady(p.id)
 	case wire.PacketDisconnect:
-		end := r.engine.Disconnect(p.id)
-		delete(r.peers, p.id)
+		end := r.disconnectPeer(p, "client_request")
 		if end != nil {
 			r.notifyEnd(end)
 		}
@@ -626,6 +637,11 @@ func (r *Reflector) notifyEnd(end *StreamEnd) {
 		observer.ObserveStreamDuration(end.Duration.Seconds())
 	}
 	r.event("stream_ended", "info", map[string]any{"session_id": end.SessionID, "stream_id": end.StreamID, "reason": end.Reason})
+	if end.Reason == EndGrantTimeout || end.Reason == EndMediaInactivity {
+		r.event("stream_timeout", "warn", map[string]any{"session_id": end.SessionID, "stream_id": end.StreamID, "reason": end.Reason})
+	} else if end.Reason == EndTransmitTimeLimit {
+		r.event("transmit_time_limit", "warn", map[string]any{"session_id": end.SessionID, "stream_id": end.StreamID, "reason": end.Reason})
+	}
 	for key := range r.pending {
 		if key.typ == wire.PacketStreamStart {
 			delete(r.pending, key)
@@ -703,15 +719,19 @@ func (r *Reflector) ack(peer *peer, p wire.Packet) bool {
 		peer.notified = false
 		peer.receiving = false
 	} else if p.Header.Type == wire.PacketDisconnect {
-		r.engine.Disconnect(peer.id)
-		delete(r.peers, peer.id)
+		r.disconnectPeer(peer, "server_shutdown")
 	}
 	return true
 }
 func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) bool {
+	before := r.engine.Snapshot().Floor
 	effects, err := r.engine.Media(owner.id, owner.address.String(), p.Header.StreamID, p.Header.Sequence, p.Header.Timestamp, p.Payload)
 	if err != nil {
 		return false
+	}
+	after := r.engine.Snapshot().Floor
+	if before.StartedAt.IsZero() && !after.StartedAt.IsZero() && after.SessionID == owner.id && after.StreamID == p.Header.StreamID {
+		r.event("stream_active", "info", map[string]any{"session_id": owner.id, "stream_id": p.Header.StreamID})
 	}
 	recipients := make([]net.Addr, 0, len(effects))
 	for _, effect := range effects {
@@ -732,8 +752,7 @@ func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) bool {
 			r.metric("opusref_fanout_frames_total", map[string]string{"item_type": item}, 1)
 			r.metric("opusref_fanout_recipients_total", map[string]string{"item_type": item}, uint64(len(recipients)))
 		} else {
-			r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_media", "item_type": item}, 1)
-			r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": "server_media", "item_type": item}, uint64(len(recipients)))
+			r.queueDrop("server_media", item, 1, uint64(len(recipients)))
 		}
 	}
 	return true
@@ -755,8 +774,7 @@ func (r *Reflector) tick(draining bool) {
 	for id, p := range r.peers {
 		if now.Sub(p.last) > r.engine.limits.SessionTimeout {
 			r.metric("opusref_timeouts_total", map[string]string{"kind": "session"}, 1)
-			end := r.engine.Disconnect(id)
-			delete(r.peers, id)
+			end := r.disconnectPeer(r.peers[id], "session_timeout")
 			if end != nil {
 				r.notifyEnd(end)
 			}
@@ -819,7 +837,7 @@ func (r *Reflector) sendControl(addr net.Addr, p wire.Packet) bool {
 		r.metric("opusref_bytes_total", map[string]string{"direction": "tx", "packet_type": packetName(p.Header.Type)}, uint64(len(data)))
 		return true
 	}
-	r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_control", "item_type": "control"}, 1)
+	r.queueDrop("server_control", "control", 1, 1)
 	for _, peer := range r.peers {
 		if peer.address.String() == addr.String() {
 			r.controlOverload(peer)
@@ -829,8 +847,7 @@ func (r *Reflector) sendControl(addr net.Addr, p wire.Packet) bool {
 	return false
 }
 func (r *Reflector) controlOverload(peer *peer) {
-	end := r.engine.Disconnect(peer.id)
-	delete(r.peers, peer.id)
+	end := r.disconnectPeer(peer, "control_overload")
 	for key := range r.pending {
 		if key.listener == peer.id {
 			delete(r.pending, key)
@@ -849,8 +866,26 @@ func (r *Reflector) enqueueRaw(addr net.Addr, data []byte) bool {
 		}
 		return true
 	}
-	r.metric("opusref_queue_drops_total", map[string]string{"queue": "server_control", "item_type": "control"}, 1)
+	r.queueDrop("server_control", "control", 1, 1)
 	return false
+}
+
+func (r *Reflector) disconnectPeer(peer *peer, reason string) *StreamEnd {
+	if peer == nil || r.peers[peer.id] != peer {
+		return nil
+	}
+	end := r.engine.Disconnect(peer.id)
+	delete(r.peers, peer.id)
+	r.event("client_disconnected", "info", map[string]any{"session_id": peer.id, "node_callsign": peer.node, "reason": reason})
+	return end
+}
+
+func (r *Reflector) queueDrop(queue, item string, frames, recipients uint64) {
+	r.metric("opusref_queue_drops_total", map[string]string{"queue": queue, "item_type": item}, frames)
+	if recipients > 0 {
+		r.metric("opusref_queue_drop_recipients_total", map[string]string{"queue": queue, "item_type": item}, recipients)
+	}
+	r.event("queue_drop", "warn", map[string]any{"queue": queue, "item_type": item, "frame_count": frames, "recipient_count": recipients})
 }
 func (r *Reflector) transactionID() uint64 {
 	for {

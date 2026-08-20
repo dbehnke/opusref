@@ -45,6 +45,35 @@ func TestCorrelatedProtocolErrorCompletesRequestAndPublishesFields(t *testing.T)
 	}
 }
 
+func TestCorrelatedBusyCompletesRequestAndPublishesEvent(t *testing.T) {
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	defer serverConn.Close()
+	clientConn, _ := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	s := &udpSender{conn: clientConn, options: Options{OperationTimeout: time.Second}, session: 1, pending: map[requestKey]pendingRequest{}, inbound: make(chan []byte, 2), controlTokens: make(chan struct{}, 1)}
+	owner, _ := New(Options{ServerAddress: "x", NodeCallsign: "N0CALL"}, s)
+	s.owner = owner
+	go s.readLoop()
+	defer s.Close()
+	go func() {
+		buf := make([]byte, wire.MaxDatagramSize)
+		n, addr, _ := serverConn.ReadFromUDP(buf)
+		request, _ := wire.Decode(buf[:n])
+		tx, _ := wire.Find(request, wire.TLVTransactionID)
+		_ = sendUDP(serverConn, addr, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamBusy, Flags: wire.FlagResponse, SessionID: 1, StreamID: request.Header.StreamID}, Extensions: []wire.TLV{{Type: wire.TLVTransactionID, Value: tx}}})
+	}()
+	if err := s.RequestFloor(context.Background(), Outbound{StreamID: 7, SourceCallsign: "N0CALL"}); !errors.Is(err, ErrBusy) {
+		t.Fatalf("RequestFloor error=%v", err)
+	}
+	select {
+	case event := <-owner.Events():
+		if event.Kind != EventBusy || event.SessionID != 1 || event.StreamID != 7 || event.Message == "" {
+			t.Fatalf("busy event=%#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("busy event not published")
+	}
+}
+
 func TestCloseRetriesTransactionalDisconnect(t *testing.T) {
 	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	defer serverConn.Close()
