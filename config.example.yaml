@@ -1,0 +1,32 @@
+network:
+  udp_listen: ":46000"
+
+reflector:
+  id: "OPUSREF"
+  display_name: "OpusRef Test Reflector"
+
+limits:
+  max_clients: 100
+  max_datagram_bytes: 1200
+  outbound_queue_frames: 256
+  recent_events: 256
+
+timers:
+  keepalive_interval: 10s
+  session_timeout: 30s
+  grant_timeout: 2s
+  stream_inactivity_timeout: 1s
+  transmit_timeout: 180s
+
+authentication:
+  # Open admission is used when both values are empty. Environment wins.
+  shared_key_env: "OPUSREF_SHARED_KEY"
+  shared_key_file: ""
+
+monitoring:
+  http_listen: "127.0.0.1:8080"
+
+logging:
+  level: "info"
+  format: "json"
+

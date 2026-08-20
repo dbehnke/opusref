@@ -1,0 +1,7 @@
+/bin/
+/coverage.out
+/opusrefd
+/opusrefctl
+*.log
+config.yaml
+
