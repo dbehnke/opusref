@@ -22,13 +22,23 @@ type udpSender struct {
 	options            Options
 	owner              *QueueClient
 	session            uint64
-	tx                 atomic.Uint64
 	writeMu, pendingMu sync.Mutex
-	pending            map[uint64]chan wire.Packet
+	pending            map[requestKey]pendingRequest
+	inbound            chan []byte
 	closed             atomic.Bool
+	inboundDrops       atomic.Uint64
 	remoteStream       uint32
 	remoteLast         time.Time
+	remoteMu           sync.Mutex
 	controlTokens      chan struct{}
+}
+type requestKey struct {
+	tx     uint64
+	stream uint32
+}
+type pendingRequest struct {
+	responses chan wire.Packet
+	types     map[wire.PacketType]bool
 }
 
 func (s *udpSender) Close() error {
@@ -47,7 +57,7 @@ func NewUDP(options Options) (Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &udpSender{conn: conn, options: options, pending: map[uint64]chan wire.Packet{}, controlTokens: make(chan struct{}, options.ControlSendQueuePackets)}
+	s := &udpSender{conn: conn, options: options, pending: map[requestKey]pendingRequest{}, inbound: make(chan []byte, options.InboundQueuePackets), controlTokens: make(chan struct{}, options.ControlSendQueuePackets)}
 	c, err := New(options, s)
 	if err != nil {
 		conn.Close()
@@ -62,7 +72,11 @@ func (s *udpSender) Send(ctx context.Context, out Outbound) error {
 		if s.session == 0 {
 			return s.handshake(ctx)
 		}
-		_, err := s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketKeepalive, SessionID: s.session}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, s.nextTx())}}, wire.PacketKeepalive)
+		tx, err := s.nextTx()
+		if err != nil {
+			return err
+		}
+		_, err = s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketKeepalive, SessionID: s.session}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx)}}, wire.PacketKeepalive)
 		return err
 	case EventAudio:
 		return s.write(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketAudio, SessionID: s.session, StreamID: out.StreamID, Sequence: out.Sequence, Timestamp: out.Timestamp}, Payload: out.Payload})
@@ -76,7 +90,11 @@ func (s *udpSender) RequestFloor(ctx context.Context, out Outbound) error {
 	if err != nil {
 		return err
 	}
-	reply, err := s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRequest, SessionID: s.session, StreamID: out.StreamID}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, s.nextTx()), {Type: wire.TLVSourceCallsign, Value: source}}}, wire.PacketStreamGrant, wire.PacketStreamBusy)
+	tx, err := s.nextTx()
+	if err != nil {
+		return err
+	}
+	reply, err := s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRequest, SessionID: s.session, StreamID: out.StreamID}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx), {Type: wire.TLVSourceCallsign, Value: source}}}, wire.PacketStreamGrant, wire.PacketStreamBusy)
 	if err != nil {
 		return err
 	}
@@ -86,15 +104,23 @@ func (s *udpSender) RequestFloor(ctx context.Context, out Outbound) error {
 	return nil
 }
 func (s *udpSender) EndFloor(ctx context.Context, out Outbound) error {
-	_, err := s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamEnd, SessionID: s.session, StreamID: out.StreamID, Sequence: out.Sequence}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, s.nextTx())}}, wire.PacketStreamEnd)
+	tx, err := s.nextTx()
+	if err != nil {
+		return err
+	}
+	_, err = s.request(ctx, wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamEnd, SessionID: s.session, StreamID: out.StreamID, Sequence: out.Sequence, Timestamp: out.Timestamp}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx)}}, wire.PacketStreamEnd)
 	return err
 }
-func (s *udpSender) nextTx() uint64 {
-	v := s.tx.Add(1)
-	if v == 0 {
-		v = s.tx.Add(1)
+func (s *udpSender) nextTx() (uint64, error) {
+	for {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return 0, err
+		}
+		if v := binary.BigEndian.Uint64(raw[:]); v != 0 {
+			return v, nil
+		}
 	}
-	return v
 }
 func (s *udpSender) handshake(ctx context.Context) error {
 	node, err := wire.Callsign(s.options.NodeCallsign)
@@ -105,7 +131,10 @@ func (s *udpSender) handshake(ctx context.Context) error {
 	if _, err = rand.Read(nonce); err != nil {
 		return err
 	}
-	tx := s.nextTx()
+	tx, err := s.nextTx()
+	if err != nil {
+		return err
+	}
 	hello := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketHello}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, tx), {Type: wire.TLVNodeCallsign, Value: node}, {Type: wire.TLVClientNonce, Value: nonce}}}
 	challenge, err := s.exchange(ctx, hello, wire.PacketChallenge, tx)
 	if err != nil {
@@ -128,7 +157,10 @@ func (s *udpSender) handshake(ctx context.Context) error {
 		return err
 	}
 	s.session = welcome.Header.SessionID
-	keepTx := s.nextTx()
+	keepTx, err := s.nextTx()
+	if err != nil {
+		return err
+	}
 	keep := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketKeepalive, SessionID: s.session}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, keepTx)}}
 	if _, err = s.exchange(ctx, keep, wire.PacketKeepalive, keepTx); err != nil {
 		return err
@@ -173,6 +205,9 @@ func (s *udpSender) exchange(ctx context.Context, p wire.Packet, want wire.Packe
 		if wire.Validate(reply, wire.ValidationContext{Direction: wire.ServerToClient, Phase: phase}) != nil || reply.Header.Type != want {
 			continue
 		}
+		if want == wire.PacketKeepalive && reply.Header.SessionID != s.session {
+			continue
+		}
 		raw, ok := wire.Find(reply, wire.TLVTransactionID)
 		if !ok || binary.BigEndian.Uint64(raw) != tx {
 			continue
@@ -192,10 +227,15 @@ func (s *udpSender) request(ctx context.Context, p wire.Packet, wants ...wire.Pa
 	raw, _ := wire.Find(p, wire.TLVTransactionID)
 	tx := binary.BigEndian.Uint64(raw)
 	responses := make(chan wire.Packet, 1)
+	types := make(map[wire.PacketType]bool, len(wants))
+	for _, typ := range wants {
+		types[typ] = true
+	}
 	s.pendingMu.Lock()
-	s.pending[tx] = responses
+	key := requestKey{tx: tx, stream: p.Header.StreamID}
+	s.pending[key] = pendingRequest{responses: responses, types: types}
 	s.pendingMu.Unlock()
-	defer func() { s.pendingMu.Lock(); delete(s.pending, tx); s.pendingMu.Unlock() }()
+	defer func() { s.pendingMu.Lock(); delete(s.pending, key); s.pendingMu.Unlock() }()
 	waits := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 2 * time.Second}
 	for attempt, wait := range waits {
 		if attempt > 0 {
@@ -233,6 +273,7 @@ func (s *udpSender) write(p wire.Packet) error {
 	return err
 }
 func (s *udpSender) readLoop() {
+	go s.processLoop()
 	buf := make([]byte, wire.MaxDatagramSize+1)
 	for {
 		_ = s.conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -242,11 +283,13 @@ func (s *udpSender) readLoop() {
 				return
 			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				s.remoteMu.Lock()
 				if s.remoteStream != 0 && time.Since(s.remoteLast) > 2*time.Second {
 					stream := s.remoteStream
 					s.remoteStream = 0
 					_ = s.owner.Publish(Event{Kind: EventStreamEnd, StreamID: stream, Message: "receive state expired"})
 				}
+				s.remoteMu.Unlock()
 				continue
 			}
 			s.owner.fail(err)
@@ -255,7 +298,26 @@ func (s *udpSender) readLoop() {
 		if n > wire.MaxDatagramSize {
 			continue
 		}
-		p, err := wire.Decode(buf[:n])
+		s.enqueueInbound(buf[:n])
+	}
+}
+func (s *udpSender) enqueueInbound(data []byte) {
+	copy := append([]byte(nil), data...)
+	select {
+	case s.inbound <- copy:
+	default:
+		s.inboundDrops.Add(1)
+	}
+}
+func (s *udpSender) processLoop() {
+	for {
+		var data []byte
+		select {
+		case data = <-s.inbound:
+		case <-s.owner.Done():
+			return
+		}
+		p, err := wire.Decode(data)
 		if err != nil || wire.Validate(p, wire.ValidationContext{Direction: wire.ServerToClient, Phase: wire.Ready}) != nil {
 			continue
 		}
@@ -265,26 +327,32 @@ func (s *udpSender) readLoop() {
 		if raw, ok := wire.Find(p, wire.TLVTransactionID); ok {
 			tx := binary.BigEndian.Uint64(raw)
 			s.pendingMu.Lock()
-			ch := s.pending[tx]
+			var pending pendingRequest
+			if p.Header.SessionID == s.session {
+				pending = s.pending[requestKey{tx: tx, stream: p.Header.StreamID}]
+			}
 			s.pendingMu.Unlock()
-			if ch != nil {
+			if pending.responses != nil && pending.types[p.Header.Type] {
 				select {
-				case ch <- p:
+				case pending.responses <- p:
 				default:
 				}
 				continue
 			}
 		}
 		event := Event{SessionID: p.Header.SessionID, StreamID: p.Header.StreamID, Sequence: p.Header.Sequence, Timestamp: p.Header.Timestamp, Payload: p.Payload}
+		s.remoteMu.Lock()
 		switch p.Header.Type {
 		case wire.PacketAudio:
 			if s.remoteStream != p.Header.StreamID {
+				s.remoteMu.Unlock()
 				continue
 			}
 			s.remoteLast = time.Now()
 			event.Kind = EventAudio
 		case wire.PacketData:
 			if s.remoteStream != p.Header.StreamID {
+				s.remoteMu.Unlock()
 				continue
 			}
 			s.remoteLast = time.Now()
@@ -295,6 +363,7 @@ func (s *udpSender) readLoop() {
 		case wire.PacketStreamStart:
 			s.ack(p)
 			if s.remoteStream == p.Header.StreamID {
+				s.remoteMu.Unlock()
 				continue
 			}
 			s.remoteStream = p.Header.StreamID
@@ -308,20 +377,27 @@ func (s *udpSender) readLoop() {
 			}
 		case wire.PacketStreamRevoke:
 			s.ack(p)
-			if s.remoteStream != p.Header.StreamID {
+			local := s.owner.revoke(p.Header.StreamID)
+			if s.remoteStream != p.Header.StreamID && !local {
+				s.remoteMu.Unlock()
 				continue
 			}
-			s.remoteStream = 0
+			if s.remoteStream == p.Header.StreamID {
+				s.remoteStream = 0
+			}
 			event.Kind = EventStreamEnd
 		case wire.PacketDisconnect:
 			s.ack(p)
 			go s.owner.Close()
+			s.remoteMu.Unlock()
 			return
 		case wire.PacketError:
 			event.Kind = EventProtocolError
 		default:
+			s.remoteMu.Unlock()
 			continue
 		}
+		s.remoteMu.Unlock()
 		_ = s.owner.Publish(event)
 	}
 }

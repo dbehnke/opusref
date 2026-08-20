@@ -38,11 +38,44 @@ func TestSequenceGapModuloRules(t *testing.T) {
 	if e.RequestFloor(1, 3, "N0ONE") != FloorGranted {
 		t.Fatal("grant")
 	}
-	for _, seq := range []uint32{0xfffffffe, 1, 0, 2} {
+	for _, seq := range []uint32{0, 2, 1, 3} {
 		_, _ = e.Media(1, "a", 3, seq, 0, []byte{1})
 	}
-	if got := e.Snapshot().SequenceGaps; got != 2 {
-		t.Fatalf("got %d gaps, want 2", got)
+	if got := e.Snapshot().SequenceGaps; got != 1 {
+		t.Fatalf("got %d gaps, want 1", got)
+	}
+}
+func TestSequenceWrapAfterZeroOrigin(t *testing.T) {
+	e := NewEngine(Limits{}, time.Now)
+	e.AddSession(1, "a", "N", true)
+	e.RequestFloor(1, 1, "N")
+	_, _ = e.Media(1, "a", 1, 0, 0, []byte{1})
+	e.floor.prior = ^uint32(0)
+	if _, err := e.Media(1, "a", 1, 0, 0, []byte{1}); err != nil || e.Snapshot().SequenceGaps != 0 {
+		t.Fatalf("wrap: %v gaps=%d", err, e.Snapshot().SequenceGaps)
+	}
+}
+func TestFirstMediaSequenceMustBeZero(t *testing.T) {
+	e := NewEngine(Limits{}, time.Now)
+	e.AddSession(1, "a", "N0ONE", true)
+	e.RequestFloor(1, 3, "N0ONE")
+	if _, err := e.Media(1, "a", 3, 1, 0, []byte{1}); err != ErrInvalidStream {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := e.Media(1, "a", 3, 0, 0, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestFloorSnapshotReportsMediaTimesAndRemainingTOT(t *testing.T) {
+	now := time.Unix(100, 0)
+	e := NewEngine(Limits{TransmitTimeLimit: 10 * time.Second}, func() time.Time { return now })
+	e.AddSession(1, "a", "N0ONE", true)
+	e.RequestFloor(1, 1, "N0ONE")
+	_, _ = e.Media(1, "a", 1, 0, 0, []byte{1})
+	now = now.Add(3 * time.Second)
+	s := e.Snapshot().Floor
+	if s.StartedAt != time.Unix(100, 0) || s.LastFrameAt != time.Unix(100, 0) || s.RemainingTransmitTime != 7*time.Second {
+		t.Fatalf("snapshot: %#v", s)
 	}
 }
 

@@ -64,11 +64,14 @@ const (
 )
 
 type FloorSnapshot struct {
-	Active         bool   `json:"active"`
-	SessionID      uint64 `json:"session_id,omitempty"`
-	StreamID       uint32 `json:"stream_id,omitempty"`
-	SourceCallsign string `json:"source_callsign,omitempty"`
-	NodeCallsign   string `json:"node_callsign,omitempty"`
+	Active                bool          `json:"active"`
+	SessionID             uint64        `json:"session_id,omitempty"`
+	StreamID              uint32        `json:"stream_id,omitempty"`
+	SourceCallsign        string        `json:"source_callsign,omitempty"`
+	NodeCallsign          string        `json:"node_callsign,omitempty"`
+	StartedAt             time.Time     `json:"started_at,omitempty"`
+	LastFrameAt           time.Time     `json:"last_frame_at,omitempty"`
+	RemainingTransmitTime time.Duration `json:"remaining_transmit_time,omitempty"`
 }
 type Snapshot struct {
 	Ready        bool          `json:"ready"`
@@ -194,6 +197,9 @@ func (e *Engine) Media(id uint64, address string, stream, sequence, timestamp ui
 	now := e.now()
 	s.last = now
 	if e.floor.firstMedia.IsZero() {
+		if sequence != 0 {
+			return nil, ErrInvalidStream
+		}
 		e.floor.firstMedia = now
 	} else if e.floor.hasPrior {
 		expected := e.floor.prior + 1
@@ -287,7 +293,14 @@ func (e *Engine) Snapshot() Snapshot {
 		if owner := e.sessions[e.floor.owner]; owner != nil {
 			node = owner.callsign
 		}
-		s.Floor = FloorSnapshot{Active: true, SessionID: e.floor.owner, StreamID: e.floor.stream, SourceCallsign: e.floor.source, NodeCallsign: node}
+		remaining := e.limits.TransmitTimeLimit
+		if !e.floor.firstMedia.IsZero() {
+			remaining -= e.now().Sub(e.floor.firstMedia)
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
+		s.Floor = FloorSnapshot{Active: true, SessionID: e.floor.owner, StreamID: e.floor.stream, SourceCallsign: e.floor.source, NodeCallsign: node, StartedAt: e.floor.firstMedia, LastFrameAt: e.floor.lastMedia, RemainingTransmitTime: remaining}
 	}
 	return s
 }

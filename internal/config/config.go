@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"github.com/dbehnke/opusref/pkg/wire"
 	"gopkg.in/yaml.v3"
+	"io"
 	"net"
 	"os"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -140,15 +140,31 @@ func (c Config) SharedKey() ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("shared key file must be regular and accessible only by its owner")
 	}
-	data, err := os.ReadFile(c.Authentication.SharedKeyFile)
+	data, err := ReadSharedKeyFile(c.Authentication.SharedKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	return validateKey(data)
+}
+func ReadSharedKeyFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 66))
 	if err != nil {
 		return nil, err
 	}
 	if len(data) > 65 {
 		return nil, errors.New("shared key file is too large")
 	}
-	data = []byte(strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r"))
-	return validateKey(data)
+	if bytes.HasSuffix(data, []byte("\r\n")) {
+		data = data[:len(data)-2]
+	} else if bytes.HasSuffix(data, []byte("\n")) {
+		data = data[:len(data)-1]
+	}
+	return data, nil
 }
 func validateKey(key []byte) ([]byte, error) {
 	if len(key) < 16 || len(key) > 64 {

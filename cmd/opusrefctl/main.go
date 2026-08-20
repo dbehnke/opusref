@@ -6,12 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/dbehnke/opusref/internal/config"
 	"github.com/dbehnke/opusref/internal/record"
 	"github.com/dbehnke/opusref/pkg/client"
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -160,14 +160,11 @@ func readKey(c common) (string, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return "", errors.New("shared key file permissions are not restricted")
 	}
-	data, err := os.ReadFile(c.keyFile)
+	data, err := config.ReadSharedKeyFile(c.keyFile)
 	if err != nil {
 		return "", err
 	}
-	if len(data) > 65 {
-		return "", errors.New("shared key file is too large")
-	}
-	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	value := string(data)
 	if len(value) < 16 || len(value) > 64 {
 		return "", errors.New("shared key length must be 16 through 64 bytes")
 	}

@@ -108,7 +108,6 @@ type Reflector struct {
 	peers        map[uint64]*peer
 	transactions map[string]completed
 	pending      map[notificationKey]*notification
-	nextTx       uint64
 	closeOnce    sync.Once
 	snapshot     atomic.Pointer[RuntimeSnapshot]
 }
@@ -285,6 +284,9 @@ func (r *Reflector) handleDrain(addr net.Addr, data []byte) {
 	if peer == nil || peer.address.String() != addr.String() {
 		return
 	}
+	if err := wire.Validate(p, wire.ValidationContext{Direction: wire.ClientToServer, Phase: wire.Ready}); err != nil {
+		return
+	}
 	if (p.Header.Type == wire.PacketStreamRevoke || p.Header.Type == wire.PacketDisconnect) && p.Header.Flags == wire.FlagResponse {
 		r.ack(peer, p)
 	} else if p.Header.Type == wire.PacketDisconnect {
@@ -352,9 +354,8 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 					}
 				}
 			}
-		} else {
-			r.engine.Disconnect(p.Header.SessionID)
-			delete(r.peers, p.Header.SessionID)
+		} else if peer := r.peers[p.Header.SessionID]; peer != nil {
+			r.controlOverload(peer)
 		}
 	} else if p.Header.Type == wire.PacketKeepalive && p.Header.SessionID != 0 {
 		if peer := r.peers[p.Header.SessionID]; peer != nil {
@@ -521,7 +522,10 @@ func (r *Reflector) notifyEnd(end *StreamEnd) {
 		}
 	}
 	for _, listener := range r.peers {
-		if listener.id == end.SessionID || !listener.notified {
+		if listener.id == end.SessionID && end.Reason == EndNormal {
+			continue
+		}
+		if listener.id != end.SessionID && !listener.notified {
 			continue
 		}
 		packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, SessionID: end.SessionID, StreamID: end.StreamID, Sequence: end.Sequence, Timestamp: end.Timestamp}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, r.transactionID()), wire.Uint16TLV(wire.TLVEndReason, endReason(end.Reason))}}
@@ -560,7 +564,11 @@ func (r *Reflector) startNotification(listener *peer, p wire.Packet) {
 		r.controlOverload(listener)
 		return
 	}
-	raw, _ := wire.Find(p, wire.TLVTransactionID)
+	raw, ok := wire.Find(p, wire.TLVTransactionID)
+	if !ok || len(raw) != 8 {
+		r.controlOverload(listener)
+		return
+	}
 	key := notificationKey{listener.id, p.Header.Type, binary.BigEndian.Uint64(raw)}
 	r.pending[key] = &notification{p, 1, time.Now().Add(500 * time.Millisecond)}
 	if p.Header.Type == wire.PacketStreamStart {
@@ -569,9 +577,13 @@ func (r *Reflector) startNotification(listener *peer, p wire.Packet) {
 	r.sendControl(listener.address, p)
 }
 func (r *Reflector) ack(peer *peer, p wire.Packet) {
-	raw, _ := wire.Find(p, wire.TLVTransactionID)
+	raw, ok := wire.Find(p, wire.TLVTransactionID)
+	if !ok || len(raw) != 8 {
+		return
+	}
 	key := notificationKey{peer.id, p.Header.Type, binary.BigEndian.Uint64(raw)}
-	if _, ok := r.pending[key]; !ok {
+	n, ok := r.pending[key]
+	if !ok || p.Header.StreamID != n.packet.Header.StreamID || p.Header.Sequence != n.packet.Header.Sequence || p.Header.Timestamp != n.packet.Header.Timestamp {
 		return
 	}
 	delete(r.pending, key)
@@ -723,11 +735,26 @@ func (r *Reflector) enqueueRaw(addr net.Addr, data []byte) bool {
 	return false
 }
 func (r *Reflector) transactionID() uint64 {
-	r.nextTx++
-	if r.nextTx == 0 {
-		r.nextTx++
+	for {
+		var raw [8]byte
+		if _, err := io.ReadFull(r.options.Random, raw[:]); err != nil {
+			return 0
+		}
+		id := binary.BigEndian.Uint64(raw[:])
+		if id == 0 {
+			continue
+		}
+		collision := false
+		for key := range r.pending {
+			if key.tx == id {
+				collision = true
+				break
+			}
+		}
+		if !collision {
+			return id
+		}
 	}
-	return r.nextTx
 }
 func (r *Reflector) publish() {
 	clients := make([]ClientView, 0, len(r.peers))

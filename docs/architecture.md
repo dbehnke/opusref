@@ -105,8 +105,10 @@ post-welcome keepalive confirms the session ID.
 
 The client waits for `STREAM_GRANT` before it activates its send state. It uses
 the same transaction ID for attempts at 0, 0.5, 1.5, and 3.5 seconds. It rejects
-a response with a different session ID or transaction ID. It acknowledges each
-notification retry and publishes one lifecycle event for the state change.
+a response with a different session ID, stream ID, packet type, or transaction
+ID. It rejects overlapping floor requests. It advances sequence and timestamp
+state only after it accepts a frame into the bounded send queue. It acknowledges
+each notification retry and publishes one lifecycle event for the state change.
 
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send
@@ -124,6 +126,11 @@ The server permits 100 connected clients and 100 pending challenges. It uses a
 and 64 for each admitted session. It permits 200 pending notifications globally
 and two for each listener. It retains 256 monitoring events.
 
+The UDP client composes a socket reader with its configured bounded inbound
+datagram queue. It drops a new datagram when this queue is full. If a required
+lifecycle event cannot enter the application queue, the client closes its UDP
+transport and reports a terminal error.
+
 ```mermaid
 sequenceDiagram
     participant Command
@@ -134,7 +141,8 @@ sequenceDiagram
     State->>Writer: STREAM_REVOKE transactions
     Writer-->>State: Acknowledgement or retry exhaustion
     State->>Writer: DISCONNECT transactions
-    Command->>Command: Close after drain or 5 seconds
+    State-->>Command: Restricted drain complete
+    Command->>Command: Close UDP only after drain completion
 ```
 
 ## 6. Configuration and secrets

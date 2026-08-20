@@ -223,6 +223,8 @@ no valid packet.
 ## 8. Transactions and retries
 
 A control message that expects a response MUST contain a transaction ID. The
+initiator generates a new transaction ID with a cryptographically secure random
+source. It MUST NOT use a counter or another predictable sequence. The
 initiator sends the first attempt at time zero. If no response arrives, it sends
 three retries. The retries occur 500 ms, 1.5 seconds, and 3.5 seconds after the
 first attempt. Thus, the delay after each attempt is 500 ms, 1 second, and 2
@@ -243,8 +245,10 @@ The server starts a separate transaction for each listener when it sends
 `STREAM_START` or `STREAM_REVOKE`. The server cache key uses the listener session
 ID, notification packet type, and transaction ID. An acknowledgement uses the
 listener's session ID, not the floor owner's session ID. It copies the stream ID
-and transaction ID and sets `RESPONSE`. A client acknowledges each duplicate
-notification but applies its state change only one time.
+sequence, timestamp, and transaction ID and sets `RESPONSE`. The server accepts
+the acknowledgement only when all these fields match the notification. A client
+acknowledges each duplicate notification but applies its state change only one
+time.
 
 If the server does not receive a `STREAM_START` acknowledgement after four
 attempts, it stops media fan-out to that listener for the active stream. The
@@ -310,7 +314,10 @@ floor is free, the server sends `STREAM_GRANT` to the requester. It also sends
 transmit time limit to each listener. Each listener acknowledges it. If the
 floor is not free, the server sends `STREAM_BUSY`.
 
-The client MUST wait for `STREAM_GRANT` before it sends media. The grant expires
+The client MUST wait for `STREAM_GRANT` before it sends media. It MUST reject a
+second or concurrent floor request while a request or local stream is active.
+It correlates the response transaction ID, session ID, stream ID, and packet
+type before it changes local state. The grant expires
 if no media arrives in two seconds. The server releases the floor after one
 second with no valid media. The default transmit time limit releases the floor
 after 180 seconds. These three values are server configuration values.
@@ -318,8 +325,9 @@ after 180 seconds. These three values are server configuration values.
 The owner sends `STREAM_END` to release the floor. The server acknowledges it
 with `STREAM_END` and `RESPONSE`, then sends a transactional `STREAM_REVOKE` to
 each listener. Each listener acknowledges it. The server also sends
-`STREAM_REVOKE` after a timeout or owner disconnect. The end reason states why
-the server released the floor.
+`STREAM_REVOKE` to the owner and listeners after a timeout, owner disconnect,
+server shutdown, or required control-delivery failure. The end reason states
+why the server released the floor.
 
 If an unused grant expires, no media sequence or timestamp exists. The server
 sets both fields to zero in `STREAM_REVOKE` for this case.

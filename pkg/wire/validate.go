@@ -114,6 +114,9 @@ func Validate(p Packet, c ValidationContext) error {
 	if p.Header.Flags&FlagReservedMask != 0 || response && p.Header.Flags&FlagRetry != 0 || response && !rule.response || !response && !rule.request {
 		return invalid(ReasonMalformed, "flags")
 	}
+	if (p.Header.Type == PacketAudio || p.Header.Type == PacketData) && p.Header.Flags != 0 {
+		return invalid(ReasonMalformed, "flags")
+	}
 	if (p.Header.Type == PacketStreamStart || p.Header.Type == PacketStreamRevoke) && ((direction == dirC) != response) {
 		return invalid(ReasonMalformed, "flags")
 	}

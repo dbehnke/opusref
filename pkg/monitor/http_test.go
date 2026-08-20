@@ -51,7 +51,7 @@ func TestMetricsAreValidAndDoNotMutateLabels(t *testing.T) {
 
 func TestClientAndStreamEndpointsUseDedicatedShapes(t *testing.T) {
 	r := New(1, 0, nil)
-	r.Publish(Snapshot{Ready: true, Clients: 1, ClientList: []ClientSnapshot{{NodeCallsign: "N0CALL"}}, Stream: StreamSnapshot{Active: true, StreamID: 7}})
+	r.Publish(Snapshot{Ready: true, Clients: 1, ClientList: []ClientSnapshot{{NodeCallsign: "N0CALL"}}, Stream: StreamSnapshot{Active: true, StreamID: 7, StartedAt: time.Unix(1, 0), LastFrameAt: time.Unix(2, 0), RemainingTransmitSeconds: 9}})
 	for path, field := range map[string]string{RouteClients: "clients", RouteStream: "stream"} {
 		w := httptest.NewRecorder()
 		r.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
@@ -61,6 +61,14 @@ func TestClientAndStreamEndpointsUseDedicatedShapes(t *testing.T) {
 		}
 		if _, ok := got[field]; !ok {
 			t.Fatalf("%s missing %s: %s", path, field, w.Body.String())
+		}
+		if path == RouteStream {
+			stream := got["stream"].(map[string]any)
+			for _, name := range []string{"started_at", "last_frame_at", "remaining_transmit_seconds"} {
+				if _, ok := stream[name]; !ok {
+					t.Fatalf("missing %s: %s", name, w.Body.String())
+				}
+			}
 		}
 	}
 }

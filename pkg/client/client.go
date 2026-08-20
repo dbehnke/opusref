@@ -104,7 +104,9 @@ type QueueClient struct {
 	control               chan Outbound
 	done                  chan struct{}
 	connected, stream     bool
+	requesting            bool
 	streamID, sequence    uint32
+	lastTimestamp         uint32
 	terminal, closeResult error
 	closeCalled           bool
 	once                  sync.Once
@@ -149,13 +151,18 @@ func (c *QueueClient) requestStream(ctx context.Context, source string) error {
 		c.mu.Unlock()
 		return errors.New("source callsign is required")
 	}
-	c.streamID++
-	if c.streamID == 0 {
-		c.streamID++
+	if c.stream || c.requesting {
+		c.mu.Unlock()
+		return errors.New("stream request is already active")
 	}
-	c.sequence = 0
-	out := Outbound{Kind: EventStreamStart, StreamID: c.streamID, SourceCallsign: source}
+	nextStream := c.streamID + 1
+	if nextStream == 0 {
+		nextStream++
+	}
+	c.requesting = true
+	out := Outbound{Kind: EventStreamStart, StreamID: nextStream, SourceCallsign: source}
 	c.mu.Unlock()
+	defer func() { c.mu.Lock(); c.requesting = false; c.mu.Unlock() }()
 	if err := c.acquireControl(out); err != nil {
 		return err
 	}
@@ -168,6 +175,9 @@ func (c *QueueClient) requestStream(ctx context.Context, source string) error {
 		return err
 	}
 	c.mu.Lock()
+	c.streamID = nextStream
+	c.sequence = 0
+	c.lastTimestamp = 0
 	c.stream = true
 	c.mu.Unlock()
 	return nil
@@ -192,12 +202,14 @@ func (c *QueueClient) enqueueMedia(out Outbound) error {
 	}
 	out.StreamID = c.streamID
 	out.Sequence = c.sequence
-	c.sequence++
-	c.mu.Unlock()
 	select {
 	case c.media <- out:
+		c.sequence++
+		c.lastTimestamp = out.Timestamp
+		c.mu.Unlock()
 		return nil
 	default:
+		c.mu.Unlock()
 		return ErrBackpressure
 	}
 }
@@ -217,7 +229,7 @@ func (c *QueueClient) EndStream(ctx context.Context) error {
 		c.mu.Unlock()
 		return ErrStreamInactive
 	}
-	out := Outbound{Kind: EventStreamEnd, StreamID: c.streamID, Sequence: c.sequence}
+	out := Outbound{Kind: EventStreamEnd, StreamID: c.streamID, Sequence: c.sequence, Timestamp: c.lastTimestamp}
 	c.stream = false
 	c.mu.Unlock()
 	if err := c.acquireControl(out); err != nil {
@@ -247,6 +259,15 @@ func (c *QueueClient) Publish(event Event) error {
 	required := event.Kind != EventAudio && event.Kind != EventData
 	return c.publish(event, required)
 }
+func (c *QueueClient) revoke(stream uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.stream || c.streamID != stream {
+		return false
+	}
+	c.stream = false
+	return true
+}
 func (c *QueueClient) publish(event Event, required bool) error {
 	select {
 	case c.events <- event:
@@ -269,6 +290,9 @@ func (c *QueueClient) fail(err error) {
 	}
 	c.mu.Unlock()
 	c.once.Do(func() { close(c.done) })
+	if closer, ok := c.sender.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 func (c *QueueClient) Close() error {
 	c.mu.Lock()

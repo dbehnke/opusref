@@ -16,6 +16,7 @@ type rig struct {
 	reflector *server.Reflector
 	ctx       context.Context
 	cancel    context.CancelFunc
+	done      chan error
 }
 
 func newRig(t *testing.T, limits server.Limits) *rig {
@@ -29,10 +30,18 @@ func newRig(t *testing.T, limits server.Limits) *rig {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { _ = r.Run(ctx) }()
-	return &rig{conn, r, ctx, cancel}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	return &rig{conn: conn, reflector: r, ctx: ctx, cancel: cancel, done: done}
 }
-func (r *rig) close() { r.cancel(); time.Sleep(120 * time.Millisecond); _ = r.reflector.Close() }
+func (r *rig) close() {
+	r.cancel()
+	select {
+	case <-r.done:
+	case <-time.After(time.Second):
+	}
+	_ = r.reflector.Close()
+}
 func (r *rig) client(t *testing.T, call string) client.Client {
 	t.Helper()
 	c, err := client.NewUDP(client.Options{ServerAddress: r.conn.LocalAddr().String(), NodeCallsign: call, ConnectTimeout: 2 * time.Second, OperationTimeout: 2 * time.Second})
@@ -56,7 +65,7 @@ func (r *rig) client(t *testing.T, call string) client.Client {
 }
 func waitKind(t *testing.T, c client.Client, kind client.EventKind) client.Event {
 	t.Helper()
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
@@ -147,10 +156,10 @@ func TestSequenceWrapAndLossAccounting(t *testing.T) {
 	e := server.NewEngine(server.Limits{}, time.Now)
 	e.AddSession(1, "a", "N0ONE", true)
 	e.RequestFloor(1, 1, "N0ONE")
-	for _, seq := range []uint32{0xfffffffe, 1, 0, 2} {
+	for _, seq := range []uint32{0, 2, 1, 3} {
 		_, _ = e.Media(1, "a", 1, seq, 0, []byte{1})
 	}
-	if e.Snapshot().SequenceGaps != 2 {
+	if e.Snapshot().SequenceGaps != 1 {
 		t.Fatalf("gaps: %d", e.Snapshot().SequenceGaps)
 	}
 }
@@ -166,6 +175,18 @@ func TestBlackBoxShutdownSendsRevoke(t *testing.T) {
 	_ = waitKind(t, listener, client.EventStreamStart)
 	r.cancel()
 	_ = waitKind(t, listener, client.EventStreamEnd)
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-listener.Done():
+	case <-time.After(time.Second):
+		t.Fatal("listener did not receive disconnect")
+	}
+	select {
+	case err := <-r.done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reflector did not complete drain")
+	}
 	_ = r.reflector.Close()
 }

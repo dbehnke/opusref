@@ -20,13 +20,14 @@ type ClientSnapshot struct {
 	LastActivity  time.Time `json:"last_activity"`
 }
 type StreamSnapshot struct {
-	Active         bool      `json:"active"`
-	SessionID      uint64    `json:"session_id,omitempty"`
-	StreamID       uint32    `json:"stream_id,omitempty"`
-	NodeCallsign   string    `json:"node_callsign,omitempty"`
-	SourceCallsign string    `json:"source_callsign,omitempty"`
-	StartedAt      time.Time `json:"started_at,omitempty"`
-	LastFrameAt    time.Time `json:"last_frame_at,omitempty"`
+	Active                   bool      `json:"active"`
+	SessionID                uint64    `json:"session_id,omitempty"`
+	StreamID                 uint32    `json:"stream_id,omitempty"`
+	NodeCallsign             string    `json:"node_callsign,omitempty"`
+	SourceCallsign           string    `json:"source_callsign,omitempty"`
+	StartedAt                time.Time `json:"started_at,omitempty"`
+	LastFrameAt              time.Time `json:"last_frame_at,omitempty"`
+	RemainingTransmitSeconds float64   `json:"remaining_transmit_seconds"`
 }
 type Snapshot struct {
 	APIVersion    int              `json:"api_version"`

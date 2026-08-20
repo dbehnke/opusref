@@ -57,3 +57,21 @@ func TestKeyFilePermissions(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+func TestKeyFileBoundAndLineEndingRules(t *testing.T) {
+	dir := t.TempDir()
+	large := filepath.Join(dir, "large")
+	if err := os.WriteFile(large, make([]byte, 1024), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSharedKeyFile(large); err == nil {
+		t.Fatal("accepted oversized key")
+	}
+	cr := filepath.Join(dir, "cr")
+	if err := os.WriteFile(cr, []byte("0123456789abcdef\r"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadSharedKeyFile(cr)
+	if err != nil || string(got) != "0123456789abcdef\r" {
+		t.Fatalf("%q %v", got, err)
+	}
+}

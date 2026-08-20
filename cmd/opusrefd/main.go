@@ -83,19 +83,11 @@ func run() error {
 				for _, c := range s.Clients {
 					clients = append(clients, monitor.ClientSnapshot{NodeCallsign: c.NodeCallsign, RemoteAddress: c.RemoteAddress, SessionID: c.SessionID, ConnectedAt: c.ConnectedAt, LastActivity: c.LastActivity})
 				}
-				registry.Publish(monitor.Snapshot{Ready: s.Ready, ReflectorID: cfg.Reflector.ID, Clients: len(clients), ClientList: clients, Floor: s.Floor, Stream: monitor.StreamSnapshot{Active: s.Floor.Active, SessionID: s.Floor.SessionID, StreamID: s.Floor.StreamID, NodeCallsign: s.Floor.NodeCallsign, SourceCallsign: s.Floor.SourceCallsign}})
+				registry.Publish(monitor.Snapshot{Ready: s.Ready, ReflectorID: cfg.Reflector.ID, Clients: len(clients), ClientList: clients, Floor: s.Floor, Stream: monitor.StreamSnapshot{Active: s.Floor.Active, SessionID: s.Floor.SessionID, StreamID: s.Floor.StreamID, NodeCallsign: s.Floor.NodeCallsign, SourceCallsign: s.Floor.SourceCallsign, StartedAt: s.Floor.StartedAt, LastFrameAt: s.Floor.LastFrameAt, RemainingTransmitSeconds: s.Floor.RemainingTransmitTime.Seconds()}})
 			}
 		}
 	}()
-	select {
-	case <-ctx.Done():
-	case err = <-errHTTP:
-		if !errors.Is(err, http.ErrServerClosed) {
-			stop()
-		}
-	case err = <-errRun:
-		stop()
-	}
+	err = waitForTermination(ctx, stop, errHTTP, errRun)
 	close(monitorDone)
 	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID})
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timers.ShutdownGrace)
@@ -106,4 +98,20 @@ func run() error {
 		return err
 	}
 	return nil
+}
+func waitForTermination(ctx context.Context, stop context.CancelFunc, httpErrors, runErrors <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return <-runErrors
+	case err := <-httpErrors:
+		stop()
+		runErr := <-runErrors
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return runErr
+	case err := <-runErrors:
+		stop()
+		return err
+	}
 }

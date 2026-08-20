@@ -50,8 +50,20 @@ func TestReflectorOpenHandshakeAndMediaFanout(t *testing.T) {
 	listener, listenerID := connect("N0TWO")
 	defer listener.Close()
 	source, _ := wire.Callsign("N0ONE")
-	sendPacket(t, owner, serverConn.LocalAddr(), wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRequest, SessionID: sid, StreamID: 7}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 2), {Type: wire.TLVSourceCallsign, Value: source}}})
-	if got := readPacket(t, owner); got.Header.Type != wire.PacketStreamGrant {
+	request := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRequest, SessionID: sid, StreamID: 7}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, 2), {Type: wire.TLVSourceCallsign, Value: source}}}
+	sendPacket(t, owner, serverConn.LocalAddr(), request)
+	grant := readPacket(t, owner)
+	if grant.Header.Type != wire.PacketStreamGrant {
+		t.Fatalf("got %v", grant.Header.Type)
+	}
+	sendPacket(t, owner, serverConn.LocalAddr(), request)
+	duplicateGrant := readPacket(t, owner)
+	a, _ := wire.Encode(grant)
+	b, _ := wire.Encode(duplicateGrant)
+	if !bytes.Equal(a, b) {
+		t.Fatal("duplicate control request did not replay grant")
+	}
+	if got := grant; got.Header.Type != wire.PacketStreamGrant {
 		t.Fatalf("got %v", got.Header.Type)
 	}
 	start := readPacket(t, listener)
@@ -121,6 +133,60 @@ func TestReflectorReplaysDuplicateAndRejectsConflictingHello(t *testing.T) {
 	sendPacket(t, c, serverConn.LocalAddr(), hello)
 	if got := readPacket(t, c); got.Header.Type != wire.PacketError {
 		t.Fatalf("got %v", got.Header.Type)
+	}
+}
+func TestDrainRejectsMalformedAndMismatchedAcknowledgements(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test"})
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
+	p := &peer{id: 9, address: addr, ready: true}
+	r.peers[9] = p
+	tx := wire.Uint64TLV(wire.TLVTransactionID, 7)
+	notice := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, SessionID: 1, StreamID: 2, Sequence: 3, Timestamp: 4}, Extensions: []wire.TLV{tx, wire.Uint16TLV(wire.TLVEndReason, 0)}}
+	key := notificationKey{listener: 9, typ: wire.PacketStreamRevoke, tx: 7}
+	r.pending[key] = &notification{packet: notice}
+	malformed, _ := wire.Encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, Flags: wire.FlagResponse, SessionID: 9, StreamID: 2}})
+	r.handleDrain(addr, malformed)
+	wrong, _ := wire.Encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, Flags: wire.FlagResponse, SessionID: 9, StreamID: 2, Sequence: 99, Timestamp: 4}, Extensions: []wire.TLV{tx}})
+	r.handleDrain(addr, wrong)
+	if _, ok := r.pending[key]; !ok {
+		t.Fatal("mismatched ACK cleared notification")
+	}
+	valid, _ := wire.Encode(wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, Flags: wire.FlagResponse, SessionID: 9, StreamID: 2, Sequence: 3, Timestamp: 4}, Extensions: []wire.TLV{tx}})
+	r.handleDrain(addr, valid)
+	if _, ok := r.pending[key]; ok {
+		t.Fatal("valid ACK did not clear notification")
+	}
+}
+func TestTransactionIDsUseRandomReader(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test", Random: bytes.NewReader(append(transactionID(41), transactionID(99)...))})
+	if a, b := r.transactionID(), r.transactionID(); a != 41 || b != 99 {
+		t.Fatalf("got %d %d", a, b)
+	}
+}
+func TestOwnerControlOverloadNotifiesListeners(t *testing.T) {
+	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer conn.Close()
+	r, _ := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test"})
+	ownerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}
+	listenerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2}
+	r.engine.AddSession(1, ownerAddr.String(), "N0ONE", true)
+	r.engine.AddSession(2, listenerAddr.String(), "N0TWO", true)
+	r.engine.RequestFloor(1, 7, "N0ONE")
+	r.peers[1] = &peer{id: 1, address: ownerAddr, ready: true}
+	r.peers[2] = &peer{id: 2, address: listenerAddr, ready: true, notified: true}
+	r.controlOverload(r.peers[1])
+	found := false
+	for key := range r.pending {
+		if key.listener == 2 && key.typ == wire.PacketStreamRevoke {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("owner overload omitted revoke")
 	}
 }
 

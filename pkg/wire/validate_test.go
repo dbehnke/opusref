@@ -65,6 +65,8 @@ func TestValidateFlagsPhasesAndNotificationForms(t *testing.T) {
 		{"start ack", Packet{Header: Header{Version: 1, Type: PacketStreamStart, Flags: FlagResponse, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, true},
 		{"start ack missing response", Packet{Header: Header{Version: 1, Type: PacketStreamStart, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, false},
 		{"media connected", Packet{Header: Header{Version: 1, Type: PacketAudio, SessionID: 1, StreamID: 1}, Payload: []byte{1}}, ValidationContext{ClientToServer, Connected}, false},
+		{"audio retry", Packet{Header: Header{Version: 1, Type: PacketAudio, Flags: FlagRetry, SessionID: 1, StreamID: 1}, Payload: []byte{1}}, ValidationContext{ClientToServer, Ready}, false},
+		{"data retry", Packet{Header: Header{Version: 1, Type: PacketData, Flags: FlagRetry, SessionID: 1, StreamID: 1}, Extensions: []TLV{Uint16TLV(TLVDataType, 1)}, Payload: []byte{1}}, ValidationContext{ClientToServer, Ready}, false},
 		{"end request", Packet{Header: Header{Version: 1, Type: PacketStreamEnd, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx}}, ValidationContext{ClientToServer, Ready}, true},
 		{"end response", Packet{Header: Header{Version: 1, Type: PacketStreamEnd, Flags: FlagResponse, SessionID: 1, StreamID: 1}, Extensions: []TLV{tx, Uint16TLV(TLVEndReason, 0)}}, ValidationContext{ServerToClient, Ready}, true},
 	}

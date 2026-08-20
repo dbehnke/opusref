@@ -8,9 +8,12 @@ import (
 )
 
 type memorySender struct {
-	mu    sync.Mutex
-	sent  []Outbound
-	block chan struct{}
+	mu        sync.Mutex
+	sent      []Outbound
+	block     chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	closed    bool
 }
 type busySender struct{ memorySender }
 
@@ -18,6 +21,9 @@ func (*busySender) RequestFloor(context.Context, Outbound) error { return ErrBus
 
 func (m *memorySender) Send(_ context.Context, o Outbound) error {
 	if m.block != nil && (o.Kind == EventAudio || o.Kind == EventData) {
+		if m.entered != nil {
+			m.enterOnce.Do(func() { close(m.entered) })
+		}
 		<-m.block
 	}
 	m.mu.Lock()
@@ -26,6 +32,7 @@ func (m *memorySender) Send(_ context.Context, o Outbound) error {
 	m.sent = append(m.sent, o)
 	return nil
 }
+func (m *memorySender) Close() error { m.mu.Lock(); m.closed = true; m.mu.Unlock(); return nil }
 func TestClientContractCopiesAndSequencesPayload(t *testing.T) {
 	s := &memorySender{}
 	c, err := New(Options{ServerAddress: "x", NodeCallsign: "N0CALL"}, s)
@@ -52,23 +59,57 @@ func TestClientContractCopiesAndSequencesPayload(t *testing.T) {
 	_ = c.Close()
 }
 func TestMediaBackpressure(t *testing.T) {
-	s := &memorySender{block: make(chan struct{})}
+	s := &memorySender{block: make(chan struct{}), entered: make(chan struct{})}
 	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N", MediaSendQueueFrames: 1}, s)
 	_ = c.Connect(context.Background())
 	_ = c.RequestStream(context.Background(), "N")
-	_ = c.SendAudio(context.Background(), 0, []byte{1})
-	var got error
-	for i := 0; i < 10; i++ {
-		got = c.SendAudio(context.Background(), 0, []byte{1})
-		if errors.Is(got, ErrBackpressure) {
-			break
-		}
+	_ = c.SendAudio(context.Background(), 10, []byte{1})
+	<-s.entered
+	if err := c.SendAudio(context.Background(), 20, []byte{1}); err != nil {
+		t.Fatal(err)
 	}
+	got := c.SendAudio(context.Background(), 30, []byte{1})
 	if !errors.Is(got, ErrBackpressure) {
 		t.Fatalf("got %v", got)
 	}
 	close(s.block)
+	if err := c.EndStream(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	end := s.sent[len(s.sent)-1]
+	s.mu.Unlock()
+	if end.Sequence != 2 || end.Timestamp != 20 {
+		t.Fatalf("backpressure consumed metadata: %#v", end)
+	}
 	_ = c.Close()
+}
+
+type blockingRequester struct {
+	memorySender
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingRequester) RequestFloor(context.Context, Outbound) error {
+	close(b.entered)
+	<-b.release
+	return nil
+}
+func TestConcurrentFloorRequestIsRejected(t *testing.T) {
+	s := &blockingRequester{entered: make(chan struct{}), release: make(chan struct{})}
+	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	_ = c.Connect(context.Background())
+	first := make(chan error, 1)
+	go func() { first <- c.RequestStream(context.Background(), "N") }()
+	<-s.entered
+	if err := c.RequestStream(context.Background(), "N"); err == nil {
+		t.Fatal("concurrent request accepted")
+	}
+	close(s.release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
 }
 func TestPublishCopiesEventPayload(t *testing.T) {
 	s := &memorySender{}
@@ -93,8 +134,37 @@ func TestRequiredEventBackpressureIsTerminal(t *testing.T) {
 	if !errors.Is(c.Err(), ErrApplicationBackpressure) {
 		t.Fatal(c.Err())
 	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if !closed {
+		t.Fatal("terminal failure did not close transport")
+	}
 	if c.Close() != c.Close() {
 		t.Fatal("Close result changed")
+	}
+}
+func TestSecondFloorRequestDoesNotCorruptActiveStream(t *testing.T) {
+	s := &memorySender{}
+	c, _ := New(Options{ServerAddress: "x", NodeCallsign: "N"}, s)
+	_ = c.Connect(context.Background())
+	if err := c.RequestStream(context.Background(), "N"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RequestStream(context.Background(), "N"); err == nil {
+		t.Fatal("second request accepted")
+	}
+	if err := c.SendAudio(context.Background(), 960, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EndStream(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	end := s.sent[len(s.sent)-1]
+	if end.StreamID != 1 || end.Sequence != 1 || end.Timestamp != 960 {
+		t.Fatalf("bad end metadata: %#v", end)
 	}
 }
 func TestClientDoesNotActivateStreamBeforeGrant(t *testing.T) {
