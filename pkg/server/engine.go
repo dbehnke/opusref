@@ -132,10 +132,21 @@ func NewEngine(l Limits, now func() time.Time) *Engine {
 func (e *Engine) AddSession(id uint64, address, callsign string, ready bool) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.draining || id == 0 || len(e.sessions) >= e.limits.MaxClients {
+	if _, exists := e.sessions[id]; e.draining || id == 0 || exists || len(e.sessions) >= e.limits.MaxClients {
 		return false
 	}
 	e.sessions[id] = &session{address: address, callsign: callsign, ready: ready, last: e.now()}
+	return true
+}
+func (e *Engine) SetReady(id uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s := e.sessions[id]
+	if s == nil {
+		return false
+	}
+	s.ready = true
+	s.last = e.now()
 	return true
 }
 func (e *Engine) RequestFloor(id uint64, stream uint32, source string) FloorResult {
