@@ -122,6 +122,48 @@ func TestDecodeRejectsMalformedPackets(t *testing.T) {
 	}
 }
 
+func TestUnknownOptionalZeroLengthTLVRoundTrips(t *testing.T) {
+	packet := Packet{
+		Header:     Header{Version: Version1, Type: PacketAudio, SessionID: 1, StreamID: 1},
+		Extensions: []TLV{{Type: 0x1234}},
+		Payload:    []byte{0xf8},
+	}
+	data, err := Encode(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Extensions) != 1 || len(decoded.Extensions[0].Value) != 0 {
+		t.Fatalf("unexpected extensions: %#v", decoded.Extensions)
+	}
+}
+
+func TestEncodeRejectsInvalidKnownTLVValues(t *testing.T) {
+	tests := map[string]TLV{
+		"short transaction": {Type: TLVTransactionID, Value: make([]byte, 7)},
+		"invalid callsign":  {Type: TLVNodeCallsign, Value: []byte("N0CALL !  ")},
+		"short nonce":       {Type: TLVClientNonce, Value: make([]byte, 31)},
+		"invalid UTF-8":     {Type: TLVDisplayName, Value: []byte{0xff}},
+		"zero data type":    {Type: TLVDataType, Value: []byte{0, 0}},
+		"bad end reason":    {Type: TLVEndReason, Value: []byte{0, 6}},
+	}
+	for name, extension := range tests {
+		t.Run(name, func(t *testing.T) {
+			packet := Packet{
+				Header:     Header{Version: Version1, Type: PacketAudio, SessionID: 1, StreamID: 1},
+				Extensions: []TLV{extension},
+				Payload:    []byte{0xf8},
+			}
+			if _, err := Encode(packet); err == nil {
+				t.Fatal("Encode accepted an invalid registered TLV")
+			}
+		})
+	}
+}
+
 func FuzzDecode(f *testing.F) {
 	seed, err := hex.DecodeString(goldenAudioHex)
 	if err != nil {

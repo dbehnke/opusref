@@ -15,7 +15,7 @@ random sources, packet transports, and event sinks.
 
 | Area | Responsibility |
 |---|---|
-| `pkg/wire` | Header and TLV encoding, decoding, validation, and golden vectors |
+| `pkg/wire` | Structural encoding, decoding, registered-value validation, and golden vectors |
 | `pkg/server` | Sessions, floor arbitration, stream state, and fan-out decisions |
 | `pkg/client` | Handshake, retry, keepalive, floor control, and raw-frame events |
 | `pkg/monitor` | Read-only snapshots, events, HTTP handlers, and metrics |
@@ -75,7 +75,8 @@ stateDiagram-v2
 Only the state owner can grant or release the floor. The first accepted
 `STREAM_REQUEST` in event order wins. A duplicate transaction returns its prior
 result. A second client receives `STREAM_BUSY`. A grant becomes active on the
-first valid audio or data packet.
+first valid audio or data packet. The first media packet establishes the initial
+48 kHz timestamp. Thus, a data packet can activate a granted stream.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
 inactivity timeout, and transmit time limit. Each release produces one monitor

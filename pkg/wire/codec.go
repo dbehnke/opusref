@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 var (
@@ -110,7 +111,7 @@ func Decode(data []byte) (Packet, error) {
 		baseType := typeID &^ TLVCriticalMask
 		valueLength := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
 		tlvSize := alignedTLVSize(valueLength)
-		if valueLength == 0 || tlvSize > headerLength-offset {
+		if tlvSize > headerLength-offset {
 			return Packet{}, fmt.Errorf("%w: invalid TLV length", ErrMalformedPacket)
 		}
 		if _, exists := seen[baseType]; exists {
@@ -127,6 +128,9 @@ func Decode(data []byte) (Packet, error) {
 			}
 		}
 		value := append([]byte(nil), data[offset+4:valueEnd]...)
+		if err := validateTLVValue(baseType, value); err != nil {
+			return Packet{}, err
+		}
 		packet.Extensions = append(packet.Extensions, TLV{Type: typeID, Value: value})
 		offset += tlvSize
 	}
@@ -139,7 +143,7 @@ func validateExtensions(extensions []TLV) (int, error) {
 	total := 0
 	for _, extension := range extensions {
 		baseType := extension.Type &^ TLVCriticalMask
-		if len(extension.Value) == 0 || len(extension.Value) > int(^uint16(0)) {
+		if len(extension.Value) > int(^uint16(0)) {
 			return 0, fmt.Errorf("%w: invalid TLV length", ErrMalformedPacket)
 		}
 		if _, exists := seen[baseType]; exists {
@@ -148,6 +152,9 @@ func validateExtensions(extensions []TLV) (int, error) {
 		seen[baseType] = struct{}{}
 		if extension.Type&TLVCriticalMask != 0 && !knownTLV(baseType) {
 			return 0, fmt.Errorf("%w: unknown critical TLV %#04x", ErrMalformedPacket, extension.Type)
+		}
+		if err := validateTLVValue(baseType, extension.Value); err != nil {
+			return 0, err
 		}
 		total += alignedTLVSize(len(extension.Value))
 	}
@@ -160,4 +167,82 @@ func alignedTLVSize(valueLength int) int {
 
 func knownTLV(typeID TLVType) bool {
 	return typeID >= TLVTransactionID && typeID <= TLVEndReason
+}
+
+func validateTLVValue(typeID TLVType, value []byte) error {
+	invalid := func() error {
+		return fmt.Errorf("%w: invalid value for TLV %#04x", ErrMalformedPacket, typeID)
+	}
+	switch typeID {
+	case TLVTransactionID:
+		if len(value) != 8 {
+			return invalid()
+		}
+	case TLVNodeCallsign, TLVSourceCallsign:
+		if !validPaddedIdentifier(value, CallsignSize) {
+			return invalid()
+		}
+	case TLVReflectorID:
+		if !validPaddedIdentifier(value, 16) {
+			return invalid()
+		}
+	case TLVDisplayName:
+		if len(value) < 1 || len(value) > 64 || !utf8.Valid(value) {
+			return invalid()
+		}
+	case TLVClientNonce, TLVServerNonce, TLVAuthenticationTag:
+		if len(value) != 32 {
+			return invalid()
+		}
+	case TLVDataType:
+		if len(value) != 2 || binary.BigEndian.Uint16(value) == 0 {
+			return invalid()
+		}
+	case TLVErrorCode:
+		if len(value) != 2 {
+			return invalid()
+		}
+		code := ErrorCode(binary.BigEndian.Uint16(value))
+		if code < ErrorMalformedPacket || code > ErrorInternal {
+			return invalid()
+		}
+	case TLVErrorText:
+		if len(value) < 1 || len(value) > 128 || !utf8.Valid(value) {
+			return invalid()
+		}
+	case TLVTransmitTimeLimit:
+		if len(value) != 4 || binary.BigEndian.Uint32(value) == 0 {
+			return invalid()
+		}
+	case TLVEndReason:
+		if len(value) != 2 || EndReason(binary.BigEndian.Uint16(value)) > EndReasonServerShutdown {
+			return invalid()
+		}
+	}
+	return nil
+}
+
+func validPaddedIdentifier(value []byte, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	contentLength := size
+	for i, char := range value {
+		if char == ' ' {
+			contentLength = i
+			break
+		}
+		if !((char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '/' || char == '-') {
+			return false
+		}
+	}
+	if contentLength == 0 {
+		return false
+	}
+	for _, char := range value[contentLength:] {
+		if char != ' ' {
+			return false
+		}
+	}
+	return true
 }

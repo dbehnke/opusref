@@ -44,9 +44,11 @@ stream uses stream ID, sequence, and timestamp zero. Audio and data packets use
 one shared sequence space for the stream. The first media packet uses sequence
 zero. The value increases by one modulo 2^32 for each audio or data packet.
 
-The first audio timestamp MAY have any value. Each later audio timestamp adds
-the number of decoded samples in the prior Opus packet at a 48 kHz clock. A data
-packet uses the timestamp of the current stream position.
+The first media timestamp MAY have any value. This rule applies when the first
+media packet is audio or data. A first data packet establishes the initial
+stream position. Each later audio timestamp adds the number of decoded samples
+in the prior Opus packet at a 48 kHz clock. A data packet uses the most recent
+stream timestamp. Consecutive data packets can use the same timestamp.
 
 ### 3.1 Flags
 
@@ -68,6 +70,9 @@ Bit 15 of the TLV type is the critical bit. The lower 15 bits are the type
 number. A receiver MUST reject an unknown critical TLV. It MUST skip an unknown
 optional TLV. A packet MUST NOT contain the same TLV more than once unless this
 document permits it.
+
+An unknown optional TLV MAY have a value length of zero. A registered TLV MUST
+have the length in the following table.
 
 | Type | Name | Value |
 |---:|---|---|
@@ -216,11 +221,15 @@ first attempt. Thus, the delay after each attempt is 500 ms, 1 second, and 2
 seconds. Each retry uses the same transaction ID and sets `RETRY`. The client
 stops after four total attempts.
 
-Before admission, the server cache key is the remote IP address and port, the
-request packet type, and the transaction ID. After admission, the cache key is
-the session ID, the request packet type, and the transaction ID. Packet type is
-part of both keys. Thus, `HELLO` and `AUTHENTICATE` can use the same connection
-transaction ID and cannot collide in the cache.
+Handshake requests always use the remote IP address and port, the request packet
+type, and the transaction ID as the cache key. This rule applies to a retried
+`AUTHENTICATE` after the server creates a session. Thus, the server can return
+the original `WELCOME` when the first `WELCOME` is lost. `HELLO` and
+`AUTHENTICATE` can use the same connection transaction ID because packet type is
+part of the key.
+
+After admission, non-handshake requests use the session ID, request packet type,
+and transaction ID as the cache key.
 
 The server keeps a completed result for at least 30 seconds. When it receives a
 duplicate request, it returns the prior logical result and does not repeat the
