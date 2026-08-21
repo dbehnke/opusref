@@ -43,14 +43,18 @@ rule removes lock ordering from protocol policy. The UDP reader copies each
 datagram into a bounded buffer and validates it before it creates an event. The
 state owner does not block on network writes, logs, metrics, or HTTP clients.
 
-One UDP writer receives immutable send intents. Its queue is bounded. When the
-queue is full, the server drops the new media intent, increments a metric, and
-continues. Control responses use a small reserved queue so that media load does
-not block disconnect, revoke, or error traffic.
+One UDP writer receives immutable send intents. Its queues are bounded. The
+media queue has 256 frame batches. A batch contains one datagram and one
+recipient snapshot. The control queue has 64 destination datagrams. The writer
+sends available control traffic before each media batch and between recipient
+writes. The state owner does not block on either queue.
 
 The server uses one UDP socket. A session key contains the random session ID and
 the remote IP address and port. The session store has configured client and
 challenge limits. Expiration uses an injected monotonic clock.
+
+The UDP reader uses a 1,201-byte detection buffer. It rejects a datagram that is
+larger than 1,200 bytes. It does not accept a truncated prefix as a packet.
 
 ## 4. State model
 
@@ -77,21 +81,28 @@ stateDiagram-v2
 Only the state owner can grant or release the floor. The first accepted
 `STREAM_REQUEST` in event order wins. A duplicate transaction returns its prior
 result. A second client receives `STREAM_BUSY`. A grant becomes active on the
-first valid audio or data packet. The first media packet establishes the initial
-48 kHz stream position. Data does not advance that position. Audio advances it
-by the decoded sample count. Thus, a data packet can activate a granted stream,
-and the first later audio packet uses the established position.
+first valid audio or data packet. The endpoint supplies each 48 kHz timestamp.
+The reflector records and forwards the current header timestamp without
+modification. It does not calculate an Opus duration. Audio and data use one
+sequence space. A data packet can activate a granted stream.
 
 Release causes are owner end, owner disconnect, unused grant timeout, media
-inactivity timeout, and transmit time limit. Each release produces one monitor
-event and one listener revoke operation.
+inactivity timeout, and transmit time limit. Each release emits one
+`stream_ended` event and starts the listener revoke procedure. A grant timeout
+or media-inactivity timeout also emits `stream_timeout`. A transmit time limit
+also emits `transmit_time_limit`.
 
 ## 5. Client architecture
 
-The client package accepts a packet transport, clock, random source, and event
-sink. It owns one connection state machine and at most one local stream. It
+The client package accepts an injected sender for unit tests. Its UDP adapter
+owns the socket, secure random source, receive timer, and event sink. It owns one
+connection state machine and at most one local stream. It
 performs control retries and keepalives. It exposes received stream metadata,
 opaque audio, typed data, busy, revoke, and error events.
+
+A correlated `STREAM_BUSY` completes the pending floor request, returns the
+busy error, and publishes a populated busy event. The event contains the local
+session ID and requested stream ID.
 
 The server uses a per-listener transaction for each stream-start and
 stream-revoke notification. The listener acknowledges the notification. The
@@ -99,21 +110,94 @@ server retries an unacknowledged notification with the standard bounded retry
 schedule. A new session does not enter the fan-out set until its immediate
 post-welcome keepalive confirms the session ID.
 
+The client waits for `STREAM_GRANT` before it activates its send state. It uses
+the same transaction ID for attempts at 0, 0.5, 1.5, and 3.5 seconds. It rejects
+a response with a different session ID, stream ID, packet type, or transaction
+ID. It rejects overlapping floor requests. It advances sequence and timestamp
+state only after it accepts a frame into the bounded send queue. It acknowledges
+each notification retry and publishes one lifecycle event for the state change.
+Before it sends `STREAM_END`, it waits until the transport has sent every
+accepted media frame. This preserves media, sequence, and timestamp order.
+
+`Close` sends a transactional `DISCONNECT` when the client has an active
+session. It uses the control retry schedule and the configured operation
+timeout. It closes the UDP socket after the response or timeout. A
+server-initiated disconnect is acknowledged and closes the socket without
+starting a second exchange. The public `Client` interface has nine methods. It
+does not include a context-specific close method.
+
+A correlated `ERROR` completes a pending request. The client publishes one
+protocol-error event with the session ID, stream ID, error code, and optional
+error text.
+
+One connect attempt owns the pre-admission socket reader. The client rejects a
+concurrent connect attempt. An unrelated datagram does not advance the retry
+schedule. The library limits the full connection procedure to the configured
+connect timeout or an earlier caller deadline. The reader continues until that
+deadline.
+
 The library does not reorder, decode, or play audio. It reports sequence gaps
 and timestamps so that an application can implement a jitter buffer. Send
 methods accept a complete Opus packet or typed data payload. They reject a
 payload that cannot fit in a 1,200-byte datagram.
 
-`opusrefctl` reads and writes a diagnostic record format. Each record has a
-four-byte network-order length followed by one opaque payload. The command can
-connect, request the floor, send records from standard input, and write received
-records to standard output. It does not use microphone or speaker devices.
+`opusrefctl` reads and writes the 16-byte `ORR1` diagnostic record header that
+the protocol specification defines. It does not use microphone or speaker
+devices.
+
+### 5.1 Capacity and shutdown
+
+The server permits 100 connected clients and 100 pending challenges. It uses a
+256-datagram inbound queue. It retains 1,024 completed transactions globally
+and 64 for each admitted session. It permits 200 pending notifications globally
+and two for each listener. It retains 256 monitoring events.
+
+The UDP client composes a socket reader with its configured bounded inbound
+datagram queue. It drops a new datagram when this queue is full. If a required
+lifecycle event cannot enter the application queue, the client closes its UDP
+transport and reports a terminal error.
+
+If the server cannot enqueue a required control response or a retained duplicate
+response, it closes the admitted session. If that session owns the floor, the
+server sends owner-disconnect revoke semantics to the listeners.
+
+The receive state identity contains the owner session ID and stream ID. A
+periodic receive-state timer uses the last-media time for that stream. Unrelated
+socket traffic does not delay expiry.
+
+```mermaid
+sequenceDiagram
+    participant Command
+    participant State as State owner
+    participant Writer
+    Command->>State: Start restricted drain
+    State->>State: Reject admission, floor, and media
+    State->>Writer: Disable and discard queued media
+    State->>Writer: STREAM_REVOKE transactions
+    Writer-->>State: Acknowledgement or retry exhaustion
+    State->>Writer: DISCONNECT transactions
+    State-->>Command: Restricted drain complete
+    Command->>Command: Close UDP only after drain completion
+```
 
 ## 6. Configuration and secrets
 
 The server reads YAML once at startup. It validates all addresses, limits,
 identifiers, and timer relationships before it opens a socket. Defaults match
 `config.example.yaml`.
+The server and client constructors reject zero or negative effective queue and
+state capacities before they allocate channels. They reject negative timer
+values instead of treating them as defaults.
+
+The live reflector supplies one clock to the engine, challenges, retained
+transactions, notification retries, session timeouts, and monitoring snapshots.
+Tests replace this clock to control policy time.
+
+`opusrefd` applies the configured log level and format to its runtime logger.
+The supported levels are debug, info, warn, and error. The supported formats
+are JSON and text. Runtime log fields can contain the reflector ID and listen
+addresses. They do not contain shared-key values, key-source settings, nonces,
+authentication tags, or HMAC input.
 
 An environment variable has priority over a shared-key file. The server uses the
 UTF-8 bytes of a nonempty environment value. If the environment variable is not

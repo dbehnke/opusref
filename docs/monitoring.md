@@ -36,12 +36,41 @@ paths, or shared-key values.
 
 Each event contains an event ID, UTC timestamp, event type, severity, and a
 small set of typed details. Event IDs increase for the process lifetime. The
-defined event types are client connected, client disconnected, authentication
-failed, stream granted, stream busy, stream active, stream ended, stream
-timeout, transmit time limit, malformed packet, and queue drop.
+defined event types are `client_connected`, `client_disconnected`,
+`authentication_failed`, `stream_granted`, `stream_busy`, `stream_active`,
+`stream_ended`, `stream_timeout`, `transmit_time_limit`, `malformed_packet`,
+`queue_drop`, and `control_overload`.
+
+| Event type | Required details |
+|---|---|
+| `client_connected` | Session ID and node callsign |
+| `client_disconnected` | Session ID, node callsign, and bounded reason |
+| `authentication_failed` | None |
+| `stream_granted` | Session ID and stream ID |
+| `stream_busy` | None |
+| `stream_active` | Session ID and stream ID |
+| `stream_ended` | Session ID, stream ID, and end reason |
+| `stream_timeout` | Session ID, stream ID, and grant or media-inactivity reason |
+| `transmit_time_limit` | Session ID, stream ID, and transmit-time-limit reason |
+| `malformed_packet` | None |
+| `queue_drop` | Fixed queue, fixed item type, frame count, and recipient count |
+| `control_overload` | Session ID |
+
+The server emits `stream_active` for the first accepted media frame. Every
+release emits `stream_ended`. A grant timeout or media-inactivity timeout also
+emits `stream_timeout`. A transmit time limit also emits
+`transmit_time_limit`. The server emits `client_disconnected` on each path that
+removes a session. It emits `queue_drop` when it observes an inbound drop or
+rejects queued media or control work.
+
+The bounded disconnect reasons are `client_request`, `server_shutdown`,
+`session_timeout`, `control_overload`, and
+`admission_delivery_failure`.
 
 An event must not contain media or typed-data payload bytes. Error text must not
-contain secret material.
+contain secret material. Event details use bounded protocol identifiers, fixed
+reason strings, fixed queue names, fixed item types, and integer counts. They do
+not contain a shared key, nonce, authentication tag, or HMAC input.
 
 ## 4. Prometheus metrics
 
@@ -63,14 +92,29 @@ All names use the `opusref_` prefix. Counters have a `_total` suffix.
 | `opusref_stream_duration_seconds` | Histogram | None |
 | `opusref_busy_total` | Counter | None |
 | `opusref_timeouts_total` | Counter | `kind` |
-| `opusref_fanout_frames_total` | Counter | `frame_type` |
-| `opusref_fanout_recipients_total` | Counter | `frame_type` |
-| `opusref_queue_drops_total` | Counter | `queue`, `frame_type` |
+| `opusref_fanout_frames_total` | Counter | `item_type` |
+| `opusref_fanout_recipients_total` | Counter | `item_type` |
+| `opusref_queue_drops_total` | Counter | `queue`, `item_type` |
+| `opusref_queue_drop_recipients_total` | Counter | `queue`, `item_type` |
 | `opusref_sequence_gaps_total` | Counter | `direction` |
 
 Label values come from fixed enumerations. Callsigns, identifiers, addresses,
 data type numbers, and error text are prohibited labels. Histograms use fixed
-buckets that the implementation documents with its first metrics code.
+buckets of 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, and 180 seconds.
+
+The fixed `direction` values are `rx` and `tx`. The fixed `item_type` values are
+`datagram`, `audio`, `data`, `control`, and `event`. Queue values are
+`server_inbound`, `server_media`, `server_control`, `client_inbound`,
+`client_events`, `client_media`, and `client_control`. The implementation MUST
+reject any other label value.
+
+Packet error reasons are `malformed`, `unsupported_version`, `invalid_session`,
+`address_mismatch`, `invalid_stream`, `unsupported_type`, `limit_exceeded`, and
+`transaction_conflict`. Authentication results are `accepted`, `rejected`, and
+`overloaded`. Authentication modes are `open` and `shared_key`. Stream results
+are `granted`, `busy`, `rejected`, and `overloaded`. Stream-end reasons and
+timeout kinds use the values that the protocol specification defines. Packet
+type labels use the lowercase names in the packet-type registry.
 
 ## 5. Snapshot design
 

@@ -44,13 +44,10 @@ stream uses stream ID, sequence, and timestamp zero. Audio and data packets use
 one shared sequence space for the stream. The first media packet uses sequence
 zero. The value increases by one modulo 2^32 for each audio or data packet.
 
-The first media timestamp MAY have any value. This rule applies when the first
-media packet is audio or data. The value establishes the current stream
-position. A data packet uses the current stream position and does not change it.
-The first audio packet uses the current stream position. After an audio packet
-with timestamp T and duration D, the current stream position becomes T plus D
-modulo 2^32. Thus, the next audio packet uses T plus D even when data packets
-occur between the audio packets.
+The endpoint supplies each media timestamp. The first timestamp MAY have any
+value. The endpoint uses one 48 kHz timeline for audio and data. The reflector
+does not calculate packet duration or check timestamp continuity. It forwards
+the timestamp without modification.
 
 ### 3.1 Flags
 
@@ -226,6 +223,8 @@ no valid packet.
 ## 8. Transactions and retries
 
 A control message that expects a response MUST contain a transaction ID. The
+initiator generates a new transaction ID with a cryptographically secure random
+source. It MUST NOT use a counter or another predictable sequence. The
 initiator sends the first attempt at time zero. If no response arrives, it sends
 three retries. The retries occur 500 ms, 1.5 seconds, and 3.5 seconds after the
 first attempt. Thus, the delay after each attempt is 500 ms, 1 second, and 2
@@ -246,8 +245,10 @@ The server starts a separate transaction for each listener when it sends
 `STREAM_START` or `STREAM_REVOKE`. The server cache key uses the listener session
 ID, notification packet type, and transaction ID. An acknowledgement uses the
 listener's session ID, not the floor owner's session ID. It copies the stream ID
-and transaction ID and sets `RESPONSE`. A client acknowledges each duplicate
-notification but applies its state change only one time.
+sequence, timestamp, and transaction ID and sets `RESPONSE`. The server accepts
+the acknowledgement only when all these fields match the notification. A client
+acknowledges each duplicate notification but applies its state change only one
+time.
 
 If the server does not receive a `STREAM_START` acknowledgement after four
 attempts, it stops media fan-out to that listener for the active stream. The
@@ -257,6 +258,23 @@ cancels its outstanding start transactions before it starts revoke transactions.
 The server keeps a completed result for at least 30 seconds. When it receives a
 duplicate request, it returns the prior logical result and does not repeat the
 state change. A response copies the transaction ID and sets `RESPONSE`.
+The server keeps a completed `DISCONNECT` result after it removes the session.
+During the retention time, it replays that result only to the same UDP address
+and for the same session, transaction, and normalized request. Replay does not
+restore the session. The server is silent after the result expires.
+The server also retains this result when the first response cannot enter the
+control queue.
+
+The normalized request fingerprint contains the packet type, flags with only
+`RETRY` removed, all state header fields, canonical ordered TLVs, and payload.
+The receiver rejects the same cache key with a different fingerprint as a
+malformed transaction conflict. The server does not evict a retained result
+before its retention time ends. Only a packet that passes semantic validation
+and the session address check refreshes session activity.
+Wire validation alone does not refresh activity. The server first accepts the
+packet in the floor, sequence, transaction, or notification state machine. A
+wrong-owner packet, wrong-stream packet, stale first sequence, or mismatched
+notification acknowledgement does not refresh activity.
 
 ## 9. Half-duplex stream procedure
 
@@ -288,16 +306,24 @@ floor is free, the server sends `STREAM_GRANT` to the requester. It also sends
 transmit time limit to each listener. Each listener acknowledges it. If the
 floor is not free, the server sends `STREAM_BUSY`.
 
-The client MUST wait for `STREAM_GRANT` before it sends media. The grant expires
-if no media arrives in two seconds. The server releases the floor after one
+The client MUST wait for `STREAM_GRANT` before it sends media. It MUST reject a
+second or concurrent floor request while a request or local stream is active.
+It correlates the response transaction ID, session ID, stream ID, and packet
+type before it changes local state. The grant expires if no media arrives in two
+seconds. The server releases the floor after one
 second with no valid media. The default transmit time limit releases the floor
 after 180 seconds. These three values are server configuration values.
 
-The owner sends `STREAM_END` to release the floor. The server acknowledges it
-with `STREAM_END` and `RESPONSE`, then sends a transactional `STREAM_REVOKE` to
-each listener. Each listener acknowledges it. The server also sends
-`STREAM_REVOKE` after a timeout or owner disconnect. The end reason states why
-the server released the floor.
+The owner sends `STREAM_END` to release the floor. The request stream ID MUST
+match the active stream. Its sequence and timestamp MUST match the next sequence
+and final endpoint timestamp. The server returns `ERROR` with invalid stream for
+a wrong owner, stream, sequence, timestamp, or inactive floor. The server
+acknowledges a valid request with `STREAM_END` and `RESPONSE`, then sends a
+transactional `STREAM_REVOKE` to each listener. Each listener acknowledges it.
+The server also sends
+`STREAM_REVOKE` to the owner and listeners after a timeout, owner disconnect,
+server shutdown, or required control-delivery failure. The end reason states
+why the server released the floor.
 
 If an unused grant expires, no media sequence or timestamp exists. The server
 sets both fields to zero in `STREAM_REVOKE` for this case.
@@ -313,9 +339,12 @@ to that listener. It does not wait for the acknowledgement before it sends
 media. A client MUST discard media for a stream until it has the stream
 metadata. If the first notification is lost, a retry supplies the metadata.
 
-A listener releases its receive state when it receives `STREAM_REVOKE`. It also
-releases stale receive state after two seconds with no media or when it accepts
-a new `STREAM_START`. These rules provide recovery when all revoke attempts are
+A listener keys receive state by the owner session ID and stream ID. It keeps a
+bounded set of retired identities so a delayed start or revoke cannot replace a
+new owner that reused the same stream ID. A listener releases its receive state
+when it receives `STREAM_REVOKE`. It also releases stale receive state after two
+seconds with no media or when it accepts a new `STREAM_START`. These rules
+provide recovery when all revoke attempts are
 lost.
 
 ## 10. Audio and data
@@ -342,6 +371,28 @@ The defined error codes are: malformed packet (1), unsupported version (2),
 authentication failed (3), invalid session (4), invalid stream (5), limit
 exceeded (6), unsupported type (7), and internal error (8).
 
-The server SHOULD silently drop an invalid unauthenticated packet. This rule
+The server MUST silently drop an invalid unauthenticated packet. This rule
 prevents reflection amplification. It MAY send a bounded `ERROR` for a valid
-session. An error response MUST NOT be larger than the request.
+session. An error response MUST NOT be larger than the request. The server omits
+the optional transaction ID when it must make a minimal error fit this limit.
+When `ERROR` contains a transaction ID, the client completes the matching
+request immediately. It publishes the error code and optional error text to the
+application. It does not wait for another retry deadline.
+
+## 12. Diagnostic record format
+
+The diagnostic client uses this local record format. It is not an OpusRef UDP
+datagram.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `ORR1` |
+| 4 | 1 | Kind: 1 audio, 2 data |
+| 5 | 1 | Flags: zero |
+| 6 | 2 | Data type: zero for audio, nonzero for data |
+| 8 | 4 | Endpoint-supplied 48 kHz timestamp |
+| 12 | 4 | Payload length |
+
+Audio payload length is 1 through 1,168 bytes. Data payload length is 1 through
+1,160 bytes. A reader validates the complete header and length before it
+allocates payload memory.

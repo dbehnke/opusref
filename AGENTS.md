@@ -2,9 +2,9 @@
 
 ## Current maturity
 
-OpusRef is a protocol and architecture bootstrap. The Go packages and commands
-compile, but networking is not implemented. Do not describe the reflector or
-client as functional until implementation and interoperability tests prove it.
+OpusRef includes the v1 protocol, UDP reflector, raw-frame client, diagnostic
+commands, monitoring surface, and interoperability tests. Do not describe it as
+an audio application. It does not capture, play, encode, or decode audio.
 
 ## Normative documents
 

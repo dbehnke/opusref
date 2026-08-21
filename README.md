@@ -1,14 +1,13 @@
 # OpusRef
 
-OpusRef is a specification-stage digital voice reflector protocol for amateur
+OpusRef is a digital voice reflector protocol for amateur
 radio applications. It moves opaque Opus audio packets and typed data frames
 between connected clients on one half-duplex channel. The protocol is for IP
 networks only. It is not an over-the-air waveform.
 
-This repository currently contains the OpusRef v1 specification, architecture,
-monitoring design, and compiling Go package skeletons. It does not contain a
-working reflector or client. In particular, it does not capture, encode,
-decode, transcode, play, record, or inspect audio.
+This repository contains the OpusRef v1 specification, a UDP reflector, a raw
+frame client, a diagnostic command, monitoring handlers, and tests. It does not
+capture, encode, decode, transcode, play, record, or inspect audio.
 
 Read these documents before implementation:
 
@@ -18,10 +17,12 @@ Read these documents before implementation:
 
 ## Commands
 
-- `opusrefd` is reserved for the reflector server.
-- `opusrefctl` is reserved for the diagnostic client.
+- `opusrefd --config config.yaml` starts the reflector and monitoring server.
+- `opusrefctl listen` writes received `ORR1` records to standard output.
+- `opusrefctl transmit` reads `ORR1` records from standard input.
 
-Both commands are placeholders and report that networking is not implemented.
+Use `opusrefctl listen --help` or `opusrefctl transmit --help` for flags. Logs
+and errors use standard error. Standard output contains diagnostic records only.
 
 ## Bootstrap checks
 
@@ -31,10 +32,9 @@ go vet ./...
 go build ./cmd/opusrefd ./cmd/opusrefctl
 ```
 
-Copy `config.example.yaml` to `config.yaml` only after server implementation
-starts. Local configuration is ignored by Git.
+Copy `config.example.yaml` to `config.yaml`. Local configuration is ignored by
+Git.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-

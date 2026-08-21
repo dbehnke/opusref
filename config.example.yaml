@@ -8,7 +8,14 @@ reflector:
 limits:
   max_clients: 100
   max_datagram_bytes: 1200
-  outbound_queue_frames: 256
+  inbound_queue_packets: 256
+  outbound_media_queue_frames: 256
+  outbound_control_queue_packets: 64
+  max_pending_challenges: 100
+  max_completed_transactions: 1024
+  max_completed_transactions_per_session: 64
+  max_pending_notifications: 200
+  max_pending_notifications_per_client: 2
   recent_events: 256
 
 timers:
@@ -17,6 +24,8 @@ timers:
   grant_timeout: 2s
   stream_inactivity_timeout: 1s
   transmit_time_limit: 180s
+  health_deadline: 250ms
+  shutdown_grace: 5s
 
 authentication:
   # Open admission is used when both values are empty. Environment wins.
