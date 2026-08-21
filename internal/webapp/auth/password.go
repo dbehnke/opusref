@@ -2,11 +2,13 @@
 package auth
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -178,4 +180,41 @@ func comparisonKey(value string) string {
 		}
 		return r
 	}, value)
+}
+func LoadAdditionalBlocklist(path string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	if path == "" {
+		return out, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1024*1024 {
+		return nil, errors.New("password blocklist file is invalid")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 1025)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !utf8.ValidString(line) {
+			return nil, errors.New("password blocklist is not UTF-8")
+		}
+		if line == "" {
+			continue
+		}
+		if len(out) >= 100000 {
+			return nil, errors.New("password blocklist has too many entries")
+		}
+		out[comparisonKey(line)] = struct{}{}
+	}
+	if err = scanner.Err(); err != nil {
+		return nil, errors.New("password blocklist line is too large")
+	}
+	return out, nil
 }

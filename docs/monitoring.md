@@ -1,5 +1,12 @@
 # OpusRef Monitoring Specification
 
+`opusrefweb` uses a separate loopback operator listener. Its public listener
+serves sanitized status and probes, but it does not serve `/metrics`. The
+operator listener serves probes and fixed-cardinality `opusrefweb_` metrics.
+Do not publish the operator listener through the public reverse proxy. Web
+metrics must not use callsigns, usernames, network addresses, tokens, paths, or
+identifiers as labels.
+
 ## 1. Access and data lifetime
 
 The monitoring server binds to `127.0.0.1:8080` by default. Version 1 does not

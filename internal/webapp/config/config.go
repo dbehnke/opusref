@@ -138,6 +138,11 @@ func (c Config) Validate() error {
 	if !isLoopbackListen(c.Web.MonitorListen) {
 		return errors.New("monitor listener must use loopback")
 	}
+	for _, value := range c.Web.TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(value); err != nil {
+			return errors.New("trusted proxy CIDR is invalid")
+		}
+	}
 	if !isLoopbackListen(c.Web.HTTPListen) {
 		u, err := url.Parse(c.Web.PublicOrigin)
 		if err != nil || u.Scheme != "https" || u.Host == "" {

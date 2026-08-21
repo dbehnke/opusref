@@ -68,9 +68,61 @@ The service refuses readiness when no enabled administrator exists. Stop the
 service with SIGTERM. The process removes readiness before it closes the HTTP
 listeners and reflector clients.
 
-## Current implementation limit
+## Passkey flow
 
-The first backend implementation supplies the protocol and storage foundations.
-The implementation review must reject the release until all Issue 3 routes,
-passkey ceremonies, archive recovery, retention, playback, reconnect behavior,
-and operator metrics pass their acceptance tests.
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant W as opusrefweb
+    participant A as Authenticator
+    B->>W: Request one-use options
+    W-->>B: Ceremony ID and options
+    B->>A: Create or get a credential
+    A-->>B: Signed response
+    B->>W: Ceremony ID and signed response
+    W->>W: Verify origin, RP ID, user verification, and counter
+    W-->>B: Session or enrollment result
+```
+
+## PTT flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Requesting: ptt_start
+    Requesting --> Transmitting: reflector grant
+    Requesting --> Idle: busy or error
+    Transmitting --> Stopping: ptt_stop or safety stop
+    Stopping --> Idle: stream end
+    Transmitting --> Idle: revoke, timeout, or disconnect
+```
+
+## Recording recovery
+
+```mermaid
+flowchart TD
+    A[First audio packet] --> B[Create database row]
+    B --> C[Create and sync partial file]
+    C --> D[Append opaque Opus packets]
+    D --> E[Sync and rename final file]
+    E --> F[Commit complete or partial state]
+    G[Process restart] --> H[Validate partial and final files]
+    H --> I[Finalize known files]
+    H --> J[Quarantine orphan or corrupt files]
+```
+
+## Shutdown
+
+```mermaid
+sequenceDiagram
+    participant O as Operator
+    participant W as opusrefweb
+    participant R as Reflector
+    O->>W: SIGTERM
+    W->>W: Remove readiness
+    W->>R: End active PTT
+    W->>W: Close WSS with restart code
+    W->>W: Finalize archive as partial
+    W->>R: Close UDP clients
+    W->>W: Stop HTTP within five seconds
+```

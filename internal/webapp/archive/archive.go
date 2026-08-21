@@ -42,12 +42,8 @@ func NewWriter(w io.Writer, id uuid.UUID) (*Writer, error) {
 	binary.BigEndian.PutUint16(h[4:6], 1)
 	binary.BigEndian.PutUint16(h[6:8], HeaderSize)
 	copy(h[8:24], id[:])
-	n, err := w.Write(h)
-	if err != nil {
+	if err := writeAll(w, h); err != nil {
 		return nil, err
-	}
-	if n != len(h) {
-		return nil, io.ErrShortWrite
 	}
 	return &Writer{w: w, size: HeaderSize}, nil
 }
@@ -63,13 +59,26 @@ func (w *Writer) WritePacket(p Packet) error {
 	binary.BigEndian.PutUint32(h[4:8], p.Timestamp)
 	binary.BigEndian.PutUint32(h[8:12], p.ArrivalMS)
 	binary.BigEndian.PutUint16(h[12:14], uint16(len(p.Payload)))
-	if _, err := w.w.Write(h); err != nil {
+	if err := writeAll(w.w, h); err != nil {
 		return err
 	}
-	if _, err := w.w.Write(p.Payload); err != nil {
+	if err := writeAll(w.w, p.Payload); err != nil {
 		return err
 	}
 	w.size += EntryHeaderSize + int64(len(p.Payload))
+	return nil
+}
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(data) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
 	return nil
 }
 func (w *Writer) Size() int64 { return w.size }

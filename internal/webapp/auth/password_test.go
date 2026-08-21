@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -51,5 +53,19 @@ func TestUsernameValidation(t *testing.T) {
 	}
 	if _, err := NormalizeUsername("bad name"); err == nil {
 		t.Fatal("expected invalid username")
+	}
+}
+func TestAdditionalBlocklistIsAdditive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.txt")
+	if err := os.WriteFile(path, []byte("Special-Phrase!\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	items, err := LoadAdditionalBlocklist(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := Policy{Additional: items}
+	if got := policy.Check("Special-Phrase!"); got == nil {
+		t.Fatal("additional blocklist was not applied")
 	}
 }

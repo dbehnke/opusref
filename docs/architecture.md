@@ -22,6 +22,18 @@ random sources, packet transports, and event sinks.
 | `internal/config` | YAML load, defaults, validation, and secret resolution |
 | `cmd/opusrefd` | Server composition, signals, and graceful shutdown |
 | `cmd/opusrefctl` | Diagnostic client composition and length-delimited frame I/O |
+| `internal/webapp` | Web authentication, WebAuthn, ORWB, ORAR, archive, live, PTT, and web monitoring policy |
+| `cmd/opusrefweb` | Companion composition, two ordinary clients, HTTP/WSS, workers, and shutdown |
+
+```mermaid
+flowchart LR
+    Browser -->|HTTPS and WSS| Web[opusrefweb]
+    Web -->|receive client| Reflector[opusrefd]
+    Web -->|transmit client| Reflector
+    Web --> Database[(SQLite)]
+    Web --> Files[(ORAR archive)]
+    Reflector -->|loopback monitor API| Web
+```
 
 No policy package reads or writes a UDP socket directly. No wire parser changes
 server state. The command packages only compose dependencies.

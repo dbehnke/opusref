@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -65,5 +66,28 @@ func TestFourthSessionEvictsLeastRecentlyActive(t *testing.T) {
 	}
 	if _, err = s.AuthenticateSession(context.Background(), tokens[0], now.Add(5*time.Minute)); err == nil {
 		t.Fatal("oldest session was not evicted")
+	}
+}
+func TestReauthenticationProofIsOneUseAndSessionBound(t *testing.T) {
+	s, err := Open(context.Background(), t.TempDir()+"/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	hash, _ := auth.HashPassword("quiet marble nebula orchard", auth.DefaultParams())
+	u, _ := s.CreateUser(context.Background(), CreateUser{Username: "alice", Role: RoleAdmin, PasswordHash: hash})
+	_, _, session, err := s.CreateSession(context.Background(), u.ID, time.Now(), 12*time.Hour, 7*24*time.Hour, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := s.IssueReauth(context.Background(), session.ID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConsumeReauth(context.Background(), session.ID, proof, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConsumeReauth(context.Background(), session.ID, proof, time.Now()); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("replay returned %v", err)
 	}
 }

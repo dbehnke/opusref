@@ -2,18 +2,30 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	webarchive "github.com/dbehnke/opusref/internal/webapp/archive"
 	"github.com/dbehnke/opusref/internal/webapp/auth"
 	"github.com/dbehnke/opusref/internal/webapp/gateway"
+	"github.com/dbehnke/opusref/internal/webapp/limit"
+	"github.com/dbehnke/opusref/internal/webapp/passkey"
+	reflectormonitor "github.com/dbehnke/opusref/internal/webapp/reflector"
 	wsprotocol "github.com/dbehnke/opusref/internal/webapp/socket"
 	"github.com/dbehnke/opusref/internal/webapp/store"
 )
@@ -31,6 +43,14 @@ type Config struct {
 	PTT                          *gateway.PTTManager
 	LiveQueuePackets             int
 	MaxConcurrentHashes          int
+	Passkeys                     *passkey.Manager
+	TrustedProxyCIDRs            []string
+	PasswordBlocklist            map[string]struct{}
+	ReflectorMonitor             *reflectormonitor.Client
+	MonitorStaleAfter            time.Duration
+	Archives                     *webarchive.Service
+	MaxWebSockets                int
+	MaxWebSocketsPerSession      int
 }
 type Server struct {
 	cfg                  Config
@@ -39,6 +59,15 @@ type Server struct {
 	public, monitor      http.Handler
 	hashSlots, hashQueue chan struct{}
 	dummyPasswordHash    string
+	limiter              *limit.Limiter
+	trustedProxies       []*net.IPNet
+	wsMu                 sync.Mutex
+	wsActive             int
+	wsBySession          map[string]int
+	shutdown             chan struct{}
+	shutdownOnce         sync.Once
+	channelMu            sync.Mutex
+	channelUsed          map[uint64]struct{}
 }
 
 func New(cfg Config, state *store.Store) *Server {
@@ -47,7 +76,13 @@ func New(cfg Config, state *store.Store) *Server {
 		concurrent = 2
 	}
 	dummy, _ := auth.HashPassword("dummy authentication workload", cfg.Argon2)
-	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16), dummyPasswordHash: dummy}
+	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16), dummyPasswordHash: dummy, limiter: limit.New(), wsBySession: map[string]int{}, shutdown: make(chan struct{}), channelUsed: map[uint64]struct{}{}}
+	for _, value := range cfg.TrustedProxyCIDRs {
+		_, network, err := net.ParseCIDR(value)
+		if err == nil {
+			s.trustedProxies = append(s.trustedProxies, network)
+		}
+	}
 	s.ready.Store(true)
 	s.public = s.security(s.publicMux())
 	s.monitor = s.security(s.monitorMux())
@@ -56,13 +91,36 @@ func New(cfg Config, state *store.Store) *Server {
 func (s *Server) PublicHandler() http.Handler  { return s.public }
 func (s *Server) MonitorHandler() http.Handler { return s.monitor }
 func (s *Server) SetReady(v bool)              { s.ready.Store(v) }
+func (s *Server) Shutdown()                    { s.ready.Store(false); s.shutdownOnce.Do(func() { close(s.shutdown) }) }
 func (s *Server) publicMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /api/v1/session", s.session)
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
+	mux.HandleFunc("POST /api/v1/auth/passkey/options", s.passkeyLoginOptions)
+	mux.HandleFunc("POST /api/v1/auth/passkey/verify", s.passkeyLoginVerify)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.requireSession(s.logout))
+	mux.HandleFunc("POST /api/v1/me/reauth/password", s.requireSession(s.reauthPassword))
+	mux.HandleFunc("PUT /api/v1/me/password", s.requireSession(s.changePassword))
+	mux.HandleFunc("GET /api/v1/me/sessions", s.requireSession(s.listSessions))
+	mux.HandleFunc("DELETE /api/v1/me/sessions/{id}", s.requireSession(s.deleteSession))
+	mux.HandleFunc("GET /api/v1/me/passkeys", s.requireSession(s.passkeysUnavailable))
+	mux.HandleFunc("POST /api/v1/me/passkeys/options", s.requireFullSession(s.passkeyEnrollOptions))
+	mux.HandleFunc("POST /api/v1/me/passkeys/verify", s.requireFullSession(s.passkeyEnrollVerify))
+	mux.HandleFunc("PATCH /api/v1/me/passkeys/{id}", s.requireFullSession(s.renamePasskey))
+	mux.HandleFunc("DELETE /api/v1/me/passkeys/{id}", s.requireFullSession(s.deletePasskey))
+	mux.HandleFunc("GET /api/v1/recordings", s.requireFullSession(s.recordings))
+	mux.HandleFunc("DELETE /api/v1/admin/recordings/{id}", s.requireAdmin(s.deleteRecording))
+	mux.HandleFunc("GET /api/v1/admin/accounts", s.requireAdmin(s.listAccounts))
+	mux.HandleFunc("POST /api/v1/admin/accounts", s.requireAdmin(s.createAccount))
+	mux.HandleFunc("PATCH /api/v1/admin/accounts/{id}", s.requireAdmin(s.updateAccount))
+	mux.HandleFunc("PUT /api/v1/admin/accounts/{id}/password", s.requireAdmin(s.resetAccountPassword))
+	mux.HandleFunc("POST /api/v1/admin/accounts/{id}/sessions/revoke", s.requireAdmin(s.revokeAccountSessions))
+	mux.HandleFunc("DELETE /api/v1/admin/accounts/{id}", s.requireAdmin(s.deleteAccount))
+	mux.HandleFunc("DELETE /api/v1/admin/accounts/{id}/passkeys", s.requireAdmin(s.clearAccountPasskeys))
+	mux.HandleFunc("GET /api/v1/admin/audit", s.requireAdmin(s.listAudit))
+	mux.HandleFunc("GET /api/v1/admin/clients", s.requireAdmin(s.adminClients))
 	mux.HandleFunc("GET /api/v1/public/status", s.publicStatus)
 	mux.HandleFunc("GET /api/v1/ws", s.webSocket)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +138,10 @@ type socketOutput struct {
 }
 
 func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.Allow("ws_ip", s.clientAddress(r), 10, time.Minute, time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
+		return
+	}
 	if r.Header.Get("Origin") != s.cfg.PublicOrigin {
 		writeError(w, http.StatusForbidden, "origin_rejected")
 		return
@@ -89,6 +151,15 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authentication_required")
 		return
 	}
+	sessionKey := ""
+	if sessionErr == nil {
+		sessionKey = session.ID
+	}
+	if !s.acquireSocket(sessionKey) {
+		writeError(w, http.StatusTooManyRequests, "websocket_limit")
+		return
+	}
+	defer s.releaseSocket(sessionKey)
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		return
@@ -97,6 +168,14 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(wsprotocol.MaxControlMessage)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-s.shutdown:
+			_ = conn.Close(4410, "server_restart")
+			cancel()
+		}
+	}()
 	helloCtx, helloCancel := context.WithTimeout(ctx, 5*time.Second)
 	kind, data, err := conn.Read(helloCtx)
 	helloCancel()
@@ -121,7 +200,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		} `json:"audio"`
 		CSRF string `json:"csrf_token"`
 	}
-	if err = json.Unmarshal(hello.Body, &body); err != nil || !body.Audio.Encoder || !body.Audio.Decoder || body.Audio.ContextRate != 48000 {
+	if err = decodeBody(hello.Body, &body); err != nil || !body.Audio.Encoder || !body.Audio.Decoder || body.Audio.ContextRate != 48000 {
 		_ = conn.Close(4400, "audio_capability_required")
 		return
 	}
@@ -132,6 +211,28 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(4401, "session_invalid")
 			return
 		}
+	}
+	if authenticated {
+		cookie, _ := r.Cookie(CookieName)
+		go func(raw string) {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if _, checkErr := s.store.AuthenticateSessionWithIdle(context.Background(), raw, time.Now(), s.cfg.SessionIdle); checkErr != nil {
+						if s.cfg.PTT != nil {
+							_ = s.cfg.PTT.StopSession(context.Background(), session.ID)
+						}
+						_ = conn.Close(4401, "session_invalid")
+						cancel()
+						return
+					}
+				}
+			}
+		}(cookie.Value)
 	}
 	output := make(chan socketOutput, 32)
 	writerDone := make(chan error, 1)
@@ -152,10 +253,25 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+	type replayEntry struct {
+		digest [32]byte
+		result []byte
+	}
+	replays := map[string]replayEntry{}
+	replayOrder := make([]string, 0, 64)
 	sendControl := func(value any) bool {
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return false
+		}
+		var direct struct {
+			RequestID string `json:"request_id"`
+		}
+		_ = json.Unmarshal(encoded, &direct)
+		if direct.RequestID != "" {
+			entry := replays[direct.RequestID]
+			entry.result = append([]byte(nil), encoded...)
+			replays[direct.RequestID] = entry
 		}
 		select {
 		case output <- socketOutput{websocket.MessageText, encoded}:
@@ -164,7 +280,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 	}
-	if !sendControl(map[string]any{"api_version": 1, "type": "hello_ok", "request_id": hello.RequestID, "body": map[string]any{"authenticated": authenticated, "role": session.Role, "ptt_available": authenticated && !session.PasswordChangeRequired && session.Callsign != "" && s.cfg.PTT != nil, "passkey_available": false, "limits": map[string]any{"media_bytes": 1200, "control_bytes": 16384}}}) {
+	bodyResult := map[string]any{"authenticated": authenticated, "ptt_available": authenticated && !session.PasswordChangeRequired && session.Callsign != "" && s.cfg.PTT != nil, "passkey_available": s.cfg.Passkeys != nil, "limits": map[string]any{"media_bytes": 1200, "control_bytes": 16384, "live_queue_packets": s.cfg.LiveQueuePackets}, "status": map[string]any{"health": "ok", "ready": s.ready.Load()}}
+	if authenticated {
+		bodyResult["role"] = session.Role
+	}
+	if !sendControl(map[string]any{"api_version": 1, "type": "hello_ok", "request_id": hello.RequestID, "body": bodyResult}) {
 		_ = conn.Close(4409, "overload")
 		return
 	}
@@ -174,7 +294,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		if capacity <= 0 {
 			capacity = 64
 		}
-		_, media, cancelSub := s.cfg.LiveHub.Subscribe(capacity)
+		_, events, cancelSub := s.cfg.LiveHub.Subscribe(capacity)
 		liveCancel = cancelSub
 		defer liveCancel()
 		go func() {
@@ -182,24 +302,88 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-ctx.Done():
 					return
-				case packet, ok := <-media:
+				case event, ok := <-events:
 					if !ok {
 						return
 					}
-					encoded, err := wsprotocol.EncodeMedia(packet)
-					if err != nil {
-						continue
-					}
-					select {
-					case output <- socketOutput{websocket.MessageBinary, encoded}:
-					default:
-						cancel()
-						return
+					switch event.Kind {
+					case gateway.LiveStart:
+						sendControl(map[string]any{"api_version": 1, "type": "stream_start", "body": map[string]any{"channel_id": strconv.FormatUint(event.ChannelID, 10), "source_callsign": event.SourceCallsign, "started_at": time.Now().UTC().Format(time.RFC3339), "tot_seconds": 180}})
+					case gateway.LiveEnd:
+						sendControl(map[string]any{"api_version": 1, "type": "stream_end", "body": map[string]any{"channel_id": strconv.FormatUint(event.ChannelID, 10), "reason": event.Reason}})
+					case gateway.LiveDiscontinuity:
+						sendControl(map[string]any{"api_version": 1, "type": "discontinuity", "body": map[string]any{"old_channel_id": strconv.FormatUint(event.OldChannelID, 10), "new_channel_id": strconv.FormatUint(event.ChannelID, 10), "reason": event.Reason}})
+					case gateway.LiveMedia:
+						encoded, encodeErr := wsprotocol.EncodeMedia(event.Media)
+						if encodeErr != nil {
+							continue
+						}
+						select {
+						case output <- socketOutput{websocket.MessageBinary, encoded}:
+						default:
+							cancel()
+							return
+						}
 					}
 				}
 			}
 		}()
 	}
+	var playbackMu sync.Mutex
+	var playbackCancel context.CancelFunc
+	var playbackChannel uint64
+	var playbackPackets []webarchive.Packet
+	var playbackIndex int
+	startPlayback := func() {
+		playbackMu.Lock()
+		if playbackCancel != nil {
+			playbackCancel()
+		}
+		playCtx, stop := context.WithCancel(ctx)
+		playbackCancel = stop
+		channel := playbackChannel
+		start := playbackIndex
+		packets := playbackPackets
+		playbackMu.Unlock()
+		go func() {
+			var previous uint32
+			for index := start; index < len(packets); index++ {
+				packet := packets[index]
+				if index > start {
+					wait := time.Duration(packet.ArrivalMS-previous) * time.Millisecond
+					timer := time.NewTimer(wait)
+					select {
+					case <-playCtx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+				}
+				previous = packet.ArrivalMS
+				encoded, encodeErr := wsprotocol.EncodeMedia(wsprotocol.Media{Kind: wsprotocol.KindPlayback, ChannelID: channel, Sequence: uint32(index - start), Timestamp: packet.Timestamp, Payload: packet.Payload})
+				if encodeErr != nil {
+					return
+				}
+				select {
+				case output <- socketOutput{websocket.MessageBinary, encoded}:
+					playbackMu.Lock()
+					playbackIndex = index + 1
+					playbackMu.Unlock()
+				case <-playCtx.Done():
+					return
+				default:
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		playbackMu.Lock()
+		if playbackCancel != nil {
+			playbackCancel()
+		}
+		playbackMu.Unlock()
+	}()
 	for {
 		kind, data, err = conn.Read(ctx)
 		if err != nil {
@@ -227,10 +411,42 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(4400, "protocol_violation")
 			break
 		}
+		digest := sha256.Sum256(data)
+		if prior, ok := replays[control.RequestID]; ok && prior.digest != ([32]byte{}) {
+			if prior.digest != digest {
+				_ = conn.Close(4400, "request_id_reuse")
+				break
+			}
+			if len(prior.result) > 0 {
+				select {
+				case output <- socketOutput{websocket.MessageText, prior.result}:
+				default:
+					_ = conn.Close(4409, "overload")
+					return
+				}
+			}
+			continue
+		}
+		if len(replayOrder) == 64 {
+			delete(replays, replayOrder[0])
+			replayOrder = replayOrder[1:]
+		}
+		replayOrder = append(replayOrder, control.RequestID)
+		entry := replays[control.RequestID]
+		entry.digest = digest
+		replays[control.RequestID] = entry
 		switch control.Type {
 		case "ptt_start":
+			if err = decodeBody(control.Body, &struct{}{}); err != nil {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
 			if !authenticated || session.PasswordChangeRequired || session.Callsign == "" || s.cfg.PTT == nil {
 				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "PTT is not available."}})
+				continue
+			}
+			if !s.limiter.Allow("ptt_second", session.UserID, 1, time.Second, time.Now()) || !s.limiter.Allow("ptt_minute", session.UserID, 10, time.Minute, time.Now()) {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "rate_limited", "text": "PTT request rate exceeded."}})
 				continue
 			}
 			grant, startErr := s.cfg.PTT.Start(ctx, session.ID, session.Callsign)
@@ -238,17 +454,117 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				sendControl(map[string]any{"api_version": 1, "type": "ptt_busy", "request_id": control.RequestID, "body": map[string]any{}})
 				continue
 			}
-			sendControl(map[string]any{"api_version": 1, "type": "ptt_granted", "request_id": control.RequestID, "body": map[string]any{"channel_id": grant.ChannelID, "tot_seconds": 180}})
+			sendControl(map[string]any{"api_version": 1, "type": "ptt_granted", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(grant.ChannelID, 10), "tot_seconds": 180}})
 		case "ptt_stop":
 			var stop struct {
-				ChannelID uint64 `json:"channel_id"`
+				ChannelID string `json:"channel_id"`
 			}
-			if json.Unmarshal(control.Body, &stop) != nil || s.cfg.PTT == nil {
+			if decodeBody(control.Body, &stop) != nil || s.cfg.PTT == nil {
 				_ = conn.Close(4400, "invalid_request")
 				return
 			}
-			_ = s.cfg.PTT.Stop(ctx, session.ID, stop.ChannelID)
+			channelID, parseErr := parseChannelID(stop.ChannelID)
+			if parseErr != nil {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			_ = s.cfg.PTT.Stop(ctx, session.ID, channelID)
 			sendControl(map[string]any{"api_version": 1, "type": "ptt_ended", "request_id": control.RequestID, "body": map[string]any{"channel_id": stop.ChannelID, "reason": "normal"}})
+		case "playback_open":
+			if !authenticated || session.PasswordChangeRequired || s.cfg.Archives == nil {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "Playback is not available."}})
+				continue
+			}
+			var open struct {
+				RecordingID string `json:"recording_id"`
+			}
+			if decodeBody(control.Body, &open) != nil {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			packets, readErr := s.cfg.Archives.ReadPackets(open.RecordingID)
+			if readErr != nil {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "recording_unavailable", "text": "The recording is unavailable."}})
+				continue
+			}
+			channelID, channelErr := s.newChannel()
+			if channelErr != nil {
+				return
+			}
+			duration := uint32(0)
+			if len(packets) > 0 {
+				duration = packets[len(packets)-1].ArrivalMS
+			}
+			playbackMu.Lock()
+			playbackChannel = channelID
+			playbackPackets = packets
+			playbackIndex = 0
+			playbackMu.Unlock()
+			sendControl(map[string]any{"api_version": 1, "type": "playback_opened", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(channelID, 10), "recording_id": open.RecordingID, "duration_ms": duration, "status": "complete"}})
+			startPlayback()
+		case "playback_pause", "playback_resume", "playback_close":
+			var action struct {
+				ChannelID string `json:"channel_id"`
+			}
+			if decodeBody(control.Body, &action) != nil {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			id, parseErr := parseChannelID(action.ChannelID)
+			playbackMu.Lock()
+			valid := parseErr == nil && id == playbackChannel
+			if valid && control.Type != "playback_resume" && playbackCancel != nil {
+				playbackCancel()
+			}
+			elapsed := 0
+			if playbackIndex > 0 && playbackIndex <= len(playbackPackets) {
+				elapsed = int(playbackPackets[playbackIndex-1].ArrivalMS)
+			}
+			if valid && control.Type == "playback_close" {
+				playbackChannel = 0
+				playbackPackets = nil
+				playbackIndex = 0
+			}
+			playbackMu.Unlock()
+			if !valid {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			if control.Type == "playback_resume" {
+				startPlayback()
+			}
+			state := strings.TrimPrefix(control.Type, "playback_")
+			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": action.ChannelID, "state": state, "elapsed_ms": elapsed}})
+		case "playback_seek":
+			var seek struct {
+				ChannelID string `json:"channel_id"`
+				ElapsedMS int    `json:"elapsed_ms"`
+			}
+			if decodeBody(control.Body, &seek) != nil || seek.ElapsedMS < 0 {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			id, parseErr := parseChannelID(seek.ChannelID)
+			playbackMu.Lock()
+			if parseErr != nil || id != playbackChannel {
+				playbackMu.Unlock()
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			if playbackCancel != nil {
+				playbackCancel()
+			}
+			index := 0
+			for index < len(playbackPackets) && int(playbackPackets[index].ArrivalMS) < seek.ElapsedMS {
+				index++
+			}
+			if index > 0 {
+				index--
+			}
+			playbackIndex = index
+			playbackMu.Unlock()
+			startPlayback()
+			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": seek.ChannelID, "state": "playing", "elapsed_ms": seek.ElapsedMS}})
 		default:
 			sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "unsupported", "text": "The request type is not supported."}})
 		}
@@ -264,13 +580,66 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+func decodeBody(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+func parseChannelID(value string) (uint64, error) {
+	if value == "" || value[0] == '0' || len(value) > 20 {
+		return 0, errors.New("channel ID is invalid")
+	}
+	for _, c := range value {
+		if c < '0' || c > '9' {
+			return 0, errors.New("channel ID is invalid")
+		}
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 {
+		return 0, errors.New("channel ID is invalid")
+	}
+	return id, nil
+}
+func (s *Server) newChannel() (uint64, error) {
+	s.channelMu.Lock()
+	defer s.channelMu.Unlock()
+	for {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return 0, err
+		}
+		id := binary.BigEndian.Uint64(raw[:])
+		if id == 0 {
+			continue
+		}
+		if _, ok := s.channelUsed[id]; ok {
+			continue
+		}
+		s.channelUsed[id] = struct{}{}
+		return id, nil
+	}
+}
 func (s *Server) monitorMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = w.Write([]byte("opusrefweb_up 1\n"))
+		s.wsMu.Lock()
+		active := s.wsActive
+		s.wsMu.Unlock()
+		ready := 0
+		if s.ready.Load() {
+			ready = 1
+		}
+		_, _ = fmt.Fprintf(w, "# TYPE opusrefweb_up gauge\nopusrefweb_up 1\n# TYPE opusrefweb_ready gauge\nopusrefweb_ready %d\n# TYPE opusrefweb_websocket_connections gauge\nopusrefweb_websocket_connections %d\n", ready, active)
 	})
 	return mux
 }
@@ -295,7 +664,8 @@ func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	n, err := s.store.EnabledAdminCount(context.Background())
-	if err != nil || n == 0 {
+	monitorReady := s.cfg.ReflectorMonitor == nil || s.cfg.ReflectorMonitor.Fresh(s.cfg.MonitorStaleAfter)
+	if err != nil || n == 0 || !monitorReady {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
 		return
 	}
@@ -308,12 +678,27 @@ func (s *Server) publicStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"health": "ok", "ready": s.ready.Load(), "reflector": map[string]any{"id": "", "display_name": ""}, "client_count": 0, "floor": map[string]any{"active": false}, "recording": map[string]any{"available": true, "quota_full": false}, "server_time": time.Now().UTC().Format(time.RFC3339)})
+	reflector := map[string]any{"id": "", "display_name": ""}
+	clientCount := 0
+	floor := map[string]any{"active": false}
+	if s.cfg.ReflectorMonitor != nil {
+		if snapshot, ok := s.cfg.ReflectorMonitor.Snapshot(); ok {
+			reflector["id"] = snapshot.ReflectorID
+			clientCount = snapshot.ClientCount
+			floor = map[string]any{"active": snapshot.Stream.Active}
+			if snapshot.Stream.Active {
+				floor["source_callsign"] = snapshot.Stream.SourceCallsign
+				floor["started_at"] = snapshot.Stream.StartedAt
+				floor["remaining_seconds"] = snapshot.Stream.Remaining
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"health": "ok", "ready": s.ready.Load(), "reflector": reflector, "client_count": clientCount, "floor": floor, "recording": map[string]any{"available": true, "quota_full": false}, "server_time": time.Now().UTC().Format(time.RFC3339)})
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	session, err := s.requestSession(r)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"authenticated": false, "passkey_available": false})
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": false, "passkey_available": s.cfg.Passkeys != nil})
 		return
 	}
 	csrf, err := s.store.RotateCSRF(r.Context(), session.ID)
@@ -321,7 +706,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "session_unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": session.Role, "username": session.Username, "source_callsign": session.Callsign, "csrf_token": csrf, "forced_password_change": session.PasswordChangeRequired, "passkey_available": false})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": session.Role, "username": session.Username, "source_callsign": session.Callsign, "csrf_token": csrf, "forced_password_change": session.PasswordChangeRequired, "passkey_available": s.cfg.Passkeys != nil})
 }
 
 type loginRequest struct {
@@ -337,6 +722,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var in loginRequest
 	if err := decodeExact(r, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	limiterName := strings.ToLower(in.Username)
+	if !s.limiter.Allow("login_user", limiterName, 5, 15*time.Minute, time.Now()) || !s.limiter.Allow("login_ip", s.clientAddress(r), 5, 15*time.Minute, time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	select {
@@ -357,10 +747,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if lookupErr == nil && !user.Disabled {
 		hash = user.PasswordHash
 	}
-	ok, _, err := auth.VerifyPassword(in.Password, hash, s.cfg.Argon2)
+	ok, rehash, err := auth.VerifyPassword(in.Password, hash, s.cfg.Argon2)
 	if err != nil || !ok || lookupErr != nil || user.Disabled {
+		var target *string
+		if lookupErr == nil {
+			target = &user.ID
+		}
+		_ = s.store.WriteAudit(r.Context(), "login", "failure", nil, target, nil, "{}", time.Now())
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
+	}
+	if rehash {
+		if upgraded, hashErr := auth.HashPassword(in.Password, s.cfg.Argon2); hashErr == nil {
+			_ = s.store.UpgradePasswordHash(r.Context(), user.ID, upgraded, time.Now())
+		}
 	}
 	raw, csrf, session, err := s.store.CreateSession(r.Context(), user.ID, time.Now(), s.cfg.SessionIdle, s.cfg.SessionAbsolute, s.cfg.MaxSessions)
 	if err != nil {
@@ -368,6 +768,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: raw, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: session.AbsoluteExpiry})
+	_ = s.store.WriteAudit(r.Context(), "login", "success", &user.ID, &user.ID, nil, "{}", time.Now())
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": session.Role, "username": user.Username, "source_callsign": user.Callsign, "csrf_token": csrf, "forced_password_change": session.PasswordChangeRequired, "passkey_available": false})
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request, session store.Session) {
@@ -380,6 +781,434 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request, session store.Se
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	writeJSON(w, http.StatusOK, map[string]any{"logged_out": true})
 }
+func (s *Server) reauthPassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	user, err := s.store.FindUserByID(r.Context(), session.UserID)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication_failed")
+		return
+	}
+	ok, _, err := auth.VerifyPassword(in.Password, user.PasswordHash, s.cfg.Argon2)
+	if err != nil || !ok {
+		writeError(w, http.StatusUnauthorized, "authentication_failed")
+		return
+	}
+	raw, err := s.store.IssueReauth(r.Context(), session.ID, time.Now())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "reauth_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reauth_token": raw, "expires_in_seconds": 300})
+}
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	policy := auth.Policy{Username: session.Username, Callsign: session.Callsign, ServiceTerms: []string{"OpusRef"}, Additional: s.cfg.PasswordBlocklist}
+	if policyErr := policy.Check(in.Password); policyErr != nil {
+		writeError(w, http.StatusUnprocessableEntity, string(policyErr.Code))
+		return
+	}
+	hash, err := auth.HashPassword(in.Password, s.cfg.Argon2)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "password_unavailable")
+		return
+	}
+	if err = s.store.UpdatePassword(r.Context(), session.UserID, session.ID, hash, time.Now()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "password_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"changed": true})
+}
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request, session store.Session) {
+	items, err := s.store.ListSessions(r.Context(), session.UserID, session.ID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "sessions_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page(items))
+}
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	if err := s.store.RevokeOtherSession(r.Context(), session.UserID, session.ID, r.PathValue("id"), time.Now()); err != nil {
+		writeError(w, http.StatusNotFound, "session_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
+}
+func (s *Server) passkeysUnavailable(w http.ResponseWriter, r *http.Request, session store.Session) {
+	items, err := s.store.ListPasskeys(r.Context(), session.UserID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "passkeys_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page(items))
+}
+func (s *Server) passkeyLoginOptions(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "origin_rejected")
+		return
+	}
+	if s.cfg.Passkeys == nil {
+		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	if decodeExact(r, &struct{}{}) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	id, options, err := s.cfg.Passkeys.BeginLogin()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "passkey_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ceremony_id": id, "options": options})
+}
+func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "origin_rejected")
+		return
+	}
+	if s.cfg.Passkeys == nil {
+		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	var in struct {
+		CeremonyID string          `json:"ceremony_id"`
+		Credential json.RawMessage `json:"credential"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	userID, err := s.cfg.Passkeys.FinishLogin(r.Context(), in.CeremonyID, in.Credential)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication_failed")
+		return
+	}
+	user, err := s.store.FindUserByID(r.Context(), userID)
+	if err != nil || user.Disabled {
+		writeError(w, http.StatusUnauthorized, "authentication_failed")
+		return
+	}
+	raw, csrf, session, err := s.store.CreateSession(r.Context(), user.ID, time.Now(), s.cfg.SessionIdle, s.cfg.SessionAbsolute, s.cfg.MaxSessions)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: raw, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: session.AbsoluteExpiry})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "username": user.Username, "role": user.Role, "source_callsign": user.Callsign, "csrf_token": csrf, "forced_password_change": user.PasswordChangeRequired, "passkey_available": true})
+}
+func (s *Server) passkeyEnrollOptions(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if s.cfg.Passkeys == nil {
+		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	if decodeExact(r, &struct{}{}) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	id, options, err := s.cfg.Passkeys.BeginEnrollment(r.Context(), session.UserID, session.ID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "passkey_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ceremony_id": id, "options": options})
+}
+func (s *Server) passkeyEnrollVerify(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if s.cfg.Passkeys == nil {
+		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	var in struct {
+		CeremonyID string          `json:"ceremony_id"`
+		Name       string          `json:"name"`
+		Credential json.RawMessage `json:"credential"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if err := s.cfg.Passkeys.FinishEnrollment(r.Context(), in.CeremonyID, session.UserID, session.ID, in.Name, in.Credential); err != nil {
+		writeError(w, http.StatusBadRequest, "passkey_verification_failed")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"created": true})
+}
+func (s *Server) renamePasskey(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if decodeExact(r, &in) != nil || s.store.RenamePasskey(r.Context(), session.UserID, r.PathValue("id"), in.Name) != nil {
+		writeError(w, http.StatusBadRequest, "passkey_update_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
+}
+func (s *Server) deletePasskey(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	if s.store.DeletePasskey(r.Context(), session.UserID, r.PathValue("id")) != nil {
+		writeError(w, http.StatusNotFound, "passkey_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+func (s *Server) recordings(w http.ResponseWriter, r *http.Request, _ store.Session) {
+	items, err := s.store.ListRecordings(r.Context(), 50)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "recordings_unavailable")
+		return
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		duration := int64(0)
+		if item.EndedAt != nil {
+			duration = item.EndedAt.Sub(item.StartedAt).Milliseconds()
+		}
+		result = append(result, map[string]any{"id": item.ID, "source_callsign": item.SourceCallsign, "started_at": item.StartedAt, "duration_ms": duration, "status": item.Status, "end_reason": item.EndReason})
+	}
+	writeJSON(w, http.StatusOK, page(result))
+}
+func (s *Server) deleteRecording(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.adminMutation(w, r, session) {
+		return
+	}
+	if s.cfg.Archives == nil {
+		writeError(w, http.StatusServiceUnavailable, "archive_unavailable")
+		return
+	}
+	if err := s.cfg.Archives.Delete(r.Context(), r.PathValue("id"), time.Now()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "recording_delete_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request, _ store.Session) {
+	items, err := s.store.ListUsers(r.Context(), 50)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "accounts_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page(items))
+}
+func (s *Server) listAudit(w http.ResponseWriter, r *http.Request, _ store.Session) {
+	items, err := s.store.ListAudit(r.Context(), 50)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page(items))
+}
+func (s *Server) adminClients(w http.ResponseWriter, _ *http.Request, _ store.Session) {
+	if s.cfg.ReflectorMonitor == nil {
+		writeJSON(w, http.StatusOK, page([]any{}))
+		return
+	}
+	snapshot, ok := s.cfg.ReflectorMonitor.Snapshot()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "monitor_unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page(snapshot.Clients))
+}
+func (s *Server) clearAccountPasskeys(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	if err := s.store.ClearPasskeysAndSessions(r.Context(), r.PathValue("id"), time.Now()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "credential_clear_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
+}
+func (s *Server) adminMutation(w http.ResponseWriter, r *http.Request, session store.Session) bool {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return false
+	}
+	if !s.limiter.Allow("admin", session.ID, 60, time.Minute, time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
+		return false
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return false
+	}
+	return true
+}
+func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.adminMutation(w, r, session) {
+		return
+	}
+	var in struct {
+		Username       *string     `json:"username"`
+		SourceCallsign *string     `json:"source_callsign"`
+		Role           *store.Role `json:"role"`
+		Disabled       *bool       `json:"disabled"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if err := s.store.UpdateUser(r.Context(), r.PathValue("id"), in.Username, in.SourceCallsign, in.Role, in.Disabled, time.Now()); err != nil {
+		writeError(w, http.StatusConflict, "account_update_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
+}
+func (s *Server) resetAccountPassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.adminMutation(w, r, session) {
+		return
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	target, err := s.store.FindUserByID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "account_not_found")
+		return
+	}
+	policy := auth.Policy{Username: target.Username, Callsign: target.Callsign, ServiceTerms: []string{"OpusRef"}, Additional: s.cfg.PasswordBlocklist}
+	if policyErr := policy.Check(in.Password); policyErr != nil {
+		writeError(w, http.StatusUnprocessableEntity, string(policyErr.Code))
+		return
+	}
+	hash, err := auth.HashPassword(in.Password, s.cfg.Argon2)
+	if err != nil || s.store.SetPasswordHash(r.Context(), target.ID, hash, true, time.Now()) != nil {
+		writeError(w, http.StatusServiceUnavailable, "password_reset_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reset": true})
+}
+func (s *Server) revokeAccountSessions(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.adminMutation(w, r, session) {
+		return
+	}
+	if decodeExact(r, &struct{}{}) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if s.store.RevokeAllSessions(r.Context(), r.PathValue("id"), time.Now()) != nil {
+		writeError(w, http.StatusServiceUnavailable, "session_revoke_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
+}
+func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.adminMutation(w, r, session) {
+		return
+	}
+	if s.store.DeleteUser(r.Context(), r.PathValue("id"), time.Now()) != nil {
+		writeError(w, http.StatusConflict, "account_delete_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+func (s *Server) createAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
+	if !s.validCSRF(r, session) {
+		writeError(w, http.StatusForbidden, "csrf_rejected")
+		return
+	}
+	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, "reauth_required")
+		return
+	}
+	var in struct {
+		Username       string     `json:"username"`
+		Role           store.Role `json:"role"`
+		SourceCallsign *string    `json:"source_callsign"`
+		Password       string     `json:"initial_password"`
+	}
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	callsign := ""
+	if in.SourceCallsign != nil {
+		callsign = *in.SourceCallsign
+	}
+	policy := auth.Policy{Username: in.Username, Callsign: callsign, ServiceTerms: []string{"OpusRef"}, Additional: s.cfg.PasswordBlocklist}
+	if policyErr := policy.Check(in.Password); policyErr != nil {
+		writeError(w, http.StatusUnprocessableEntity, string(policyErr.Code))
+		return
+	}
+	hash, err := auth.HashPassword(in.Password, s.cfg.Argon2)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "account_unavailable")
+		return
+	}
+	user, err := s.store.CreateUser(r.Context(), store.CreateUser{Username: in.Username, Role: in.Role, Callsign: callsign, PasswordHash: hash, PasswordChangeRequired: true})
+	if err != nil {
+		writeError(w, http.StatusConflict, "account_conflict")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": user.ID})
+}
 func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request, store.Session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, err := s.requestSession(r)
@@ -389,6 +1218,24 @@ func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request, st
 		}
 		next(w, r, session)
 	}
+}
+func (s *Server) requireFullSession(next func(http.ResponseWriter, *http.Request, store.Session)) http.HandlerFunc {
+	return s.requireSession(func(w http.ResponseWriter, r *http.Request, session store.Session) {
+		if session.PasswordChangeRequired {
+			writeError(w, http.StatusForbidden, "password_change_required")
+			return
+		}
+		next(w, r, session)
+	})
+}
+func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, store.Session)) http.HandlerFunc {
+	return s.requireFullSession(func(w http.ResponseWriter, r *http.Request, session store.Session) {
+		if session.Role != store.RoleAdmin {
+			writeError(w, http.StatusForbidden, "admin_required")
+			return
+		}
+		next(w, r, session)
+	})
 }
 func (s *Server) requestSession(r *http.Request) (store.Session, error) {
 	cookie, err := r.Cookie(CookieName)
@@ -402,6 +1249,66 @@ func (s *Server) validCSRF(r *http.Request, session store.Session) bool {
 }
 func (s *Server) sameOrigin(r *http.Request) bool {
 	return r.Header.Get("Origin") == s.cfg.PublicOrigin && r.Header.Get("Sec-Fetch-Site") == "same-origin"
+}
+func (s *Server) clientAddress(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	direct := net.ParseIP(host)
+	if direct == nil || !s.isTrustedProxy(direct) {
+		return host
+	}
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		value := strings.TrimSpace(forwarded[index])
+		ip := net.ParseIP(value)
+		if ip != nil && !s.isTrustedProxy(ip) {
+			return value
+		}
+	}
+	return host
+}
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	for _, network := range s.trustedProxies {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) acquireSocket(session string) bool {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	global := s.cfg.MaxWebSockets
+	if global <= 0 {
+		global = 250
+	}
+	perSession := s.cfg.MaxWebSocketsPerSession
+	if perSession <= 0 {
+		perSession = 3
+	}
+	if s.wsActive >= global || session != "" && s.wsBySession[session] >= perSession {
+		return false
+	}
+	s.wsActive++
+	if session != "" {
+		s.wsBySession[session]++
+	}
+	return true
+}
+func (s *Server) releaseSocket(session string) {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.wsActive > 0 {
+		s.wsActive--
+	}
+	if session != "" {
+		s.wsBySession[session]--
+		if s.wsBySession[session] <= 0 {
+			delete(s.wsBySession, session)
+		}
+	}
 }
 func decodeExact(r *http.Request, target any) error {
 	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
@@ -430,3 +1337,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"api_version": 1, "data": value})
 }
+func page(items any) map[string]any { return map[string]any{"items": items} }

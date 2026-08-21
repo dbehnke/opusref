@@ -125,22 +125,27 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 func (c Config) SharedKey() ([]byte, error) {
-	if c.Authentication.SharedKeyEnv != "" {
-		if value := os.Getenv(c.Authentication.SharedKeyEnv); value != "" {
+	return ResolveSharedKey(c.Authentication.SharedKeyEnv, c.Authentication.SharedKeyFile)
+}
+
+// ResolveSharedKey loads an environment-first shared key from a restricted source.
+func ResolveSharedKey(environment, file string) ([]byte, error) {
+	if environment != "" {
+		if value := os.Getenv(environment); value != "" {
 			return validateKey([]byte(value))
 		}
 	}
-	if c.Authentication.SharedKeyFile == "" {
+	if file == "" {
 		return nil, nil
 	}
-	info, err := os.Stat(c.Authentication.SharedKeyFile)
+	info, err := os.Stat(file)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("shared key file must be regular and accessible only by its owner")
 	}
-	data, err := ReadSharedKeyFile(c.Authentication.SharedKeyFile)
+	data, err := ReadSharedKeyFile(file)
 	if err != nil {
 		return nil, err
 	}

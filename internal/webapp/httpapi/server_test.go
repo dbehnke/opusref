@@ -82,3 +82,17 @@ func TestLoginIsSameOriginAndNonEnumerating(t *testing.T) {
 		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
 	}
 }
+func TestChannelIDUsesCanonicalLosslessDecimal(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		ok    bool
+	}{{"9007199254740993", true}, {"18446744073709551615", true}, {"0", false}, {"01", false}, {"18446744073709551616", false}, {"9.1", false}} {
+		got, err := parseChannelID(tc.value)
+		if tc.ok && (err != nil || got == 0) {
+			t.Fatalf("%q rejected: %v", tc.value, err)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("%q accepted", tc.value)
+		}
+	}
+}

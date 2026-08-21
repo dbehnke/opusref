@@ -8,6 +8,15 @@ import (
 	"github.com/google/uuid"
 )
 
+type shortWriter struct{ bytes.Buffer }
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return w.Buffer.Write(p)
+}
+
 func TestArchivePreservesOpaquePackets(t *testing.T) {
 	id := uuid.New()
 	var output bytes.Buffer
@@ -81,5 +90,18 @@ func TestAtomicFileLifecycle(t *testing.T) {
 	}
 	if _, err = os.Stat(f.PartialPath()); !os.IsNotExist(err) {
 		t.Fatal("partial file remains")
+	}
+}
+func TestWriterCompletesShortWrites(t *testing.T) {
+	var out shortWriter
+	w, err := NewWriter(&out, uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.WritePacket(Packet{Payload: []byte{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != HeaderSize+EntryHeaderSize+3 {
+		t.Fatalf("size=%d", out.Len())
 	}
 }
