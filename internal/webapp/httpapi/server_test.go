@@ -470,3 +470,82 @@ func TestAdminCursorIsEndpointBound(t *testing.T) {
 		t.Fatal("cross-endpoint cursor accepted")
 	}
 }
+
+func TestAdminEventsEndpointReturnsBoundedNewestFirstContract(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	admin, err := state.FindUserByUsername(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, _, err := state.CreateSession(context.Background(), admin.ID, time.Now(), 12*time.Hour, 7*24*time.Hour, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 300; index++ {
+		server.telemetry.event("rate_limit", "warning", "A fixed operator message.")
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://radio.example.test/api/v1/admin/events", nil)
+	request.AddCookie(&http.Cookie{Name: CookieName, Value: raw})
+	response := httptest.NewRecorder()
+	server.PublicHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d cache=%q", response.Code, response.Header().Get("Cache-Control"))
+	}
+	var envelope struct {
+		APIVersion int `json:"api_version"`
+		Data       struct {
+			Items []operatorEvent `json:"items"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	items := envelope.Data.Items
+	if envelope.APIVersion != 1 || len(items) != 256 || items[0].ID != 300 || items[len(items)-1].ID != 45 {
+		t.Fatalf("version=%d items=%d first=%+v last=%+v", envelope.APIVersion, len(items), items[0], items[len(items)-1])
+	}
+	if items[0].Time.IsZero() || items[0].Kind != "rate_limit" || items[0].Severity != "warning" || items[0].Message != "A fixed operator message." {
+		t.Fatalf("event=%+v", items[0])
+	}
+	unauthorized := httptest.NewRecorder()
+	server.PublicHandler().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "https://radio.example.test/api/v1/admin/events", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+}
+
+func TestSessionExplainsForcedPasswordChangeState(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	hash, err := auth.HashPassword("temporary marble nebula orchard", auth.DefaultParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := state.CreateUser(context.Background(), store.CreateUser{Username: "temporary", Role: store.RoleUser, PasswordHash: hash, PasswordChangeRequired: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, _, err := state.CreateSession(context.Background(), user.ID, time.Now(), 12*time.Hour, 7*24*time.Hour, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://radio.example.test/api/v1/session", nil)
+	request.AddCookie(&http.Cookie{Name: CookieName, Value: raw})
+	response := httptest.NewRecorder()
+	server.PublicHandler().ServeHTTP(response, request)
+	var envelope struct {
+		Data struct {
+			Authenticated        bool   `json:"authenticated"`
+			Username             string `json:"username"`
+			ForcedPasswordChange bool   `json:"forced_password_change"`
+			CSRFToken            string `json:"csrf_token"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || !envelope.Data.Authenticated || envelope.Data.Username != "temporary" || !envelope.Data.ForcedPasswordChange || envelope.Data.CSRFToken == "" {
+		t.Fatalf("status=%d session=%+v", response.Code, envelope.Data)
+	}
+}
