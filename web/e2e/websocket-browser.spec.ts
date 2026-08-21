@@ -80,7 +80,7 @@ test('open-access browser session downgrades immediately after revocation', asyn
   const server = new WebSocketServer({ port: 0, perMessageDeflate: false })
   await new Promise<void>(resolve => server.once('listening', resolve))
   const address = server.address(); if (typeof address === 'string' || !address) throw new Error('WebSocket server did not bind')
-  server.on('connection', socket => socket.once('message', data => { const hello = JSON.parse(data.toString()); socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: hello.request_id, body: { authenticated: true, role: 'user', ptt_available: true, passkey_available: false } })); setTimeout(() => socket.send(JSON.stringify({ api_version: 1, type: 'status', body: { authenticated: false, reason: 'session_invalid' } })), 50) }))
+  server.on('connection', socket => socket.once('message', data => { const hello = JSON.parse(data.toString()); socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: hello.request_id, body: { authenticated: true, role: 'user', ptt_available: true, passkey_available: false } })); setTimeout(() => socket.send(JSON.stringify({ api_version: 1, type: 'error', body: { code: 'session_invalid', text: 'Your session ended. Live listening remains available.' } })), 50) }))
   try {
     await page.goto('/')
     const state = await page.evaluate(async endpoint => {
@@ -97,4 +97,34 @@ test('open-access browser session downgrades immediately after revocation', asyn
     }, `http://127.0.0.1:${address.port}/api/v1/ws`)
     expect(state).toEqual({ connected: true, listening: true, pttAvailable: false, revoked: true })
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
+})
+
+test('browser closes on an unmatched response and on control backpressure', async ({ page }) => {
+  const server = new WebSocketServer({ port: 0, perMessageDeflate: false })
+  await new Promise<void>(resolve => server.once('listening', resolve))
+  const address = server.address(); if (typeof address === 'string' || !address) throw new Error('WebSocket server did not bind')
+  let connection = 0
+  server.on('connection', socket => {
+    connection++
+    if (connection === 1) socket.once('message', () => socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: 'not-pending', body: { authenticated: false, ptt_available: false } })))
+  })
+  try {
+    await page.goto('/')
+    const result = await page.evaluate(async endpoint => {
+      // @ts-expect-error Vite serves this source module during browser tests.
+      const { OpusRefSocket } = await import('/src/lib/socket.ts')
+      async function connectAndClose(action?: (socket: InstanceType<typeof OpusRefSocket>) => void) {
+        const socket = new OpusRefSocket(endpoint)
+        const closed = new Promise<any>(resolve => socket.addEventListener('event', (event: Event) => { const detail = (event as CustomEvent).detail; if (detail.closed) resolve(detail.closed) }))
+        socket.connect({ encoder: true, decoder: true, context_rate: 48000 })
+        if (action) { await new Promise(resolve => setTimeout(resolve, 50)); action(socket) }
+        return await closed
+      }
+      const unmatched = await connectAndClose()
+      const overloaded = await connectAndClose(socket => { for (let index = 0; index < 32; index++) { try { socket.send('playback_open', { recording_id: String(index) }) } catch {} } })
+      return { unmatched, overloaded }
+    }, `http://127.0.0.1:${address.port}/api/v1/ws`)
+    expect(result.unmatched.code).toBe(4400)
+    expect(result.overloaded.code).toBe(4409)
+  } finally { for (const client of server.clients) client.terminate(); await new Promise<void>(resolve => server.close(() => resolve())) }
 })

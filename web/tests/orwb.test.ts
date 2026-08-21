@@ -19,4 +19,10 @@ describe('control messages', () => {
   it('accepts a version-one server envelope', () => { expect(parseControlMessage('{"api_version":1,"type":"ptt_busy","body":{}}').type).toBe('ptt_busy') })
   it.each(['{"api_version":1,"type":"unknown","body":{}}', '{"api_version":1,"type":"status","body":{},"extra":1}', '{"api_version":2,"type":"status","body":{}}'])('rejects an invalid server envelope', input => expect(() => parseControlMessage(input)).toThrow(ProtocolError))
   it('rejects more than 16 KiB', () => expect(() => parseControlMessage('{"api_version":1,"type":"error","body":{"text":"' + 'x'.repeat(16384) + '"}}')).toThrow('too large'))
+  it('accepts the exact public status schema', () => expect(parseControlMessage('{"api_version":1,"type":"status","body":{"health":"ok","ready":true,"reflector":{"id":"TEST","display_name":"Test"},"client_count":1,"floor":{"active":false},"recording":{"available":true,"quota_full":false},"server_time":"2026-08-21T00:00:00Z"}}').type).toBe('status'))
+  it.each([
+    '{"api_version":1,"type":"status","body":{"authenticated":false}}',
+    '{"api_version":1,"type":"error","body":{"code":"session_invalid"}}',
+    '{"api_version":1,"type":"hello_ok","body":{"status":{"health":"ok"}}}',
+  ])('rejects a conflicting status or error schema', input => expect(() => parseControlMessage(input)).toThrow(ProtocolError))
 })

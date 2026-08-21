@@ -1,6 +1,7 @@
 import { MediaKind } from './orwb'
 import { OpusRefSocket, type SocketEvent } from './socket'
 import { parseChannelId } from './channel-id'
+import type { PublicStatus } from './types'
 
 export interface AudioSessionState {
   connected: boolean
@@ -13,6 +14,7 @@ export interface AudioSessionState {
   currentSource?: string
   activity: { text: string; at: string }[]
   pttAvailable: boolean
+  status?: PublicStatus
 }
 
 export class BrowserAudioSession extends EventTarget {
@@ -70,17 +72,17 @@ export class BrowserAudioSession extends EventTarget {
   async requestPTT(): Promise<void> {
     if (!this.state.connected) { this.update({ error: 'The live connection is not ready.' }); return }
     this.cancelPending = false; this.update({ ptt: 'requesting', busy: false, error: undefined })
-    this.socket.send('ptt_start', {})
+    this.send('ptt_start', {})
   }
 
   stopPTT(): void {
-    if (this.pttChannel) this.socket.send('ptt_stop', { channel_id: this.pttChannel.toString() }); else this.cancelPending = true
+    if (this.pttChannel) this.send('ptt_stop', { channel_id: this.pttChannel.toString() }); else this.cancelPending = true
     this.worker?.postMessage({ type: 'stop-transmit' }); this.stopMicrophone(); this.update({ ptt: 'stopping' })
   }
 
-  openPlayback(recordingId: string): void { this.socket.send('playback_open', { recording_id: recordingId }) }
-  playback(type: 'playback_pause' | 'playback_resume' | 'playback_close', channelId: string): void { this.socket.send(type, { channel_id: channelId }); if (type === 'playback_close') this.closePlayback() }
-  seek(channelId: string, elapsedMs: number): void { this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.socket.send('playback_seek', { channel_id: channelId, elapsed_ms: Math.max(0, Math.round(elapsedMs)) }) }
+  openPlayback(recordingId: string): void { this.send('playback_open', { recording_id: recordingId }) }
+  playback(type: 'playback_pause' | 'playback_resume' | 'playback_close', channelId: string): void { this.send(type, { channel_id: channelId }); if (type === 'playback_close') this.closePlayback() }
+  seek(channelId: string, elapsedMs: number): void { this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.send('playback_seek', { channel_id: channelId, elapsed_ms: Math.max(0, Math.round(elapsedMs)) }) }
 
   async close(): Promise<void> {
     this.closing = true
@@ -98,7 +100,7 @@ export class BrowserAudioSession extends EventTarget {
       this.media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 48000, echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false })
       this.context?.createMediaStreamSource(this.media).connect(this.audioNode!)
       this.pttChannel = channelId; this.worker?.postMessage({ type: 'start-transmit', channelId: channelId.toString() }); this.update({ ptt: 'transmitting' })
-    } catch { this.socket.send('ptt_stop', { channel_id: channelId.toString() }); this.update({ ptt: 'stopping', error: 'Microphone access failed. PTT stopped.' }) }
+    } catch { this.send('ptt_stop', { channel_id: channelId.toString() }); this.update({ ptt: 'stopping', error: 'Microphone access failed. PTT stopped.' }) }
   }
 
   private stopMicrophone() { this.media?.getTracks().forEach(track => track.stop()); this.media = undefined }
@@ -122,17 +124,17 @@ export class BrowserAudioSession extends EventTarget {
     }
     const control = event.control
     if (!control) return
-    if (control.type === 'hello_ok') { const body = control.body as { ptt_available?: boolean }; this.update({ connected: true, pttAvailable: body.ptt_available === true }) }
+    if (control.type === 'hello_ok') { const body = control.body as { ptt_available?: boolean; status?: PublicStatus }; this.update({ connected: true, pttAvailable: body.ptt_available === true, status: body.status }) }
+    else if (control.type === 'status') this.update({ status: control.body as PublicStatus })
     else if (control.type === 'stream_start') { const body = control.body as { channel_id: string; source_callsign: string }; try { const id = parseChannelId(body.channel_id); if (this.liveChannel) this.retire(this.liveChannel); this.liveChannel = id; this.worker?.postMessage({ type: 'reset-playout' }); this.update({ currentSource: body.source_callsign }); this.activity(`${body.source_callsign} started a transmission.`) } catch { this.socket.close() } }
     else if (control.type === 'stream_end') { const body = control.body as { channel_id: string; reason: string }; try { const id = parseChannelId(body.channel_id); this.retire(id); if (id === this.liveChannel) { this.liveChannel = undefined; this.update({ currentSource: undefined }); this.activity(`The transmission ended: ${body.reason}.`) } } catch { this.socket.close() } }
-    else if (control.type === 'ptt_granted') { const body = control.body as { channel_id: string; tot_seconds: number }; try { const id = parseChannelId(body.channel_id); if (this.cancelPending) { this.socket.send('ptt_stop', { channel_id: body.channel_id }); this.update({ ptt: 'stopping' }) } else { void this.startMicrophone(id); this.startTOT(body.tot_seconds) } } catch { this.update({ ptt: 'idle', error: 'The server returned an invalid channel ID.' }); this.socket.close() } }
+    else if (control.type === 'ptt_granted') { const body = control.body as { channel_id: string; tot_seconds: number }; try { const id = parseChannelId(body.channel_id); if (this.cancelPending) { this.send('ptt_stop', { channel_id: body.channel_id }); this.update({ ptt: 'stopping' }) } else { void this.startMicrophone(id); this.startTOT(body.tot_seconds) } } catch { this.update({ ptt: 'idle', error: 'The server returned an invalid channel ID.' }); this.socket.close() } }
     else if (control.type === 'ptt_busy') { this.update({ ptt: 'idle', busy: true, error: 'The reflector floor is busy.' }); setTimeout(() => this.update({ busy: false }), 3000) }
     else if (control.type === 'ptt_ended') { clearInterval(this.totTimer); this.worker?.postMessage({ type: 'stop-transmit' }); this.stopMicrophone(); this.pttChannel = undefined; this.cancelPending = false; this.update({ ptt: 'idle', remaining: undefined }) }
     else if (control.type === 'discontinuity') { const body = control.body as { old_channel_id: string; new_channel_id: string }; try { const oldID = parseChannelId(body.old_channel_id); const newID = parseChannelId(body.new_channel_id); this.retire(oldID); if (oldID === this.liveChannel) this.liveChannel = newID; this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.activity('Live audio restarted after a network discontinuity.') } catch { this.socket.close() } }
     else if (control.type === 'playback_opened') { const body = control.body as { channel_id: string; recording_id: string; duration_ms: number; status: 'complete' | 'partial' }; try { parseChannelId(body.channel_id); this.update({ playback: { channelId: body.channel_id, recordingId: body.recording_id, durationMs: body.duration_ms, status: body.status, state: 'playing', elapsedMs: 0 } }); this.startPlaybackClock() } catch { this.socket.close() } }
     else if (control.type === 'playback_state') { const body = control.body as { channel_id: string; state: 'playing' | 'paused' | 'closed'; elapsed_ms: number }; if (this.state.playback?.channelId === body.channel_id) { if (body.state === 'closed') this.closePlayback(); else { this.update({ playback: { ...this.state.playback, state: body.state, elapsedMs: body.elapsed_ms } }); if (body.state === 'playing') this.startPlaybackClock(); else clearInterval(this.playbackTimer) } } }
-    else if (control.type === 'status' && (control.body as { authenticated?: boolean }).authenticated === false) { if (this.state.ptt !== 'idle') this.stopPTT(); if (this.state.playback) this.closePlayback(); this.update({ pttAvailable: false }); this.activity('Your session ended. Live listening remains available.'); this.dispatchEvent(new Event('session-invalid')) }
-    else if (control.type === 'error') this.update({ error: (control.body as { text?: string }).text ?? 'The live request failed.' })
+    else if (control.type === 'error') { const body = control.body as { code?: string; text?: string }; if (body.code === 'session_invalid') this.downgradeSession(); else this.update({ error: body.text ?? 'The live request failed.' }) }
   }
 
   private startTOT(seconds: number) {
@@ -149,4 +151,6 @@ export class BrowserAudioSession extends EventTarget {
   }
 
   private closePlayback() { clearInterval(this.playbackTimer); this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.update({ playback: undefined }) }
+  private downgradeSession() { if (this.state.ptt !== 'idle') this.stopPTT(); if (this.state.playback) this.closePlayback(); this.update({ pttAvailable: false }); this.activity('Your session ended. Live listening remains available.'); this.dispatchEvent(new Event('session-invalid')) }
+  private send(type: string, body: unknown): boolean { try { this.socket.send(type, body); return true } catch { this.update({ error: 'The live request queue is full. Reconnect and try again.' }); return false } }
 }

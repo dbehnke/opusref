@@ -61,10 +61,11 @@ access mode, the browser stops PTT and playback. It keeps anonymous live listeni
 available. If the WebSocket closes, the UI requires the user to select Listen live
 again. It does not restart audio without a user action.
 
-Playwright uses a loopback WebSocket server to test control messages, ORWB media,
-playback, close handling, and anonymous downgrade. This is not the production TLS
-proxy test. The system release gate must test HTTPS and WSS through the configured
-reverse proxy.
+Playwright uses loopback servers to test control messages, ORWB media, playback,
+close handling, anonymous downgrade, and the production bundle over HTTPS and
+same-origin WSS. The local HTTPS certificate is test-only. The system release gate
+must also test the configured reverse proxy and the devices in
+[QUALIFICATION.md](QUALIFICATION.md).
 
 ## Production assets
 
