@@ -162,6 +162,12 @@ type Recording struct {
 	PacketCount, ByteSize                               int64
 	PartialReasons                                      uint32
 	SHA256                                              []byte
+	FirstSequence, LastSequence                         *uint32
+	FirstTimestamp, LastTimestamp                       *uint32
+}
+type RecordingPacketBounds struct {
+	FirstSequence, LastSequence   uint32
+	FirstTimestamp, LastTimestamp uint32
 }
 type RecordingQuery struct {
 	Limit                         int
@@ -178,7 +184,7 @@ func (s *Store) QueryRecordings(ctx context.Context, query RecordingQuery) ([]Re
 	if limit < 1 || limit > 201 {
 		limit = 50
 	}
-	statement := `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256 FROM recordings WHERE status IN('complete','partial')`
+	statement := `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256,first_sequence,last_sequence,first_timestamp,last_timestamp FROM recordings WHERE status IN('complete','partial')`
 	args := []any{}
 	if query.Source != "" {
 		statement += " AND source_callsign=?"
@@ -212,9 +218,11 @@ func (s *Store) QueryRecordings(ctx context.Context, query RecordingQuery) ([]Re
 		var item Recording
 		var start string
 		var end sql.NullString
-		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256); err != nil {
+		var firstSequence, lastSequence, firstTimestamp, lastTimestamp sql.NullInt64
+		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256, &firstSequence, &lastSequence, &firstTimestamp, &lastTimestamp); err != nil {
 			return nil, err
 		}
+		setRecordingBounds(&item, firstSequence, lastSequence, firstTimestamp, lastTimestamp)
 		item.StartedAt, _ = time.Parse(time.RFC3339Nano, start)
 		if end.Valid {
 			parsed, _ := time.Parse(time.RFC3339Nano, end.String)
@@ -228,16 +236,28 @@ func (s *Store) RecordingByID(ctx context.Context, id string) (Recording, error)
 	var item Recording
 	var start string
 	var end sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256 FROM recordings WHERE id=? AND status IN('complete','partial')`, id).Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256)
+	var firstSequence, lastSequence, firstTimestamp, lastTimestamp sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256,first_sequence,last_sequence,first_timestamp,last_timestamp FROM recordings WHERE id=? AND status IN('complete','partial')`, id).Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256, &firstSequence, &lastSequence, &firstTimestamp, &lastTimestamp)
 	if err != nil {
 		return item, err
 	}
 	item.StartedAt, _ = time.Parse(time.RFC3339Nano, start)
+	setRecordingBounds(&item, firstSequence, lastSequence, firstTimestamp, lastTimestamp)
 	if end.Valid {
 		parsed, _ := time.Parse(time.RFC3339Nano, end.String)
 		item.EndedAt = &parsed
 	}
 	return item, nil
+}
+
+func setRecordingBounds(item *Recording, values ...sql.NullInt64) {
+	targets := []**uint32{&item.FirstSequence, &item.LastSequence, &item.FirstTimestamp, &item.LastTimestamp}
+	for index, value := range values {
+		if value.Valid {
+			converted := uint32(value.Int64)
+			*targets[index] = &converted
+		}
+	}
 }
 func (s *Store) InsertRecording(ctx context.Context, id, node, source, webUserID, path string, start time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO recordings(id,node_callsign,source_callsign,web_user_id,start_at,status,relative_path,created_at)VALUES(?,?,?,?,?,'creating',?,?)`, id, node, source, nullString(webUserID), start.UTC().Format(time.RFC3339Nano), path, time.Now().UTC().Format(time.RFC3339Nano))
@@ -284,10 +304,37 @@ func (s *Store) PrepareRecoveryFinalize(ctx context.Context, id, intendedStatus,
 	return nil
 }
 func (s *Store) FinishRecording(ctx context.Context, id, status, reason string, end time.Time, packets, size int64, sum []byte) error {
+	return s.finishRecording(ctx, id, status, reason, end, packets, size, sum, nil)
+}
+func (s *Store) FinishRecordingWithBounds(ctx context.Context, id, status, reason string, end time.Time, packets, size int64, sum []byte, bounds RecordingPacketBounds) error {
+	return s.finishRecording(ctx, id, status, reason, end, packets, size, sum, &bounds)
+}
+func (s *Store) BackfillRecordingBounds(ctx context.Context, id string, packets int64, bounds RecordingPacketBounds) error {
+	var firstSequence, lastSequence, firstTimestamp, lastTimestamp any
+	if packets > 0 {
+		firstSequence, lastSequence = bounds.FirstSequence, bounds.LastSequence
+		firstTimestamp, lastTimestamp = bounds.FirstTimestamp, bounds.LastTimestamp
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET packet_count=?,first_sequence=?,last_sequence=?,first_timestamp=?,last_timestamp=? WHERE id=? AND status IN('complete','partial')`, packets, firstSequence, lastSequence, firstTimestamp, lastTimestamp, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) finishRecording(ctx context.Context, id, status, reason string, end time.Time, packets, size int64, sum []byte, bounds *RecordingPacketBounds) error {
 	if status != "complete" && status != "partial" {
 		return errors.New("recording status is invalid")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET status=?,intended_status=NULL,end_reason=?,end_at=?,packet_count=?,byte_size=?,sha256=? WHERE id=? AND status='finalizing' AND intended_status=?`, status, reason, end.UTC().Format(time.RFC3339Nano), packets, size, sum, id, status)
+	var firstSequence, lastSequence, firstTimestamp, lastTimestamp any
+	if bounds != nil && packets > 0 {
+		firstSequence, lastSequence = bounds.FirstSequence, bounds.LastSequence
+		firstTimestamp, lastTimestamp = bounds.FirstTimestamp, bounds.LastTimestamp
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET status=?,intended_status=NULL,end_reason=?,end_at=?,packet_count=?,byte_size=?,sha256=?,first_sequence=?,last_sequence=?,first_timestamp=?,last_timestamp=? WHERE id=? AND status='finalizing' AND intended_status=?`, status, reason, end.UTC().Format(time.RFC3339Nano), packets, size, sum, firstSequence, lastSequence, firstTimestamp, lastTimestamp, id, status)
 	if err != nil {
 		return err
 	}
@@ -1327,6 +1374,9 @@ func (s *Store) RecoverAdmin(ctx context.Context, username, hash string, now tim
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", stamp, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(occurred_at,action,outcome,actor_id,target_id,details)VALUES(?,'admin_recovery','success',?,?, '{}')`, stamp, id, id); err != nil {
 		return err
 	}
 	return tx.Commit()

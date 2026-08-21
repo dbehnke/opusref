@@ -68,18 +68,24 @@ type Service struct {
 	closeOnce sync.Once
 	healthy   atomic.Bool
 	observer  func(string, string)
+	alerts    []archiveAlert
+	quotaStop bool
 }
+type archiveAlert struct{ action, result string }
 type activeStream struct {
-	key          StreamKey
-	id           uuid.UUID
-	node, source string
-	webUserID    string
-	started      time.Time
-	file         *File
-	packets      int64
-	reasons      uint32
-	seen         bool
-	lastSequence uint32
+	key                                     StreamKey
+	id                                      uuid.UUID
+	node, source                            string
+	webUserID                               string
+	started                                 time.Time
+	file                                    *File
+	packets                                 int64
+	reasons                                 uint32
+	seen                                    bool
+	lastSequence                            uint32
+	hasBounds                               bool
+	firstAudioSequence, lastAudioSequence   uint32
+	firstAudioTimestamp, lastAudioTimestamp uint32
 }
 
 func NewService(ctx context.Context, state *store.Store, directory string, quota int64, queuePackets int) (*Service, error) {
@@ -127,7 +133,12 @@ func (s *Service) Close() {
 func (s *Service) SetObserver(observer func(action, result string)) {
 	s.mu.Lock()
 	s.observer = observer
+	alerts := append([]archiveAlert(nil), s.alerts...)
+	s.alerts = nil
 	s.mu.Unlock()
+	for _, alert := range alerts {
+		observer(alert.action, alert.result)
+	}
 }
 func (s *Service) observe(action, result string) {
 	s.mu.Lock()
@@ -135,6 +146,30 @@ func (s *Service) observe(action, result string) {
 	s.mu.Unlock()
 	if observer != nil {
 		observer(action, result)
+	}
+}
+func (s *Service) recoveryAlert(result string) {
+	s.mu.Lock()
+	if s.observer == nil {
+		s.alerts = append(s.alerts, archiveAlert{"recover", result})
+		s.mu.Unlock()
+		return
+	}
+	observer := s.observer
+	s.mu.Unlock()
+	observer("recover", result)
+}
+func (s *Service) setQuotaStopped(stopped bool) {
+	s.mu.Lock()
+	changed := s.quotaStop != stopped
+	s.quotaStop = stopped
+	s.mu.Unlock()
+	if changed {
+		result := "clear"
+		if stopped {
+			result = "full"
+		}
+		s.observe("quota", result)
 	}
 }
 func (s *Service) media(item command) bool {
@@ -254,6 +289,7 @@ func (s *Service) write(active *activeStream, item command) {
 		s.mu.Unlock()
 		if !available {
 			active.reasons |= PartialQuota
+			s.setQuotaStopped(true)
 			return
 		}
 		relative := active.id.String() + ".orar"
@@ -281,13 +317,22 @@ func (s *Service) write(active *activeStream, item command) {
 	if err := active.file.Append(Packet{Sequence: item.sequence, Timestamp: item.timestamp, ArrivalMS: uint32(offset), Payload: item.payload}); err != nil {
 		if errors.Is(err, ErrLimit) {
 			active.reasons |= PartialQuota
+			s.setQuotaStopped(true)
 		} else {
 			active.reasons |= PartialWriteFailure
 		}
 		return
 	}
 	active.packets++
+	if !active.hasBounds {
+		active.firstAudioSequence, active.firstAudioTimestamp = item.sequence, item.timestamp
+		active.hasBounds = true
+	}
+	active.lastAudioSequence, active.lastAudioTimestamp = item.sequence, item.timestamp
 	s.addUsed(active.file.writer.Size() - before)
+	if s.usedBytes() >= s.quota {
+		s.setQuotaStopped(true)
+	}
 }
 func (s *Service) finish(active *activeStream, reason string) {
 	if active.file == nil {
@@ -309,7 +354,8 @@ func (s *Service) finish(active *activeStream, reason string) {
 		s.healthy.Store(false)
 		return
 	}
-	if err = s.state.FinishRecording(context.Background(), active.id.String(), status, reason, time.Now(), active.packets, size, sum); err != nil {
+	bounds := store.RecordingPacketBounds{FirstSequence: active.firstAudioSequence, LastSequence: active.lastAudioSequence, FirstTimestamp: active.firstAudioTimestamp, LastTimestamp: active.lastAudioTimestamp}
+	if err = s.state.FinishRecordingWithBounds(context.Background(), active.id.String(), status, reason, time.Now(), active.packets, size, sum, bounds); err != nil {
 		s.observe("finalize", "failure")
 		s.healthy.Store(false)
 	} else {
@@ -332,6 +378,11 @@ func (s *Service) recount() error {
 	}
 	s.mu.Lock()
 	s.used = used
+	wasStopped := s.quotaStop
+	s.quotaStop = used >= s.quota
+	if s.quotaStop && !wasStopped {
+		s.alerts = append(s.alerts, archiveAlert{"quota", "full"})
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -349,6 +400,7 @@ func (s *Service) recover(ctx context.Context) error {
 			id, parseErr := uuid.Parse(name[:len(name)-len(extension)])
 			if parseErr != nil {
 				_ = os.Rename(path, path+".quarantine")
+				s.recoveryAlert("failure")
 				continue
 			}
 			if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -387,6 +439,7 @@ func (s *Service) recover(ctx context.Context) error {
 				if err = s.state.DeleteCreatingRecording(ctx, filenameID.String()); err != nil {
 					return err
 				}
+				s.recoveryAlert("failure")
 				continue
 			}
 			if persistedErr == nil {
@@ -394,18 +447,20 @@ func (s *Service) recover(ctx context.Context) error {
 					return markErr
 				}
 			}
+			s.recoveryAlert("failure")
 			if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
 				return renameErr
 			}
 			continue
 		}
 		if persistedErr != nil || filenameID != id {
+			s.recoveryAlert("failure")
 			if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
 				return renameErr
 			}
 			continue
 		}
-		count, countErr := CountPackets(path)
+		count, bounds, countErr := packetMetadata(path)
 		if countErr != nil {
 			return countErr
 		}
@@ -435,6 +490,15 @@ func (s *Service) recover(ctx context.Context) error {
 				if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
 					return renameErr
 				}
+				s.recoveryAlert("failure")
+			} else {
+				count, bounds, metadataErr := packetMetadata(path)
+				if metadataErr != nil {
+					return metadataErr
+				}
+				if err = s.state.BackfillRecordingBounds(ctx, id.String(), count, bounds); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -455,9 +519,10 @@ func (s *Service) recover(ctx context.Context) error {
 				return err
 			}
 		}
-		if err = s.state.FinishRecording(ctx, id.String(), finalStatus, finalReason, time.Now(), count, size, sum); err != nil {
+		if err = s.state.FinishRecordingWithBounds(ctx, id.String(), finalStatus, finalReason, time.Now(), count, size, sum, bounds); err != nil {
 			return err
 		}
+		s.recoveryAlert("partial")
 	}
 	recoverable, err := s.state.RecoverableRecordingIDs(ctx)
 	if err != nil {
@@ -473,6 +538,7 @@ func (s *Service) recover(ctx context.Context) error {
 				err = s.state.DeleteCreatingRecording(ctx, id)
 			} else {
 				err = s.state.MarkRecordingUnavailable(ctx, id, "archive_missing", time.Now())
+				s.recoveryAlert("failure")
 			}
 			if err != nil {
 				return err
@@ -517,8 +583,12 @@ func (s *Service) Purge(ctx context.Context, retention time.Duration, now time.T
 }
 func (s *Service) usedBytes() int64           { s.mu.Lock(); defer s.mu.Unlock(); return s.used }
 func (s *Service) Usage() (used, quota int64) { return s.usedBytes(), s.quota }
-func (s *Service) QuotaFull() bool            { s.mu.Lock(); defer s.mu.Unlock(); return s.used >= s.quota }
-func (s *Service) Ready() bool                { return s.healthy.Load() }
+func (s *Service) QuotaFull() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaStop || s.used >= s.quota
+}
+func (s *Service) Ready() bool { return s.healthy.Load() }
 func (s *Service) Probe(ctx context.Context) bool {
 	if err := s.state.Ping(ctx); err != nil {
 		s.healthy.Store(false)
@@ -596,6 +666,9 @@ func (s *Service) delete(ctx context.Context, id, actor string, now time.Time) e
 		return err
 	}
 	s.addUsed(-info.Size())
+	if s.usedBytes() < s.quota {
+		s.setQuotaStopped(false)
+	}
 	s.observe("delete", "success")
 	return nil
 }

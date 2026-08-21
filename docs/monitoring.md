@@ -129,6 +129,11 @@ enabled accounts, active sessions, retained recordings, archive bytes, archive
 quota bytes, and authentication failures. These metrics have no labels. The
 public listener does not serve them.
 
+`opusrefweb_archive_alerts_total` uses only the fixed `full`, `clear`, and
+`recovery` kinds. The companion also puts quota transitions and recovery
+anomalies in its bounded administrator event list. It does not put a recording
+ID or file path in a metric label or operator message.
+
 ## 5. Snapshot design
 
 ```mermaid

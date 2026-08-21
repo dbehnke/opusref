@@ -5,7 +5,35 @@ import (
 	"errors"
 	"io"
 	"os"
+
+	"github.com/dbehnke/opusref/internal/webapp/store"
 )
+
+func packetMetadata(path string) (int64, store.RecordingPacketBounds, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, store.RecordingPacketBounds{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, store.RecordingPacketBounds{}, err
+	}
+	var count int64
+	var bounds store.RecordingPacketBounds
+	for offset := int64(HeaderSize); offset < info.Size(); count++ {
+		packet, next, readErr := readPacketAt(file, info.Size(), offset)
+		if readErr != nil {
+			return 0, store.RecordingPacketBounds{}, readErr
+		}
+		if count == 0 {
+			bounds.FirstSequence, bounds.FirstTimestamp = packet.Sequence, packet.Timestamp
+		}
+		bounds.LastSequence, bounds.LastTimestamp = packet.Sequence, packet.Timestamp
+		offset = next
+	}
+	return count, bounds, nil
+}
 
 const (
 	checkpointStride = 64
@@ -79,6 +107,32 @@ func (p *Playback) NewCursor(elapsed uint32) (*PlaybackCursor, error) {
 		scanPacket++
 	}
 	cursor.offset, cursor.packet = chosenOffset, chosenPacket
+	return cursor, nil
+}
+func (p *Playback) NewCursorAt(packetIndex int64) (*PlaybackCursor, error) {
+	if packetIndex < 0 || packetIndex > p.packets {
+		return nil, errors.New("playback packet index is invalid")
+	}
+	file, err := os.Open(p.path)
+	if err != nil {
+		return nil, err
+	}
+	cursor := &PlaybackCursor{file: file, size: p.size, offset: HeaderSize}
+	for _, item := range p.checkpoints {
+		if item.packet > packetIndex {
+			break
+		}
+		cursor.offset, cursor.packet = item.offset, item.packet
+	}
+	for cursor.packet < packetIndex {
+		_, next, readErr := readPacketAt(cursor.file, cursor.size, cursor.offset)
+		if readErr != nil {
+			cursor.Close()
+			return nil, readErr
+		}
+		cursor.offset = next
+		cursor.packet++
+	}
 	return cursor, nil
 }
 

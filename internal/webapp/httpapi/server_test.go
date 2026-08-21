@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,30 @@ import (
 	"github.com/dbehnke/opusref/internal/webapp/auth"
 	"github.com/dbehnke/opusref/internal/webapp/store"
 )
+
+type blockingSocketWriter struct {
+	mu      sync.Mutex
+	writes  [][]byte
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingSocketWriter) Write(_ context.Context, _ websocket.MessageType, data []byte) error {
+	w.once.Do(func() {
+		close(w.started)
+		<-w.release
+	})
+	w.mu.Lock()
+	w.writes = append(w.writes, append([]byte(nil), data...))
+	w.mu.Unlock()
+	return nil
+}
+func (w *blockingSocketWriter) snapshot() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.writes...)
+}
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
@@ -126,6 +151,71 @@ func TestMediaOutputQueueTracksRetainedHeadAfterPartialDrain(t *testing.T) {
 		t.Fatal("departed queue head was retained in time accounting")
 	}
 }
+func TestPlaybackGenerationRetiresQueuedAndWriterHeldMedia(t *testing.T) {
+	queue := newMediaOutputQueue(2, 100)
+	first := socketOutput{kind: websocket.MessageBinary, data: []byte{1}, playback: true, generation: 1, sequence: 7}
+	second := socketOutput{kind: websocket.MessageBinary, data: []byte{2}, playback: true, generation: 1, sequence: 8}
+	if !queue.enqueue(first) || !queue.enqueue(second) {
+		t.Fatal("playback queue setup failed")
+	}
+	held := <-queue.items
+	queue.taken(held)
+	queue.discard()
+	if currentPlaybackOutput(held, 2) {
+		t.Fatal("writer-held media survived the pause generation barrier")
+	}
+	resumed := socketOutput{kind: websocket.MessageBinary, data: []byte{3}, playback: true, generation: 2, sequence: 7}
+	if !currentPlaybackOutput(resumed, 2) || resumed.sequence != held.sequence {
+		t.Fatal("ordinary resume did not preserve the packet sequence")
+	}
+	seek := socketOutput{kind: websocket.MessageBinary, data: []byte{4}, playback: true, generation: 3, sequence: 0}
+	if currentPlaybackOutput(resumed, 3) || !currentPlaybackOutput(seek, 3) || seek.sequence != 0 {
+		t.Fatal("seek did not retire the prior epoch and reset its sequence")
+	}
+}
+
+func TestBlockedWriterDoesNotSendRetiredPlaybackAfterLifecycleResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := &blockingSocketWriter{started: make(chan struct{}), release: make(chan struct{})}
+	controls := make(chan socketOutput, 2)
+	live := newMediaOutputQueue(1, 100)
+	playback := newMediaOutputQueue(2, 100)
+	var generation atomic.Uint64
+	generation.Store(1)
+	if !live.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte("live"), timestamp: 1}) {
+		t.Fatal("live setup failed")
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- writeSocketOutputs(ctx, writer, controls, live, playback, &generation, func(socketOutput) {})
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not block")
+	}
+	if !playback.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte("old-1"), playback: true, generation: 1}) || !playback.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte("old-2"), playback: true, generation: 1}) {
+		t.Fatal("playback queue was not full")
+	}
+	generation.Store(2)
+	playback.discard()
+	controls <- socketOutput{kind: websocket.MessageText, data: []byte("paused")}
+	if !playback.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte("new"), playback: true, generation: 2}) {
+		t.Fatal("new playback enqueue failed")
+	}
+	close(writer.release)
+	deadline := time.Now().Add(time.Second)
+	for len(writer.snapshot()) < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	writes := writer.snapshot()
+	if len(writes) != 3 || string(writes[0]) != "live" || string(writes[1]) != "paused" || string(writes[2]) != "new" {
+		t.Fatalf("write order=%q", writes)
+	}
+}
 func TestSecurityHeadersAndMetricsIsolation(t *testing.T) {
 	server, s := newTestServer(t)
 	defer s.Close()
@@ -180,6 +270,102 @@ func TestLoginIsSameOriginAndNonEnumerating(t *testing.T) {
 	}
 	if w := login("alice", "quiet marble nebula orchard", "https://radio.example.test"); w.Code != http.StatusOK || len(w.Result().Cookies()) != 1 {
 		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSensitiveRouteFailuresWriteRedactedAuditRecords(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	user, err := state.FindUserByUsername(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := store.Session{ID: "session", UserID: user.ID, Username: user.Username, Role: store.RoleAdmin}
+	target := user.ID
+	if err = state.InsertRecording(context.Background(), target, "WEB", "N0CALL", "", target+".orar", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		action string
+		call   func(http.ResponseWriter, *http.Request, store.Session)
+		path   string
+	}{
+		{"logout", server.logout, "/api/v1/auth/logout"},
+		{"reauth_password", server.reauthPassword, "/api/v1/me/reauth/password"},
+		{"password_change", server.changePassword, "/api/v1/me/password"},
+		{"session_revoke", server.deleteSession, "/api/v1/me/sessions/other"},
+		{"reauth_passkey", server.passkeyReauthVerify, "/api/v1/me/reauth/passkey/verify"},
+		{"passkey_enroll", server.passkeyEnrollVerify, "/api/v1/me/passkeys/verify"},
+		{"passkey_rename", server.renamePasskey, "/api/v1/me/passkeys/key"},
+		{"passkey_delete", server.deletePasskey, "/api/v1/me/passkeys/key"},
+		{"recording_delete", server.deleteRecording, "/api/v1/admin/recordings/" + target},
+		{"passkeys_clear", server.clearAccountPasskeys, "/api/v1/admin/accounts/" + target + "/passkeys"},
+		{"account_update", server.updateAccount, "/api/v1/admin/accounts/" + target},
+		{"password_reset", server.resetAccountPassword, "/api/v1/admin/accounts/" + target + "/password"},
+		{"sessions_revoke", server.revokeAccountSessions, "/api/v1/admin/accounts/" + target + "/sessions/revoke"},
+		{"account_delete", server.deleteAccount, "/api/v1/admin/accounts/" + target},
+		{"account_create", server.createAccount, "/api/v1/admin/accounts"},
+	}
+	for _, test := range tests {
+		r := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"password":"must-not-appear"}`))
+		r.SetPathValue("id", target)
+		test.call(httptest.NewRecorder(), r, session)
+	}
+	events, err := state.ListAudit(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{}
+	for _, test := range tests {
+		want[test.action] = true
+	}
+	for _, event := range events {
+		if want[event.Action] {
+			if event.Outcome != "failure" || event.Details != "{}" || strings.Contains(event.Details, "must-not-appear") {
+				t.Fatalf("unsafe audit event: %+v", event)
+			}
+			delete(want, event.Action)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing failure audits: %v", want)
+	}
+}
+
+func TestPasskeyLimiterUsesSharedIPAndAccountBuckets(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	r := httptest.NewRequest(http.MethodPost, "https://radio.example.test/api/v1/me/passkeys/options", nil)
+	r.RemoteAddr = "192.0.2.10:1234"
+	for index := 0; index < 10; index++ {
+		if !server.allowPasskeyAttempt(r, "account-a") {
+			t.Fatalf("attempt %d was limited early", index+1)
+		}
+	}
+	if server.allowPasskeyAttempt(r, "account-a") {
+		t.Fatal("shared passkey IP/account bucket allowed attempt 11")
+	}
+	r.RemoteAddr = "192.0.2.11:1234"
+	if server.allowPasskeyAttempt(r, "account-a") {
+		t.Fatal("new IP bypassed the account bucket")
+	}
+	if !server.allowPasskeyAttempt(r, "account-b") {
+		t.Fatal("independent account and IP were limited")
+	}
+}
+
+func TestAuditWriteFailureHasFixedTelemetryAndOperatorEvent(t *testing.T) {
+	server, state := newTestServer(t)
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server.audit(context.Background(), "password_change", "failure", "", "", "")
+	if server.telemetry.value("opusrefweb_audit_writes_total", "failure") != 1 || server.telemetry.value("opusrefweb_db_errors_total", "audit") != 1 {
+		t.Fatal("audit write failure telemetry was not incremented")
+	}
+	events := server.telemetry.recent()
+	if len(events) != 1 || events[0].Kind != "audit_failure" || strings.Contains(events[0].Message, "password") {
+		t.Fatalf("unsafe or missing operator event: %+v", events)
 	}
 }
 func TestChannelIDUsesCanonicalLosslessDecimal(t *testing.T) {

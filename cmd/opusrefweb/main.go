@@ -183,7 +183,12 @@ func recoverAdmin(args []string) error {
 		return err
 	}
 	defer state.Close()
-	return state.RecoverAdmin(context.Background(), *username, hash, time.Now())
+	now := time.Now()
+	if err = state.RecoverAdmin(context.Background(), *username, hash, now); err != nil {
+		_ = state.WriteAudit(context.Background(), "admin_recovery", "failure", nil, nil, nil, "{}", now)
+		return err
+	}
+	return nil
 }
 func serve(args []string) error {
 	c, err := load(args, "serve")

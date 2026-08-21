@@ -135,7 +135,16 @@ func (s *Server) RefreshReadiness(ctx context.Context) bool {
 	return ready
 }
 func (s *Server) RecordArchive(action, result string) {
+	if action == "quota" {
+		s.telemetry.inc("opusrefweb_archive_alerts_total", result)
+		s.telemetry.setQuota(result == "full")
+		return
+	}
 	s.telemetry.inc("opusrefweb_archive_total", action, result)
+	if action == "recover" && (result == "failure" || result == "partial") {
+		s.telemetry.inc("opusrefweb_archive_alerts_total", "recovery")
+		s.telemetry.event("archive_recovery", "warning", "Archive recovery found an anomaly that requires operator review.")
+	}
 	if result == "failure" || result == "partial" {
 		s.telemetry.event("archive_"+result, map[bool]string{true: "error", false: "warning"}[result == "failure"], "An archive lifecycle operation requires operator attention.")
 	}
@@ -191,15 +200,23 @@ func (s *Server) publicMux() http.Handler {
 }
 
 type socketOutput struct {
-	kind      websocket.MessageType
-	data      []byte
-	timestamp uint32
+	kind              websocket.MessageType
+	data              []byte
+	timestamp         uint32
+	playback          bool
+	generation        uint64
+	packetIndex       int64
+	sequence, elapsed uint32
 }
 type mediaOutputQueue struct {
 	items           chan socketOutput
 	mu              sync.Mutex
 	bytes, maxBytes int
 	timestamps      []uint32
+}
+
+func currentPlaybackOutput(item socketOutput, generation uint64) bool {
+	return !item.playback || item.generation == generation
 }
 
 func newMediaOutputQueue(packets, maxBytes int) *mediaOutputQueue {
@@ -246,6 +263,58 @@ func (q *mediaOutputQueue) discard() {
 	}
 	q.bytes = 0
 	q.timestamps = q.timestamps[:0]
+}
+
+type websocketMessageWriter interface {
+	Write(context.Context, websocket.MessageType, []byte) error
+}
+
+func writeSocketOutputs(ctx context.Context, conn websocketMessageWriter, output <-chan socketOutput, liveOutput, playbackOutput *mediaOutputQueue, generation *atomic.Uint64, playbackWritten func(socketOutput)) error {
+	var pendingMedia *socketOutput
+	for {
+		var item socketOutput
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case item = <-output:
+		default:
+			if pendingMedia != nil {
+				item = *pendingMedia
+				pendingMedia = nil
+			} else {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case item = <-output:
+				case item = <-liveOutput.items:
+					liveOutput.taken(item)
+				case item = <-playbackOutput.items:
+					playbackOutput.taken(item)
+				}
+				if item.kind == websocket.MessageBinary {
+					select {
+					case control := <-output:
+						copy := item
+						pendingMedia = &copy
+						item = control
+					default:
+					}
+				}
+			}
+		}
+		if !currentPlaybackOutput(item, generation.Load()) {
+			continue
+		}
+		writeCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		err := conn.Write(writeCtx, item.kind, item.data)
+		stop()
+		if err != nil {
+			return err
+		}
+		if item.playback && item.generation == generation.Load() {
+			playbackWritten(item)
+		}
+	}
 }
 
 func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
@@ -324,53 +393,34 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var playbackMu sync.Mutex
+	var playbackCancel context.CancelFunc
+	var playbackChannel uint64
+	var playbackFile *webarchive.Playback
+	var playbackElapsed uint32
+	var playbackNextPacket int64
+	var playbackSequence uint32
+	var playbackPlaying bool
+	var playbackGeneration atomic.Uint64
+	playbackProgress := make(chan struct{}, 1)
 	output := make(chan socketOutput, queueCapacity(s.cfg.ControlQueueMessages, 0, 16*1024))
 	liveOutput := newMediaOutputQueue(s.cfg.LiveQueuePackets, s.cfg.LiveQueueBytes)
 	playbackOutput := newMediaOutputQueue(s.cfg.PlaybackQueuePackets, s.cfg.PlaybackQueueBytes)
 	writerDone := make(chan error, 1)
 	go func() {
-		var pendingMedia *socketOutput
-		for {
-			var item socketOutput
+		writerDone <- writeSocketOutputs(ctx, conn, output, liveOutput, playbackOutput, &playbackGeneration, func(item socketOutput) {
+			playbackMu.Lock()
+			if item.generation == playbackGeneration.Load() {
+				playbackElapsed = item.elapsed
+				playbackNextPacket = item.packetIndex + 1
+				playbackSequence = item.sequence + 1
+			}
+			playbackMu.Unlock()
 			select {
-			case <-ctx.Done():
-				writerDone <- ctx.Err()
-				return
-			case item = <-output:
+			case playbackProgress <- struct{}{}:
 			default:
-				if pendingMedia != nil {
-					item = *pendingMedia
-					pendingMedia = nil
-				} else {
-					select {
-					case <-ctx.Done():
-						writerDone <- ctx.Err()
-						return
-					case item = <-output:
-					case item = <-liveOutput.items:
-						liveOutput.taken(item)
-					case item = <-playbackOutput.items:
-						playbackOutput.taken(item)
-					}
-					if item.kind == websocket.MessageBinary {
-						select {
-						case control := <-output:
-							copy := item
-							pendingMedia = &copy
-							item = control
-						default:
-						}
-					}
-				}
 			}
-			writeCtx, stop := context.WithTimeout(ctx, 5*time.Second)
-			err := conn.Write(writeCtx, item.kind, item.data)
-			stop()
-			if err != nil {
-				writerDone <- err
-				return
-			}
-		}
+		})
 	}()
 	type replayEntry struct {
 		digest [32]byte
@@ -426,12 +476,6 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		return false
 	}
-	var playbackMu sync.Mutex
-	var playbackCancel context.CancelFunc
-	var playbackChannel uint64
-	var playbackFile *webarchive.Playback
-	var playbackElapsed uint32
-	var playbackResumeElapsed uint32
 	var playbackSlot atomic.Bool
 	releasePlaybackSlot := func() {
 		if playbackSlot.Swap(false) {
@@ -462,6 +506,8 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackCancel()
 				playbackCancel = nil
 			}
+			playbackGeneration.Add(1)
+			playbackOutput.discard()
 			playbackMu.Unlock()
 			releasePlaybackSlot()
 			if s.cfg.OpenAccess {
@@ -592,24 +638,45 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		playbackCancel = stop
 		channel := playbackChannel
 		archivePlayback := playbackFile
-		elapsed := playbackResumeElapsed
+		nextPacket := playbackNextPacket
+		sequence := playbackSequence
+		generation := playbackGeneration.Load()
 		playbackMu.Unlock()
 		go func() {
 			if archivePlayback == nil {
 				return
 			}
-			cursor, cursorErr := archivePlayback.NewCursor(elapsed)
+			cursor, cursorErr := archivePlayback.NewCursorAt(nextPacket)
 			if cursorErr != nil {
 				return
 			}
 			defer cursor.Close()
-			previous := elapsed
-			accepted := playbackElapsed
-			var outboundSequence uint32
+			previous := uint32(0)
+			accepted := uint32(0)
+			if nextPacket > 0 {
+				playbackMu.Lock()
+				previous, accepted = playbackElapsed, playbackElapsed
+				playbackMu.Unlock()
+			}
+			outboundSequence := sequence
 			first := true
 			for {
+				packetIndex := cursor.Index()
 				packet, nextErr := cursor.Next()
 				if errors.Is(nextErr, io.EOF) {
+					for {
+						playbackMu.Lock()
+						drained := playbackNextPacket >= archivePlayback.PacketCount()
+						playbackMu.Unlock()
+						if drained {
+							break
+						}
+						select {
+						case <-playCtx.Done():
+							return
+						case <-playbackProgress:
+						}
+					}
 					break
 				}
 				if nextErr != nil {
@@ -631,20 +698,19 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				if encodeErr != nil {
 					return
 				}
-				if playbackOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: packet.Timestamp}) {
+				if playbackOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: packet.Timestamp, playback: true, generation: generation, packetIndex: packetIndex, sequence: outboundSequence, elapsed: packet.ArrivalMS}) {
 					s.telemetry.inc("opusrefweb_audio_packets_total", "playback")
 					outboundSequence++
-					accepted = packet.ArrivalMS
-					playbackMu.Lock()
-					playbackElapsed = packet.ArrivalMS
-					playbackResumeElapsed = packet.ArrivalMS
-					playbackMu.Unlock()
 				} else {
 					s.telemetry.inc("opusrefweb_queue_drops_total", "playback")
 					s.telemetry.event("playback_paused", "warning", "Playback paused because its output queue was full.")
-					playbackOutput.discard()
 					playbackMu.Lock()
-					playbackResumeElapsed = packet.ArrivalMS
+					if generation == playbackGeneration.Load() {
+						playbackGeneration.Add(1)
+						playbackOutput.discard()
+						accepted = playbackElapsed
+						playbackPlaying = false
+					}
 					playbackMu.Unlock()
 					sendLifecycle(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "paused", "elapsed_ms": accepted}})
 					return
@@ -653,10 +719,13 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			playbackMu.Lock()
 			ownsChannel := playbackChannel == channel
 			if ownsChannel {
+				playbackPlaying = false
 				playbackChannel = 0
 				playbackFile = nil
 				playbackElapsed = 0
-				playbackResumeElapsed = 0
+				playbackNextPacket = 0
+				playbackSequence = 0
+				playbackGeneration.Add(1)
 			}
 			playbackMu.Unlock()
 			if ownsChannel {
@@ -670,6 +739,8 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		if playbackCancel != nil {
 			playbackCancel()
 		}
+		playbackGeneration.Add(1)
+		playbackOutput.discard()
 		playbackMu.Unlock()
 	}()
 	for {
@@ -819,10 +890,17 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			duration := indexed.DurationMS()
 			playbackMu.Lock()
+			if playbackCancel != nil {
+				playbackCancel()
+			}
+			playbackGeneration.Add(1)
+			playbackOutput.discard()
 			playbackChannel = channelID
 			playbackFile = indexed
 			playbackElapsed = 0
-			playbackResumeElapsed = 0
+			playbackNextPacket = 0
+			playbackSequence = 0
+			playbackPlaying = true
 			playbackMu.Unlock()
 			s.telemetry.inc("opusrefweb_playback_total", "open", "success")
 			sendControl(map[string]any{"api_version": 1, "type": "playback_opened", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(channelID, 10), "recording_id": open.RecordingID, "duration_ms": duration, "status": recording.Status}})
@@ -842,8 +920,16 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			id, parseErr := parseChannelID(action.ChannelID)
 			playbackMu.Lock()
 			valid := parseErr == nil && id == playbackChannel
-			if valid && control.Type != "playback_resume" && playbackCancel != nil {
-				playbackCancel()
+			if valid && control.Type == "playback_resume" && playbackPlaying {
+				valid = false
+			}
+			if valid && control.Type != "playback_resume" {
+				if playbackCancel != nil {
+					playbackCancel()
+				}
+				playbackGeneration.Add(1)
+				playbackOutput.discard()
+				playbackPlaying = false
 			}
 			elapsed := 0
 			elapsed = int(playbackElapsed)
@@ -851,7 +937,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackChannel = 0
 				playbackFile = nil
 				playbackElapsed = 0
-				playbackResumeElapsed = 0
+				playbackNextPacket = 0
+				playbackSequence = 0
+			}
+			if valid && control.Type == "playback_resume" {
+				playbackPlaying = true
 			}
 			playbackMu.Unlock()
 			if !valid {
@@ -861,12 +951,14 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			if control.Type == "playback_close" {
 				releasePlaybackSlot()
 			}
+			state := map[string]string{"playback_pause": "paused", "playback_resume": "playing", "playback_close": "closed"}[control.Type]
+			s.telemetry.inc("opusrefweb_playback_total", strings.TrimPrefix(control.Type, "playback_"), "success")
+			if !sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": action.ChannelID, "state": state, "elapsed_ms": elapsed}}) {
+				return
+			}
 			if control.Type == "playback_resume" {
 				startPlayback()
 			}
-			state := map[string]string{"playback_pause": "paused", "playback_resume": "playing", "playback_close": "closed"}[control.Type]
-			s.telemetry.inc("opusrefweb_playback_total", strings.TrimPrefix(control.Type, "playback_"), "success")
-			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": action.ChannelID, "state": state, "elapsed_ms": elapsed}})
 		case "playback_seek":
 			if !privileged() {
 				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "Playback is not available."}})
@@ -887,15 +979,36 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				_ = conn.Close(4400, "invalid_request")
 				return
 			}
+			archivePlayback := playbackFile
+			playbackMu.Unlock()
+			cursor, cursorErr := archivePlayback.NewCursor(uint32(seek.ElapsedMS))
+			if cursorErr != nil {
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
+			packetIndex := cursor.Index()
+			_ = cursor.Close()
+			playbackMu.Lock()
+			if id != playbackChannel || archivePlayback != playbackFile {
+				playbackMu.Unlock()
+				_ = conn.Close(4400, "invalid_request")
+				return
+			}
 			if playbackCancel != nil {
 				playbackCancel()
 			}
+			playbackGeneration.Add(1)
+			playbackOutput.discard()
 			playbackElapsed = uint32(seek.ElapsedMS)
-			playbackResumeElapsed = uint32(seek.ElapsedMS)
+			playbackNextPacket = packetIndex
+			playbackSequence = 0
+			playbackPlaying = true
 			playbackMu.Unlock()
 			s.telemetry.inc("opusrefweb_playback_total", "seek", "success")
+			if !sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": seek.ChannelID, "state": "playing", "elapsed_ms": seek.ElapsedMS}}) {
+				return
+			}
 			startPlayback()
-			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": seek.ChannelID, "state": "playing", "elapsed_ms": seek.ElapsedMS}})
 		default:
 			sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "unsupported", "text": "The request type is not supported."}})
 		}
@@ -1128,7 +1241,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		if lookupErr == nil {
 			target = &user.ID
 		}
-		_ = s.store.WriteAudit(r.Context(), "login", "failure", nil, target, nil, "{}", time.Now())
+		targetID := ""
+		if target != nil {
+			targetID = *target
+		}
+		s.audit(r.Context(), "login", "failure", "", targetID, "")
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
@@ -1139,27 +1256,43 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, csrf, session, err := s.store.CreateSession(r.Context(), user.ID, time.Now(), s.cfg.SessionIdle, s.cfg.SessionAbsolute, s.cfg.MaxSessions)
 	if err != nil {
+		s.audit(r.Context(), "login", "failure", user.ID, user.ID, "")
 		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: raw, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: session.AbsoluteExpiry})
 	s.telemetry.inc("opusrefweb_auth_total", "password", "success")
-	_ = s.store.WriteAudit(r.Context(), "login", "success", &user.ID, &user.ID, nil, "{}", time.Now())
+	s.audit(r.Context(), "login", "success", user.ID, user.ID, "")
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": session.Role, "username": user.Username, "source_callsign": user.Callsign, "csrf_token": csrf, "forced_password_change": session.PasswordChangeRequired, "passkey_available": false})
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		outcome := "failure"
+		if succeeded {
+			outcome = "success"
+		}
+		s.audit(r.Context(), "logout", outcome, session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
 	}
 	cookie, _ := r.Cookie(CookieName)
-	_ = s.store.RevokeCurrentSession(r.Context(), cookie.Value, time.Now())
+	if err := s.store.RevokeCurrentSession(r.Context(), cookie.Value, time.Now()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "logout_failed")
+		return
+	}
 	s.revokeSessionSocket(session.ID)
-	s.audit(r.Context(), "logout", "success", session.UserID, session.UserID, "")
+	succeeded = true
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	writeJSON(w, http.StatusOK, map[string]any{"logged_out": true})
 }
 func (s *Server) reauthPassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "reauth_password", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
@@ -1187,9 +1320,13 @@ func (s *Server) reauthPassword(w http.ResponseWriter, r *http.Request, session 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reauth_token": raw, "expires_in_seconds": 300})
-	s.audit(r.Context(), "reauth_password", "success", session.UserID, session.UserID, "")
+	succeeded = true
 }
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "password_change", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
@@ -1222,7 +1359,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request, session 
 	s.revokeSockets(func(active socketRevocation) bool {
 		return active.userID == session.UserID && active.sessionID != session.ID
 	})
-	s.audit(r.Context(), "password_change", "success", session.UserID, session.UserID, "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"changed": true})
 }
 func (s *Server) listSessions(w http.ResponseWriter, r *http.Request, session store.Session) {
@@ -1234,6 +1371,10 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request, session st
 	writeJSON(w, http.StatusOK, page(items))
 }
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "session_revoke", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
@@ -1247,7 +1388,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, session s
 		return
 	}
 	s.revokeSessionSocket(r.PathValue("id"))
-	s.audit(r.Context(), "session_revoke", "success", session.UserID, session.UserID, "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 }
 func (s *Server) passkeysUnavailable(w http.ResponseWriter, r *http.Request, session store.Session) {
@@ -1267,7 +1408,7 @@ func (s *Server) passkeyLoginOptions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
 		return
 	}
-	if !s.limiter.Allow("passkey_options", s.clientAddress(r), 10, time.Minute, time.Now()) {
+	if !s.allowPasskeyAttempt(r, "") {
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -1291,7 +1432,7 @@ func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
 		return
 	}
-	if !s.limiter.Allow("passkey_verify", s.clientAddress(r), 10, time.Minute, time.Now()) {
+	if !s.allowPasskeyAttempt(r, "") {
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -1333,11 +1474,13 @@ func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.FindUserByID(r.Context(), userID)
 	if err != nil || user.Disabled {
+		s.audit(r.Context(), "passkey_login", "failure", userID, userID, "")
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
 	raw, csrf, session, err := s.store.CreateSession(r.Context(), user.ID, time.Now(), s.cfg.SessionIdle, s.cfg.SessionAbsolute, s.cfg.MaxSessions)
 	if err != nil {
+		s.audit(r.Context(), "passkey_login", "failure", user.ID, user.ID, "")
 		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
 		return
 	}
@@ -1353,6 +1496,10 @@ func (s *Server) passkeyEnrollOptions(w http.ResponseWriter, r *http.Request, se
 	}
 	if s.cfg.Passkeys == nil {
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	if !s.allowPasskeyAttempt(r, session.UserID) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
@@ -1379,7 +1526,7 @@ func (s *Server) passkeyReauthOptions(w http.ResponseWriter, r *http.Request, se
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
 		return
 	}
-	if !s.limiter.Allow("passkey_reauth", session.UserID, 10, time.Minute, time.Now()) {
+	if !s.allowPasskeyAttempt(r, session.UserID) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -1395,12 +1542,18 @@ func (s *Server) passkeyReauthOptions(w http.ResponseWriter, r *http.Request, se
 	writeJSON(w, http.StatusOK, passkeyOptionsResponse(id, options))
 }
 func (s *Server) passkeyReauthVerify(w http.ResponseWriter, r *http.Request, session store.Session) {
+	outcome := "failure"
+	defer func() { s.audit(r.Context(), "reauth_passkey", outcome, session.UserID, session.UserID, "") }()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
 	}
 	if s.cfg.Passkeys == nil {
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	if !s.allowPasskeyAttempt(r, session.UserID) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	var in struct {
@@ -1412,12 +1565,10 @@ func (s *Server) passkeyReauthVerify(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	if err := s.cfg.Passkeys.FinishReauth(r.Context(), in.CeremonyID, session.UserID, session.ID, in.Credential); err != nil {
-		outcome := "failure"
 		var failure *passkey.VerificationFailure
 		if errors.As(err, &failure) && failure.Regression {
 			outcome = "sign_counter_regression"
 		}
-		s.audit(r.Context(), "reauth_passkey", outcome, session.UserID, session.UserID, "")
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
@@ -1427,15 +1578,23 @@ func (s *Server) passkeyReauthVerify(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reauth_token": raw, "expires_in_seconds": 300})
-	s.audit(r.Context(), "reauth_passkey", "success", session.UserID, session.UserID, "")
+	outcome = "success"
 }
 func (s *Server) passkeyEnrollVerify(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "passkey_enroll", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
 	}
 	if s.cfg.Passkeys == nil {
 		writeError(w, http.StatusNotFound, "passkeys_unavailable")
+		return
+	}
+	if !s.allowPasskeyAttempt(r, session.UserID) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	var in struct {
@@ -1452,9 +1611,13 @@ func (s *Server) passkeyEnrollVerify(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"created": true})
-	s.audit(r.Context(), "passkey_enroll", "success", session.UserID, session.UserID, "")
+	succeeded = true
 }
 func (s *Server) renamePasskey(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "passkey_rename", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
@@ -1471,9 +1634,13 @@ func (s *Server) renamePasskey(w http.ResponseWriter, r *http.Request, session s
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
-	s.audit(r.Context(), "passkey_rename", "success", session.UserID, session.UserID, "")
+	succeeded = true
 }
 func (s *Server) deletePasskey(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "passkey_delete", successOutcome(succeeded), session.UserID, session.UserID, "")
+	}()
 	if !s.validCSRF(r, session) {
 		writeError(w, http.StatusForbidden, "csrf_rejected")
 		return
@@ -1487,7 +1654,7 @@ func (s *Server) deletePasskey(w http.ResponseWriter, r *http.Request, session s
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
-	s.audit(r.Context(), "passkey_delete", "success", session.UserID, session.UserID, "")
+	succeeded = true
 }
 func (s *Server) recordings(w http.ResponseWriter, r *http.Request, _ store.Session) {
 	query, err := recordingQuery(r)
@@ -1526,6 +1693,12 @@ func (s *Server) recording(w http.ResponseWriter, r *http.Request, _ store.Sessi
 	writeJSON(w, http.StatusOK, recordingResponse(item))
 }
 func (s *Server) deleteRecording(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			s.audit(r.Context(), "recording_delete", "failure", session.UserID, "", r.PathValue("id"))
+		}
+	}()
 	if !s.adminMutation(w, r, session) {
 		return
 	}
@@ -1537,6 +1710,8 @@ func (s *Server) deleteRecording(w http.ResponseWriter, r *http.Request, session
 		writeError(w, http.StatusServiceUnavailable, "recording_delete_failed")
 		return
 	}
+	succeeded = true
+	s.telemetry.inc("opusrefweb_audit_writes_total", "success")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request, _ store.Session) {
@@ -1607,12 +1782,11 @@ func (s *Server) adminEvents(w http.ResponseWriter, _ *http.Request, _ store.Ses
 	writeJSON(w, http.StatusOK, page(s.telemetry.recent()))
 }
 func (s *Server) clearAccountPasskeys(w http.ResponseWriter, r *http.Request, session store.Session) {
-	if !s.validCSRF(r, session) {
-		writeError(w, http.StatusForbidden, "csrf_rejected")
-		return
-	}
-	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
-		writeError(w, http.StatusForbidden, "reauth_required")
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "passkeys_clear", successOutcome(succeeded), session.UserID, r.PathValue("id"), "")
+	}()
+	if !s.adminMutation(w, r, session) {
 		return
 	}
 	if err := s.store.ClearPasskeysAndSessions(r.Context(), r.PathValue("id"), time.Now()); err != nil {
@@ -1620,7 +1794,7 @@ func (s *Server) clearAccountPasskeys(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 	s.revokeUserSockets(r.PathValue("id"))
-	s.audit(r.Context(), "passkeys_clear", "success", session.UserID, r.PathValue("id"), "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
 }
 func (s *Server) adminMutation(w http.ResponseWriter, r *http.Request, session store.Session) bool {
@@ -1639,6 +1813,10 @@ func (s *Server) adminMutation(w http.ResponseWriter, r *http.Request, session s
 	return true
 }
 func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "account_update", successOutcome(succeeded), session.UserID, r.PathValue("id"), "")
+	}()
 	if !s.adminMutation(w, r, session) {
 		return
 	}
@@ -1657,10 +1835,14 @@ func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request, session s
 		return
 	}
 	s.revokeUserSockets(r.PathValue("id"))
-	s.audit(r.Context(), "account_update", "success", session.UserID, r.PathValue("id"), "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 }
 func (s *Server) resetAccountPassword(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "password_reset", successOutcome(succeeded), session.UserID, r.PathValue("id"), "")
+	}()
 	if !s.adminMutation(w, r, session) {
 		return
 	}
@@ -1687,10 +1869,14 @@ func (s *Server) resetAccountPassword(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 	s.revokeUserSockets(target.ID)
-	s.audit(r.Context(), "password_reset", "success", session.UserID, target.ID, "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"reset": true})
 }
 func (s *Server) revokeAccountSessions(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "sessions_revoke", successOutcome(succeeded), session.UserID, r.PathValue("id"), "")
+	}()
 	if !s.adminMutation(w, r, session) {
 		return
 	}
@@ -1703,10 +1889,14 @@ func (s *Server) revokeAccountSessions(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	s.revokeUserSockets(r.PathValue("id"))
-	s.audit(r.Context(), "sessions_revoke", "success", session.UserID, r.PathValue("id"), "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 }
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
+	succeeded := false
+	defer func() {
+		s.audit(r.Context(), "account_delete", successOutcome(succeeded), session.UserID, r.PathValue("id"), "")
+	}()
 	if !s.adminMutation(w, r, session) {
 		return
 	}
@@ -1715,16 +1905,16 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, session s
 		return
 	}
 	s.revokeUserSockets(r.PathValue("id"))
-	s.audit(r.Context(), "account_delete", "success", session.UserID, r.PathValue("id"), "")
+	succeeded = true
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request, session store.Session) {
-	if !s.validCSRF(r, session) {
-		writeError(w, http.StatusForbidden, "csrf_rejected")
-		return
-	}
-	if err := s.store.ConsumeReauth(r.Context(), session.ID, r.Header.Get("X-Reauth-Token"), time.Now()); err != nil {
-		writeError(w, http.StatusForbidden, "reauth_required")
+	succeeded := false
+	targetID := ""
+	defer func() {
+		s.audit(r.Context(), "account_create", successOutcome(succeeded), session.UserID, targetID, "")
+	}()
+	if !s.adminMutation(w, r, session) {
 		return
 	}
 	var in struct {
@@ -1756,8 +1946,9 @@ func (s *Server) createAccount(w http.ResponseWriter, r *http.Request, session s
 		writeError(w, http.StatusConflict, "account_conflict")
 		return
 	}
+	targetID = user.ID
+	succeeded = true
 	writeJSON(w, http.StatusCreated, map[string]any{"id": user.ID})
-	s.audit(r.Context(), "account_create", "success", session.UserID, user.ID, "")
 }
 func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request, store.Session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1818,6 +2009,19 @@ func (s *Server) clientAddress(r *http.Request) string {
 		}
 	}
 	return host
+}
+
+func (s *Server) allowPasskeyAttempt(r *http.Request, userID string) bool {
+	now := time.Now()
+	if !s.limiter.Allow("passkey_ip", s.clientAddress(r), 10, time.Minute, now) {
+		s.telemetry.event("rate_limit", "warning", "A passkey source rate limit was reached.")
+		return false
+	}
+	if userID != "" && !s.limiter.Allow("passkey_account", userID, 10, time.Minute, now) {
+		s.telemetry.event("rate_limit", "warning", "A passkey account rate limit was reached.")
+		return false
+	}
+	return true
 }
 func (s *Server) isTrustedProxy(ip net.IP) bool {
 	for _, network := range s.trustedProxies {
@@ -1888,6 +2092,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"api_version": 1, "data": value})
 }
 func page(items any) map[string]any { return map[string]any{"items": items} }
+
+func successOutcome(success bool) string {
+	if success {
+		return "success"
+	}
+	return "failure"
+}
 
 func passkeyOptionsResponse(ceremonyID string, options any) map[string]any {
 	encoded, err := json.Marshal(options)
@@ -2050,5 +2261,5 @@ func recordingResponse(item store.Recording) map[string]any {
 	if item.EndedAt != nil {
 		duration = item.EndedAt.Sub(item.StartedAt).Milliseconds()
 	}
-	return map[string]any{"id": item.ID, "source_callsign": item.SourceCallsign, "node_callsign": item.NodeCallsign, "started_at": item.StartedAt, "duration_ms": duration, "status": item.Status, "end_reason": item.EndReason, "packet_count": item.PacketCount, "byte_size": item.ByteSize}
+	return map[string]any{"id": item.ID, "source_callsign": item.SourceCallsign, "node_callsign": item.NodeCallsign, "started_at": item.StartedAt, "duration_ms": duration, "status": item.Status, "end_reason": item.EndReason, "packet_count": item.PacketCount, "byte_size": item.ByteSize, "first_sequence": item.FirstSequence, "last_sequence": item.LastSequence, "first_timestamp": item.FirstTimestamp, "last_timestamp": item.LastTimestamp}
 }

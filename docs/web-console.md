@@ -94,6 +94,18 @@ and announces a discontinuity with a new channel. A full playback queue pauses
 playback for an explicit resume or seek. A full control queue closes the socket
 with code 4409. One slow browser cannot block the reflector clients.
 
+Each playback queue item has a server generation. Pause, seek, close, and
+session revocation retire the current generation and discard its queued media.
+The writer rejects retired media that it already removed from the queue. A
+pause or seek result is a media barrier. Resume keeps the sequence of the same
+channel. Seek starts a new sequence at zero.
+
+Authentication limits use bounded in-memory token buckets. Passkey begin and
+finish operations share source and account buckets. Administrator mutations
+share one administrator-session bucket. Limiter state expires after 30 minutes.
+Audit records use fixed action and outcome values. Audit details do not contain
+submitted credentials, tokens, addresses, or media.
+
 ## Passkey flow
 
 ```mermaid
@@ -144,13 +156,19 @@ all earlier media before it finalizes the file. A sequence gap, a synthetic end,
 an unknown prefix, or archive backpressure makes the recording `partial`.
 
 Recording IDs are canonical UUID strings. File access stays in the configured
-archive directory. Playback indexes at most 4,096 packets and 1 MiB of index
-data. The default playback duration limit is 15 minutes. Deletion uses the
-database `deleting` state and a `.deleting` file. Startup
+archive directory. Playback uses a bounded sparse index and reads packets on
+demand. It does not reject a recording because the recording has many packets.
+Deletion uses the database `deleting` state and a `.deleting` file. Startup
 completes an interrupted deletion. Retention removes expired recordings first.
 Quota-full mode stops new archive writes and keeps retained recordings. The
 service stays ready and reports degraded recording state. Retention cleanup is
 the only automatic operation that deletes recordings.
+
+Finalization stores the first and last sequence and timestamp in the same
+database update as the final status. Startup recovery reconstructs these
+values. Quota refusal and recovery anomalies raise fixed metrics and bounded
+operator events. The service replays startup anomalies after it attaches the
+observer.
 
 ## API pagination
 

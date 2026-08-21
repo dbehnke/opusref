@@ -24,3 +24,17 @@ func TestOperatorEventsAreBoundedAndMetricsUseFixedLabels(t *testing.T) {
 		t.Fatalf("metric output is not fixed-label/redacted:\n%s", output)
 	}
 }
+
+func TestArchiveQuotaAndRecoveryObserversRaiseBoundedAlerts(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	server.RecordArchive("quota", "full")
+	server.RecordArchive("recover", "failure")
+	if server.telemetry.value("opusrefweb_archive_alerts_total", "full") != 1 || server.telemetry.value("opusrefweb_archive_alerts_total", "recovery") != 1 {
+		t.Fatal("archive alert metrics were not incremented")
+	}
+	events := server.telemetry.recent()
+	if len(events) < 3 || events[0].Kind != "archive_failure" {
+		t.Fatalf("operator alerts=%+v", events)
+	}
+}

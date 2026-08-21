@@ -289,3 +289,24 @@ func TestReauthenticationProofIsOneUseAndSessionBound(t *testing.T) {
 		t.Fatalf("replay returned %v", err)
 	}
 }
+
+func TestAdminRecoveryIsAuditedInItsTransaction(t *testing.T) {
+	ctx := context.Background()
+	state, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	hash, _ := auth.HashPassword("quiet marble nebula orchard", auth.DefaultParams())
+	user, err := state.CreateUser(ctx, CreateUser{Username: "recoverme", Role: RoleUser, PasswordHash: hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = state.RecoverAdmin(ctx, user.Username, hash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	events, err := state.ListAudit(ctx, 10)
+	if err != nil || len(events) != 1 || events[0].Action != "admin_recovery" || events[0].Outcome != "success" || events[0].Details != "{}" {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
