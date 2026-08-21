@@ -183,7 +183,7 @@ func TestOwnerControlOverloadNotifiesListeners(t *testing.T) {
 	r.engine.AddSession(2, listenerAddr.String(), "N0TWO", true)
 	r.engine.RequestFloor(1, 7, "N0ONE")
 	r.peers[1] = &peer{id: 1, address: ownerAddr, ready: true}
-	r.peers[2] = &peer{id: 2, address: listenerAddr, ready: true, notified: true}
+	r.peers[2] = &peer{id: 2, address: listenerAddr, ready: true, notified: true, notifiedFor: streamIdentity{owner: 1, stream: 7}}
 	r.controlOverload(r.peers[1])
 	found := false
 	for key := range r.pending {
@@ -366,6 +366,55 @@ func TestInjectedClockControlsChallengeRetentionAndNotificationRetry(t *testing.
 	r.tick(false)
 	if len(r.challenges) != 0 || len(r.transactions) != 0 {
 		t.Fatal("retention ignored injected clock")
+	}
+}
+
+func TestLateRevokeAcknowledgementDoesNotDisableNewStream(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r, err := NewReflector(conn, ReflectorOptions{ID: "OPUSREF", DisplayName: "Test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &peer{id: 3, address: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 3}, ready: true}
+	r.peers[1] = &peer{id: 1, address: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, node: "N0OLD", ready: true}
+	r.peers[2] = &peer{id: 2, address: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2}, node: "N0NEW", ready: true}
+	r.peers[3] = listener
+
+	r.notifyStart(listener, FloorSnapshot{Active: true, SessionID: 1, StreamID: 10, SourceCallsign: "N0OLD"})
+	r.notifyEnd(&StreamEnd{SessionID: 1, StreamID: 10, Reason: EndGrantTimeout})
+	var oldRevoke wire.Packet
+	for key, pending := range r.pending {
+		if key.listener == listener.id && key.typ == wire.PacketStreamRevoke {
+			oldRevoke = pending.packet
+		}
+	}
+	if oldRevoke.Header.Type != wire.PacketStreamRevoke {
+		t.Fatal("old revoke notification was not queued")
+	}
+
+	r.notifyStart(listener, FloorSnapshot{Active: true, SessionID: 2, StreamID: 20, SourceCallsign: "N0NEW"})
+	var newStart wire.Packet
+	for key, pending := range r.pending {
+		if key.listener == listener.id && key.typ == wire.PacketStreamStart {
+			newStart = pending.packet
+		}
+	}
+	ackFor := func(packet wire.Packet) wire.Packet {
+		tx, _ := wire.Find(packet, wire.TLVTransactionID)
+		return wire.Packet{Header: wire.Header{Version: 1, Type: packet.Header.Type, Flags: wire.FlagResponse, SessionID: listener.id, StreamID: packet.Header.StreamID, Sequence: packet.Header.Sequence, Timestamp: packet.Header.Timestamp}, Extensions: []wire.TLV{{Type: wire.TLVTransactionID, Value: tx}}}
+	}
+	if !r.ack(listener, ackFor(newStart)) {
+		t.Fatal("new start acknowledgement was rejected")
+	}
+	if !r.ack(listener, ackFor(oldRevoke)) {
+		t.Fatal("late old revoke acknowledgement was rejected")
+	}
+	if !listener.notified || !listener.receiving {
+		t.Fatal("late old revoke acknowledgement disabled the new stream")
 	}
 }
 
@@ -552,7 +601,7 @@ func TestQueueDropEventsClassifyMediaAndControl(t *testing.T) {
 	r.engine.AddSession(2, listener.String(), "N0TWO", true)
 	r.engine.RequestFloor(1, 7, "N0ONE")
 	r.peers[1] = &peer{id: 1, address: addr, node: "N0ONE", ready: true}
-	r.peers[2] = &peer{id: 2, address: listener, node: "N0TWO", ready: true, receiving: true}
+	r.peers[2] = &peer{id: 2, address: listener, node: "N0TWO", ready: true, receiving: true, receivingFor: streamIdentity{owner: 1, stream: 7}}
 	for len(r.transport.Media) < cap(r.transport.Media) {
 		r.transport.Media <- transport.MediaBatch{Kind: transport.MediaAudio}
 	}

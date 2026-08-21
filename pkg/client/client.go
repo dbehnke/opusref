@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"errors"
+	"github.com/dbehnke/opusref/pkg/wire"
 	"sync"
 	"time"
 )
@@ -40,6 +41,7 @@ const (
 	EventBusy
 	EventStatus
 	EventProtocolError
+	EventStreamGranted
 )
 
 type Event struct {
@@ -51,6 +53,8 @@ type Event struct {
 	Payload                       []byte
 	ProtocolErrorCode             uint16
 	Message                       string
+	EndReason                     wire.EndReason
+	Synthetic                     bool
 }
 type Options struct {
 	ServerAddress, NodeCallsign, SharedKey                                                     string
@@ -121,6 +125,15 @@ type Client interface {
 	Close() error
 }
 
+// GrantIdentity reports the reflector identity confirmed by the most recent
+// successful RequestStream call. It lets compositions correlate the grant
+// without racing the asynchronous event channel.
+type GrantIdentity interface {
+	ConfirmedGrant() (sessionID uint64, streamID uint32, ok bool)
+}
+
+type sessionIdentifier interface{ sessionID() uint64 }
+
 // QueueClient applies queue and ownership rules around an injected sender.
 type QueueClient struct {
 	mu                                    sync.Mutex
@@ -181,6 +194,17 @@ func (c *QueueClient) Connect(ctx context.Context) error {
 }
 func (c *QueueClient) RequestStream(ctx context.Context, source string) error {
 	return c.requestStream(ctx, source)
+}
+
+func (c *QueueClient) ConfirmedGrant() (uint64, uint32, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	provider, ok := c.sender.(sessionIdentifier)
+	if !ok || !c.stream {
+		return 0, 0, false
+	}
+	session := provider.sessionID()
+	return session, c.streamID, session != 0 && c.streamID != 0
 }
 func (c *QueueClient) requestStream(ctx context.Context, source string) error {
 	c.mu.Lock()

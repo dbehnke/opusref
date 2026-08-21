@@ -52,6 +52,8 @@ type remoteKey struct {
 	stream uint32
 }
 
+func (s *udpSender) sessionID() uint64 { return s.session }
+
 func (s *udpSender) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
 		return s.conn.Close()
@@ -127,6 +129,9 @@ func (s *udpSender) RequestFloor(ctx context.Context, out Outbound) error {
 	if reply.Header.Type == wire.PacketStreamBusy {
 		_ = s.owner.Publish(Event{Kind: EventBusy, SessionID: reply.Header.SessionID, StreamID: reply.Header.StreamID, Message: "reflector floor is busy"})
 		return ErrBusy
+	}
+	if err := s.owner.Publish(Event{Kind: EventStreamGranted, SessionID: s.session, StreamID: out.StreamID, SourceCallsign: out.SourceCallsign}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -435,6 +440,9 @@ func (s *udpSender) processLoop() {
 				s.remote = remoteStream{}
 			}
 			event.Kind = EventStreamEnd
+			if raw, ok := wire.Find(p, wire.TLVEndReason); ok {
+				event.EndReason = wire.EndReason(binary.BigEndian.Uint16(raw))
+			}
 		case wire.PacketDisconnect:
 			s.ack(p)
 			go s.owner.remoteClose()
@@ -471,7 +479,7 @@ func (s *udpSender) expireRemote(now time.Time) {
 	s.retireLocked(remoteKey{expired.owner, expired.stream})
 	s.remote = remoteStream{}
 	s.remoteMu.Unlock()
-	_ = s.owner.Publish(Event{Kind: EventStreamEnd, SessionID: expired.owner, StreamID: expired.stream, Message: "receive state expired"})
+	_ = s.owner.Publish(Event{Kind: EventStreamEnd, SessionID: expired.owner, StreamID: expired.stream, Message: "receive state expired", Synthetic: true})
 }
 func (s *udpSender) isRetiredLocked(key remoteKey) bool {
 	for index := 0; index < s.retiredCount; index++ {

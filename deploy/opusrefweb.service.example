@@ -1,0 +1,17 @@
+[Unit]
+Description=OpusRef web companion
+After=network-online.target opusrefd.service
+
+[Service]
+Type=simple
+User=opusref
+Group=opusref
+ExecStart=/usr/local/bin/opusrefweb serve --config /etc/opusref/opusrefweb.yaml
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opusrefweb
+
+[Install]
+WantedBy=multi-user.target

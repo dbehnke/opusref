@@ -3,14 +3,18 @@
 ## Current maturity
 
 OpusRef includes the v1 protocol, UDP reflector, raw-frame client, diagnostic
-commands, monitoring surface, and interoperability tests. Do not describe it as
-an audio application. It does not capture, play, encode, or decode audio.
+commands, optional web companion, monitoring surfaces, archives, and tests.
+Keep the product boundaries clear. `opusrefd` moves opaque packets and does not
+process audio. The Go web companion stores and forwards opaque Opus packets.
+Browser code can use WebCodecs to capture, encode, decode, and play audio.
 
 ## Normative documents
 
 - `docs/protocol-v1.md` defines the wire protocol.
 - `docs/architecture.md` defines server and client boundaries.
 - `docs/monitoring.md` defines monitoring behavior and metric names.
+- `docs/web-console.md` defines the web companion and browser boundaries.
+- `docs/release-qualification.md` defines the production qualification gates.
 
 When code and a normative document disagree, stop and resolve the discrepancy.
 Do not silently change the protocol in code.
@@ -18,7 +22,9 @@ Do not silently change the protocol in code.
 ## Engineering rules
 
 1. The reflector moves opaque media. It must never encode, decode, transcode,
-   record, or inspect Opus payloads.
+   record, or inspect Opus payloads. The Go web companion must keep Opus
+   payloads opaque. It can store them in the specified archive format. Browser
+   code owns capture, WebCodecs, playout, and the audio user interface.
 2. Keep the single-channel, first-talker-wins, half-duplex model unless the
    operator approves a protocol version change.
 3. Use TDD for all production behavior. Write a failing test before production
@@ -38,5 +44,7 @@ Do not silently change the protocol in code.
 8. Do not put callsigns, reflector IDs, stream IDs, session IDs, IP addresses,
    or data type IDs in Prometheus labels.
 9. Never log or return a shared key or HMAC input containing the key.
-10. Update all three normative documents and golden vectors in the same change
-   when wire behavior changes.
+10. Update each applicable normative document and the golden vectors in the
+    same change when wire behavior changes.
+11. Run the Go, web build, browser, and reverse-proxy gates for web companion
+    changes. Keep `web/dist` reproducible.

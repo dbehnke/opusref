@@ -87,7 +87,12 @@ type peer struct {
 	address                    net.Addr
 	node                       string
 	ready, notified, receiving bool
+	notifiedFor, receivingFor  streamIdentity
 	connected, last            time.Time
+}
+type streamIdentity struct {
+	owner  uint64
+	stream uint32
 }
 type completed struct {
 	fingerprint, response []byte
@@ -449,7 +454,7 @@ func (r *Reflector) transact(addr net.Addr, p wire.Packet, apply func() wire.Pac
 		return false
 	} else if p.Header.Type == wire.PacketKeepalive && p.Header.SessionID != 0 {
 		if peer := r.peers[p.Header.SessionID]; peer != nil {
-			if floor := r.engine.Snapshot().Floor; floor.Active && floor.SessionID != peer.id && !peer.notified {
+			if floor := r.engine.Snapshot().Floor; floor.Active && floor.SessionID != peer.id && peer.notifiedFor != (streamIdentity{owner: floor.SessionID, stream: floor.StreamID}) {
 				r.notifyStart(peer, floor)
 			}
 		}
@@ -548,7 +553,7 @@ func (r *Reflector) authenticate(addr net.Addr, p wire.Packet) wire.Packet {
 			r.metric("opusref_authentication_total", map[string]string{"result": "accepted", "mode": mode}, 1)
 			r.event("client_connected", "info", map[string]any{"session_id": sid, "node_callsign": c.node})
 			now := r.options.Clock()
-			r.peers[sid] = &peer{sid, addr, c.node, false, false, false, now, now}
+			r.peers[sid] = &peer{id: sid, address: addr, node: c.node, connected: now, last: now}
 			delete(r.challenges, key)
 			id, _ := wire.ReflectorID(r.options.ID)
 			return wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketWelcome, Flags: wire.FlagResponse, SessionID: sid}, Extensions: []wire.TLV{{Type: wire.TLVTransactionID, Value: tx}, {Type: wire.TLVReflectorID, Value: id}, {Type: wire.TLVDisplayName, Value: []byte(r.options.DisplayName)}}}
@@ -628,7 +633,9 @@ func (r *Reflector) notifyStart(listener *peer, floor FloorSnapshot) {
 	node, _ := wire.Callsign(owner.node)
 	source, _ := wire.Callsign(floor.SourceCallsign)
 	packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamStart, SessionID: floor.SessionID, StreamID: floor.StreamID}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, r.transactionID()), {Type: wire.TLVNodeCallsign, Value: node}, {Type: wire.TLVSourceCallsign, Value: source}, wire.Uint32TLV(wire.TLVTransmitTimeLimit, uint32(r.engine.limits.TransmitTimeLimit/time.Second))}}
+	identity := streamIdentity{owner: floor.SessionID, stream: floor.StreamID}
 	listener.notified = true
+	listener.notifiedFor = identity
 	r.startNotification(listener, packet)
 }
 func (r *Reflector) notifyEnd(end *StreamEnd) {
@@ -651,11 +658,15 @@ func (r *Reflector) notifyEnd(end *StreamEnd) {
 		if listener.id == end.SessionID && end.Reason == EndNormal {
 			continue
 		}
-		if listener.id != end.SessionID && !listener.notified {
+		identity := streamIdentity{owner: end.SessionID, stream: end.StreamID}
+		if listener.id != end.SessionID && listener.notifiedFor != identity {
 			continue
 		}
 		packet := wire.Packet{Header: wire.Header{Version: 1, Type: wire.PacketStreamRevoke, SessionID: end.SessionID, StreamID: end.StreamID, Sequence: end.Sequence, Timestamp: end.Timestamp}, Extensions: []wire.TLV{wire.Uint64TLV(wire.TLVTransactionID, r.transactionID()), wire.Uint16TLV(wire.TLVEndReason, endReason(end.Reason))}}
-		listener.receiving = false
+		if listener.receivingFor == identity {
+			listener.receiving = false
+			listener.receivingFor = streamIdentity{}
+		}
 		r.startNotification(listener, packet)
 	}
 }
@@ -699,6 +710,7 @@ func (r *Reflector) startNotification(listener *peer, p wire.Packet) {
 	r.pending[key] = &notification{p, 1, r.options.Clock().Add(500 * time.Millisecond)}
 	if p.Header.Type == wire.PacketStreamStart {
 		listener.receiving = true
+		listener.receivingFor = streamIdentity{owner: p.Header.SessionID, stream: p.Header.StreamID}
 	}
 	r.sendControl(listener.address, p)
 }
@@ -714,10 +726,21 @@ func (r *Reflector) ack(peer *peer, p wire.Packet) bool {
 	}
 	delete(r.pending, key)
 	if p.Header.Type == wire.PacketStreamStart {
-		peer.receiving = true
+		identity := streamIdentity{owner: n.packet.Header.SessionID, stream: n.packet.Header.StreamID}
+		if peer.notifiedFor == identity {
+			peer.receiving = true
+			peer.receivingFor = identity
+		}
 	} else if p.Header.Type == wire.PacketStreamRevoke {
-		peer.notified = false
-		peer.receiving = false
+		identity := streamIdentity{owner: n.packet.Header.SessionID, stream: n.packet.Header.StreamID}
+		if peer.notifiedFor == identity {
+			peer.notified = false
+			peer.notifiedFor = streamIdentity{}
+		}
+		if peer.receivingFor == identity {
+			peer.receiving = false
+			peer.receivingFor = streamIdentity{}
+		}
 	} else if p.Header.Type == wire.PacketDisconnect {
 		r.disconnectPeer(peer, "server_shutdown")
 	}
@@ -735,7 +758,8 @@ func (r *Reflector) media(owner *peer, p wire.Packet, raw []byte) bool {
 	}
 	recipients := make([]net.Addr, 0, len(effects))
 	for _, effect := range effects {
-		if listener := r.peers[effect.SessionID]; listener != nil && listener.receiving {
+		identity := streamIdentity{owner: owner.id, stream: p.Header.StreamID}
+		if listener := r.peers[effect.SessionID]; listener != nil && listener.receivingFor == identity {
 			recipients = append(recipients, listener.address)
 		}
 	}
@@ -799,7 +823,11 @@ func (r *Reflector) tick(draining bool) {
 			delete(r.pending, key)
 			if key.typ == wire.PacketStreamStart {
 				if p := r.peers[key.listener]; p != nil {
-					p.receiving = false
+					identity := streamIdentity{owner: n.packet.Header.SessionID, stream: n.packet.Header.StreamID}
+					if p.receivingFor == identity {
+						p.receiving = false
+						p.receivingFor = streamIdentity{}
+					}
 				}
 			}
 			continue

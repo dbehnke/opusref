@@ -1,5 +1,12 @@
 # OpusRef Monitoring Specification
 
+`opusrefweb` uses a separate loopback operator listener. Its public listener
+serves sanitized status and probes, but it does not serve `/metrics`. The
+operator listener serves probes and fixed-cardinality `opusrefweb_` metrics.
+Do not publish the operator listener through the public reverse proxy. Web
+metrics must not use callsigns, usernames, network addresses, tokens, paths, or
+identifiers as labels.
+
 ## 1. Access and data lifetime
 
 The monitoring server binds to `127.0.0.1:8080` by default. Version 1 does not
@@ -115,6 +122,21 @@ Packet error reasons are `malformed`, `unsupported_version`, `invalid_session`,
 are `granted`, `busy`, `rejected`, and `overloaded`. Stream-end reasons and
 timeout kinds use the values that the protocol specification defines. Packet
 type labels use the lowercase names in the packet-type registry.
+
+`opusrefweb` exports a separate fixed-cardinality set. It uses the
+`opusrefweb_` prefix. The set includes process readiness, WebSocket connections,
+enabled accounts, active sessions, retained recordings, archive bytes, archive
+quota bytes, and authentication failures. These metrics have no labels. The
+public listener does not serve them.
+
+`opusrefweb_archive_alerts_total` uses only the fixed `full`, `clear`,
+`recovery`, and `recovery_overflow` kinds. The startup recovery buffer retains
+up to 255 anomaly alerts and one overflow alert. The complete startup alert
+buffer has a capacity of 256. A quota transition can replace one anomaly alert
+when the buffer is full. The overflow alert remains in the buffer. The companion
+puts quota transitions and recovery anomalies in its bounded administrator
+event list. It does not put a recording ID or file path in a metric label or
+operator message.
 
 ## 5. Snapshot design
 

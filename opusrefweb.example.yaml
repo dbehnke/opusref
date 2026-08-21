@@ -1,0 +1,54 @@
+web:
+  http_listen: "127.0.0.1:8090"
+  monitor_listen: "127.0.0.1:8091"
+  public_origin: "https://opusref.example.org"
+  open_access: true
+  trusted_proxy_cidrs: ["127.0.0.0/8", "::1/128"]
+reflector:
+  udp_address: "127.0.0.1:46000"
+  monitoring_url: "http://127.0.0.1:8080"
+  node_callsign: "WEB"
+  monitor_poll_interval: "1s"
+  monitor_stale_after: "3s"
+  reconnect_initial: "500ms"
+  reconnect_max: "30s"
+  shared_key_env: "OPUSREF_SHARED_KEY"
+  shared_key_file: ""
+storage:
+  sqlite_path: "/var/lib/opusrefweb/opusrefweb.db"
+  archive_directory: "/var/lib/opusrefweb/recordings"
+  retention: "24h"
+  hard_quota_bytes: 10737418240
+  purge_interval: "1m"
+  audit_retention: "720h"
+authentication:
+  session_idle: "12h"
+  session_absolute: "168h"
+  max_sessions_per_account: 3
+  argon2_memory_kib: 65536
+  argon2_iterations: 3
+  argon2_parallelism: 4
+  max_concurrent_hashes: 2
+  # Optional additive UTF-8 blocklist. A pinned SecLists 10k corpus is embedded.
+  password_blocklist_file: ""
+webauthn:
+  rp_id: "opusref.example.org"
+  rp_name: "OpusRef"
+  origins: ["https://opusref.example.org"]
+limits:
+  max_websockets: 250
+  max_websockets_per_session: 3
+  live_queue_packets: 64
+  live_queue_bytes: 131072
+  playback_queue_packets: 64
+  playback_queue_bytes: 131072
+  transmit_queue_packets: 64
+  control_queue_messages: 32
+  archive_queue_packets: 512
+  archive_queue_bytes: 1048576
+  max_playbacks: 50
+  # Compatibility setting. Version 1 does not reject retained archives by duration.
+  playback_max_duration: 15m
+logging:
+  level: "info"
+  format: "json"
