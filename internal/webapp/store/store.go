@@ -217,12 +217,15 @@ func (s *Store) CreateSession(ctx context.Context, userID string, now time.Time,
 	return raw, csrf, session, err
 }
 func (s *Store) AuthenticateSession(ctx context.Context, raw string, now time.Time) (Session, error) {
+	return s.AuthenticateSessionWithIdle(ctx, raw, now, 12*time.Hour)
+}
+func (s *Store) AuthenticateSessionWithIdle(ctx context.Context, raw string, now time.Time, idle time.Duration) (Session, error) {
 	decoded, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil || len(decoded) != 32 {
 		return Session{}, ErrUnauthorized
 	}
 	hash := sha256.Sum256(decoded)
-	return s.authenticateHash(ctx, hash[:], now, 12*time.Hour)
+	return s.authenticateHash(ctx, hash[:], now, idle)
 }
 func (s *Store) authenticateHash(ctx context.Context, hash []byte, now time.Time, idle time.Duration) (Session, error) {
 	var out Session

@@ -38,6 +38,7 @@ type Server struct {
 	ready                atomic.Bool
 	public, monitor      http.Handler
 	hashSlots, hashQueue chan struct{}
+	dummyPasswordHash    string
 }
 
 func New(cfg Config, state *store.Store) *Server {
@@ -45,7 +46,8 @@ func New(cfg Config, state *store.Store) *Server {
 	if concurrent <= 0 {
 		concurrent = 2
 	}
-	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16)}
+	dummy, _ := auth.HashPassword("dummy authentication workload", cfg.Argon2)
+	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16), dummyPasswordHash: dummy}
 	s.ready.Store(true)
 	s.public = s.security(s.publicMux())
 	s.monitor = s.security(s.monitorMux())
@@ -337,11 +339,6 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	user, err := s.store.FindUserByUsername(r.Context(), in.Username)
-	if err != nil || user.Disabled {
-		writeError(w, http.StatusUnauthorized, "authentication_failed")
-		return
-	}
 	select {
 	case s.hashQueue <- struct{}{}:
 		defer func() { <-s.hashQueue }()
@@ -355,8 +352,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done():
 		return
 	}
-	ok, _, err := auth.VerifyPassword(in.Password, user.PasswordHash, s.cfg.Argon2)
-	if err != nil || !ok {
+	user, lookupErr := s.store.FindUserByUsername(r.Context(), in.Username)
+	hash := s.dummyPasswordHash
+	if lookupErr == nil && !user.Disabled {
+		hash = user.PasswordHash
+	}
+	ok, _, err := auth.VerifyPassword(in.Password, hash, s.cfg.Argon2)
+	if err != nil || !ok || lookupErr != nil || user.Disabled {
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
@@ -393,7 +395,7 @@ func (s *Server) requestSession(r *http.Request) (store.Session, error) {
 	if err != nil {
 		return store.Session{}, store.ErrUnauthorized
 	}
-	return s.store.AuthenticateSession(r.Context(), cookie.Value, time.Now())
+	return s.store.AuthenticateSessionWithIdle(r.Context(), cookie.Value, time.Now(), s.cfg.SessionIdle)
 }
 func (s *Server) validCSRF(r *http.Request, session store.Session) bool {
 	return s.sameOrigin(r) && s.store.VerifyCSRF(r.Context(), session.ID, r.Header.Get("X-CSRF-Token"))
