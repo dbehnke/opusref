@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"errors"
+	"github.com/dbehnke/opusref/pkg/wire"
 	"sync"
 	"time"
 )
@@ -40,6 +41,7 @@ const (
 	EventBusy
 	EventStatus
 	EventProtocolError
+	EventStreamGranted
 )
 
 type Event struct {
@@ -51,6 +53,8 @@ type Event struct {
 	Payload                       []byte
 	ProtocolErrorCode             uint16
 	Message                       string
+	EndReason                     wire.EndReason
+	Synthetic                     bool
 }
 type Options struct {
 	ServerAddress, NodeCallsign, SharedKey                                                     string

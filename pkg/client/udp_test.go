@@ -44,6 +44,14 @@ func TestUDPClientsExchangeOpaqueFrame(t *testing.T) {
 	if err = owner.RequestStream(ctx, "N0ONE"); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case event := <-owner.Events():
+		if event.Kind != client.EventStreamGranted || event.SessionID == 0 || event.StreamID == 0 || event.SourceCallsign != "N0ONE" {
+			t.Fatalf("bad grant event %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("grant event was not published before RequestStream returned")
+	}
 	time.Sleep(20 * time.Millisecond)
 	payload := []byte{0xf8, 0xff, 0xfe}
 	if err = owner.SendAudio(ctx, 48000, payload); err != nil {
