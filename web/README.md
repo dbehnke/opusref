@@ -50,6 +50,22 @@ Audio requires raw Opus support, a 48 kHz `AudioContext`, `AudioWorklet`, and
 WebCodecs audio encoder and decoder support. The UI keeps monitoring and account
 functions available when the capability test fails.
 
+The worker tests the complete encoder configuration before it starts audio. A
+Chromium browser test runs the production worker. It encodes three packets, checks
+sequence and timestamp values, checks the payload limits, and decodes the packets.
+The test does not qualify a release on Safari or an Android device.
+
+The browser closes privileged media when the page becomes hidden. It also closes
+privileged media for every `pagehide` event. If a session becomes invalid in open
+access mode, the browser stops PTT and playback. It keeps anonymous live listening
+available. If the WebSocket closes, the UI requires the user to select Listen live
+again. It does not restart audio without a user action.
+
+Playwright uses a loopback WebSocket server to test control messages, ORWB media,
+playback, close handling, and anonymous downgrade. This is not the production TLS
+proxy test. The system release gate must test HTTPS and WSS through the configured
+reverse proxy.
+
 ## Production assets
 
 Run `npm run build`. Commit the resulting `dist` directory with the source and

@@ -9,7 +9,7 @@ export interface AudioSessionState {
   busy: boolean
   remaining?: number
   error?: string
-  playback?: { channelId: string; state: 'playing' | 'paused'; elapsedMs: number; recordingId?: string; durationMs?: number }
+  playback?: { channelId: string; state: 'playing' | 'paused'; elapsedMs: number; recordingId?: string; durationMs?: number; status?: 'complete' | 'partial' }
   currentSource?: string
   activity: { text: string; at: string }[]
   pttAvailable: boolean
@@ -17,7 +17,7 @@ export interface AudioSessionState {
 
 export class BrowserAudioSession extends EventTarget {
   readonly state: AudioSessionState = { connected: false, listening: false, ptt: 'idle', busy: false, activity: [], pttAvailable: false }
-  private readonly socket = new OpusRefSocket()
+  private readonly socket: OpusRefSocket
   private worker?: Worker
   private context?: AudioContext
   private audioNode?: AudioWorkletNode
@@ -27,15 +27,18 @@ export class BrowserAudioSession extends EventTarget {
   private retired = new Set<bigint>()
   private cancelPending = false
   private totTimer = 0
+  private playbackTimer = 0
   private capabilityResolve?: (supported: boolean) => void
   private closing = false
-  private readonly lifecycleStop = () => { if (document.visibilityState === 'hidden') void this.close() }
+  private readonly visibilityStop = () => { if (document.visibilityState === 'hidden') void this.close() }
+  private readonly pageHideStop = () => { void this.close() }
 
-  constructor(private readonly csrf?: string) {
+  constructor(private readonly csrf?: string, socket = new OpusRefSocket()) {
     super()
+    this.socket = socket
     this.socket.addEventListener('event', event => this.onSocket((event as CustomEvent<SocketEvent>).detail))
-    document.addEventListener('visibilitychange', this.lifecycleStop)
-    window.addEventListener('pagehide', this.lifecycleStop)
+    document.addEventListener('visibilitychange', this.visibilityStop)
+    window.addEventListener('pagehide', this.pageHideStop)
   }
 
   private update(change: Partial<AudioSessionState>) { Object.assign(this.state, change); this.dispatchEvent(new Event('state')) }
@@ -76,16 +79,17 @@ export class BrowserAudioSession extends EventTarget {
   }
 
   openPlayback(recordingId: string): void { this.socket.send('playback_open', { recording_id: recordingId }) }
-  playback(type: 'playback_pause' | 'playback_resume' | 'playback_close', channelId: string): void { this.socket.send(type, { channel_id: channelId }); if (type === 'playback_close') { this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.update({ playback: undefined }) } }
+  playback(type: 'playback_pause' | 'playback_resume' | 'playback_close', channelId: string): void { this.socket.send(type, { channel_id: channelId }); if (type === 'playback_close') this.closePlayback() }
   seek(channelId: string, elapsedMs: number): void { this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.socket.send('playback_seek', { channel_id: channelId, elapsed_ms: Math.max(0, Math.round(elapsedMs)) }) }
 
   async close(): Promise<void> {
     this.closing = true
     if (this.state.ptt !== 'idle') this.stopPTT()
     clearInterval(this.totTimer)
+    clearInterval(this.playbackTimer)
     this.socket.close(); this.worker?.terminate(); this.audioNode?.disconnect(); this.stopMicrophone(); await this.context?.close()
-    document.removeEventListener('visibilitychange', this.lifecycleStop)
-    window.removeEventListener('pagehide', this.lifecycleStop)
+    document.removeEventListener('visibilitychange', this.visibilityStop)
+    window.removeEventListener('pagehide', this.pageHideStop)
     this.update({ connected: false, listening: false, ptt: 'idle' })
   }
 
@@ -125,8 +129,9 @@ export class BrowserAudioSession extends EventTarget {
     else if (control.type === 'ptt_busy') { this.update({ ptt: 'idle', busy: true, error: 'The reflector floor is busy.' }); setTimeout(() => this.update({ busy: false }), 3000) }
     else if (control.type === 'ptt_ended') { clearInterval(this.totTimer); this.worker?.postMessage({ type: 'stop-transmit' }); this.stopMicrophone(); this.pttChannel = undefined; this.cancelPending = false; this.update({ ptt: 'idle', remaining: undefined }) }
     else if (control.type === 'discontinuity') { const body = control.body as { old_channel_id: string; new_channel_id: string }; try { const oldID = parseChannelId(body.old_channel_id); const newID = parseChannelId(body.new_channel_id); this.retire(oldID); if (oldID === this.liveChannel) this.liveChannel = newID; this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.activity('Live audio restarted after a network discontinuity.') } catch { this.socket.close() } }
-    else if (control.type === 'playback_opened') { const body = control.body as { channel_id: string; recording_id: string; duration_ms: number }; try { parseChannelId(body.channel_id); this.update({ playback: { channelId: body.channel_id, recordingId: body.recording_id, durationMs: body.duration_ms, state: 'playing', elapsedMs: 0 } }) } catch { this.socket.close() } }
-    else if (control.type === 'playback_state') { const body = control.body as { channel_id: string; state: 'playing' | 'paused'; elapsed_ms: number }; if (this.state.playback?.channelId === body.channel_id) this.update({ playback: { ...this.state.playback, state: body.state, elapsedMs: body.elapsed_ms } }) }
+    else if (control.type === 'playback_opened') { const body = control.body as { channel_id: string; recording_id: string; duration_ms: number; status: 'complete' | 'partial' }; try { parseChannelId(body.channel_id); this.update({ playback: { channelId: body.channel_id, recordingId: body.recording_id, durationMs: body.duration_ms, status: body.status, state: 'playing', elapsedMs: 0 } }); this.startPlaybackClock() } catch { this.socket.close() } }
+    else if (control.type === 'playback_state') { const body = control.body as { channel_id: string; state: 'playing' | 'paused' | 'closed'; elapsed_ms: number }; if (this.state.playback?.channelId === body.channel_id) { if (body.state === 'closed') this.closePlayback(); else { this.update({ playback: { ...this.state.playback, state: body.state, elapsedMs: body.elapsed_ms } }); if (body.state === 'playing') this.startPlaybackClock(); else clearInterval(this.playbackTimer) } } }
+    else if (control.type === 'status' && (control.body as { authenticated?: boolean }).authenticated === false) { if (this.state.ptt !== 'idle') this.stopPTT(); if (this.state.playback) this.closePlayback(); this.update({ pttAvailable: false }); this.activity('Your session ended. Live listening remains available.'); this.dispatchEvent(new Event('session-invalid')) }
     else if (control.type === 'error') this.update({ error: (control.body as { text?: string }).text ?? 'The live request failed.' })
   }
 
@@ -136,4 +141,12 @@ export class BrowserAudioSession extends EventTarget {
     this.update({ remaining: seconds })
     this.totTimer = window.setInterval(() => { const remaining = Math.max(0, Math.ceil((deadline - performance.now()) / 1000)); this.update({ remaining }); if (remaining === 0) { clearInterval(this.totTimer); this.stopPTT() } }, 250)
   }
+
+  private startPlaybackClock() {
+    clearInterval(this.playbackTimer)
+    let previous = performance.now()
+    this.playbackTimer = window.setInterval(() => { if (!this.state.playback || this.state.playback.state !== 'playing') return; const now = performance.now(); const elapsedMs = Math.min(this.state.playback.durationMs ?? Number.MAX_SAFE_INTEGER, this.state.playback.elapsedMs + now - previous); previous = now; this.update({ playback: { ...this.state.playback, elapsedMs } }) }, 250)
+  }
+
+  private closePlayback() { clearInterval(this.playbackTimer); this.worker?.postMessage({ type: 'reset-playout' }); this.audioNode?.port.postMessage({ type: 'clear' }); this.update({ playback: undefined }) }
 }

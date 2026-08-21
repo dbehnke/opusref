@@ -5,7 +5,9 @@ import type { Page, Recording } from '../lib/types'
 import StatusBadge from '../components/StatusBadge.vue'
 import { BrowserAudioSession } from '../lib/audio-session'
 import { useSessionStore } from '../stores/session'
+import { useRouter } from 'vue-router'
 
+const router = useRouter()
 const store = useSessionStore(); const recordings = ref<Recording[]>([]); const filter = ref('all'); const callsign = ref(''); const from = ref(''); const to = ref(''); const nextCursor = ref<string>(); const active = ref<string>(); const elapsed = ref(0); const loading = ref(true); const actionBusy = ref(false); const error = ref(''); const capabilityError = ref(''); const adminPassword = ref(''); let audio: BrowserAudioSession | undefined
 async function load(append = false) { loading.value = true; try { const query = new URLSearchParams({ limit: '50' }); if (filter.value !== 'all') query.set('status', filter.value); if (callsign.value) query.set('callsign', callsign.value.toUpperCase()); if (from.value) query.set('from', new Date(from.value).toISOString()); if (to.value) query.set('to', new Date(to.value).toISOString()); if (append && nextCursor.value) query.set('cursor', nextCursor.value); const page = await api.request<Page<Recording>>(`/api/v1/recordings?${query}`); recordings.value = append ? [...recordings.value, ...page.items] : page.items; nextCursor.value = page.next_cursor; error.value = '' } catch { error.value = 'The recording library is unavailable.' } finally { loading.value = false } }
 async function toggle(id: string) {
@@ -13,9 +15,10 @@ async function toggle(id: string) {
   if (active.value === id && audio?.state.playback) { audio.playback(audio.state.playback.state === 'playing' ? 'playback_pause' : 'playback_resume', audio.state.playback.channelId); return }
   actionBusy.value = true
   try {
-    if (!audio) { audio = new BrowserAudioSession(store.csrf); audio.addEventListener('state', () => { if (!audio) return; if (audio.state.error) error.value = audio.state.error; if (audio.state.playback) { active.value = audio.state.playback.recordingId; elapsed.value = audio.state.playback.elapsedMs } }); if (!await audio.start()) throw new Error(audio.state.error) }
+    const metadata = await api.request<Recording>(`/api/v1/recordings/${encodeURIComponent(id)}`)
+    if (!audio) { audio = new BrowserAudioSession(store.csrf); audio.addEventListener('session-invalid', async () => { await store.refresh(); if (!store.authenticated) await router.replace('/login') }); audio.addEventListener('state', () => { if (!audio) return; if (audio.state.error) error.value = audio.state.error; if (audio.state.playback) { active.value = audio.state.playback.recordingId; elapsed.value = audio.state.playback.elapsedMs } else { active.value = undefined; elapsed.value = 0 } }); if (!await audio.start()) throw new Error(audio.state.error) }
     if (audio.state.playback) audio.playback('playback_close', audio.state.playback.channelId)
-    audio.openPlayback(id)
+    audio.openPlayback(metadata.id)
   } catch { capabilityError.value = audio?.state.error ?? 'Playback could not start on this device.' }
   finally { actionBusy.value = false }
 }

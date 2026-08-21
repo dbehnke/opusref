@@ -45,7 +45,8 @@ export class JitterBuffer {
     while (this.queue.length && this.queue[0]!.unwrapped <= due) {
       const item = this.queue.shift()!
       const end = item.unwrapped + item.pcm.length
-      if (end < due - MAX_FRAMES) { this.deadlineDrops++; this.expected = Math.max(this.expected!, end); continue }
+      const deadline = this.startedAt + (item.unwrapped - this.origin!) / RATE
+      if (nowMs > deadline) { this.deadlineDrops++; this.expected = Math.max(this.expected!, end); continue }
       const gap = item.unwrapped - this.expected!
       if (gap > 0) output.push(new Float32Array(Math.min(gap, MAX_SILENCE)))
       output.push(item.pcm)

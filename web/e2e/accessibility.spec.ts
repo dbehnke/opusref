@@ -23,3 +23,10 @@ test('login has visible labels and a bounded error', async ({ page }) => {
   await expect(page.getByRole('alert')).toHaveText('Sign-in failed. Check your credentials and try again.')
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
 })
+
+test('dashboard explains temporary not-ready recovery', async ({ page }) => {
+  await page.unroute('**/api/v1/public/status')
+  await page.route('**/api/v1/public/status', route => route.fulfill({ json: { api_version: 1, data: { health: 'degraded', ready: false, reflector: { id: 'TEST', display_name: 'Test Reflector' }, client_count: 0, floor: { active: false }, recording: { available: false, quota_full: false }, server_time: new Date().toISOString() } } }))
+  await page.goto('/')
+  await expect(page.getByText('The reflector is not ready. Monitoring can remain available while connections recover.')).toBeVisible()
+})

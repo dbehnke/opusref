@@ -25,6 +25,7 @@ async function refresh() { try { status.value = await api.request<PublicStatus>(
 async function toggleListen() {
   if (listening.value) { await audio?.close(); audio = undefined; listening.value = false; return }
   audio = new BrowserAudioSession(session.csrf)
+  audio.addEventListener('session-invalid', () => void session.refresh())
   audio.addEventListener('state', () => {
     if (!audio) return
     audioState.value = { ...audio.state }
@@ -44,6 +45,7 @@ onBeforeUnmount(() => { clearInterval(timer); void audio?.close() })
   <div class="space-y-6">
     <header><p class="font-bold uppercase tracking-[.2em] text-cyan-300">Reflector console</p><h1 class="mt-2 text-4xl font-black tracking-tight sm:text-5xl">Live channel</h1><p class="mt-3 max-w-2xl text-slate-300">Monitor the shared channel. Start audio only when you are ready to listen.</p></header>
     <p v-if="error" class="surface border-red-500 p-4" role="alert">{{ error }}</p>
+    <p v-if="status && !status.ready" class="surface border-amber-500 p-4" role="status">The reflector is not ready. Monitoring can remain available while connections recover.</p>
     <section v-if="status" class="card-grid" aria-label="Reflector status">
       <article class="surface p-5"><p class="text-sm text-slate-400">Service</p><StatusBadge class="mt-3" :state="status.health" /></article>
       <article class="surface p-5"><p class="text-sm text-slate-400">Reflector</p><p class="mt-2 text-xl font-bold">{{ status.reflector.display_name }}</p><p class="text-sm text-slate-400">{{ status.reflector.id }}</p></article>

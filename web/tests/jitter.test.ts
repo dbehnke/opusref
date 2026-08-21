@@ -21,7 +21,7 @@ describe('bounded jitter buffer', () => {
     const queue = new JitterBuffer()
     queue.push(0, pcm(2880)); queue.take(0)
     queue.push(8640, pcm(960))
-    const output = queue.take(200)
+    const output = queue.take(120)
     expect(output[0]?.length).toBe(5760)
   })
   it('resets on a timestamp jump over two seconds', () => {
@@ -37,7 +37,7 @@ describe('bounded jitter buffer', () => {
   })
   it('drops PCM that misses its deadline', () => {
     const queue = new JitterBuffer(); queue.push(0, pcm(2880)); queue.take(0); queue.push(2880, pcm(960))
-    expect(queue.take(1000)).toEqual([])
+    expect(queue.take(70)).toEqual([])
     expect(queue.deadlineDrops).toBe(1)
   })
 })
