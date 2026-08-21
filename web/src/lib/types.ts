@@ -5,6 +5,7 @@ export interface SessionInfo {
   authenticated: boolean
   username?: string
   role?: Role
+  source_callsign?: string
   csrf_token?: string
   passkey_available: boolean
   forced_password_change?: boolean
@@ -41,6 +42,7 @@ export interface Account {
 export interface Passkey { id: string; name: string; created_at: string; last_used_at?: string }
 export interface UserSession { id: string; created_at: string; last_active_at: string; current: boolean }
 export interface AuditEvent { id: string; occurred_at: string; action: string; result: string; actor?: string }
+export interface Page<T> { items: T[]; next_cursor?: string }
 
 export interface ApiEnvelope<T> { api_version: 1; data: T }
 

@@ -11,7 +11,7 @@ const label = computed(() => ({ idle: 'Push to talk', requesting: 'Requesting…
 
 watch(latched, value => { localStorage.setItem('opusref.ptt.latched', String(value)); machine.latched = value }, { immediate: true })
 function run(effect: ReturnType<PTTMachine['activate']>) { state.value = machine.state; if (effect === 'request') emit('request'); if (effect === 'stop') emit('stop') }
-function activate() { if (!props.disabled && !props.busy) run(machine.activate()) }
+function activate(event?: PointerEvent) { if (event?.currentTarget instanceof Element && event.pointerId >= 0) (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId); if (!props.disabled && !props.busy) run(machine.activate()) }
 function release() { run(machine.release()) }
 function keydown(event: KeyboardEvent) { if (event.code === 'Space' && !event.repeat) { event.preventDefault(); activate() } }
 function keyup(event: KeyboardEvent) { if (event.code === 'Space') { event.preventDefault(); release() } }
@@ -30,7 +30,7 @@ onBeforeUnmount(() => { safetyStop(); document.removeEventListener('visibilitych
       <label class="flex min-h-11 items-center gap-2 rounded-lg px-2"><input v-model="latched" type="checkbox" class="size-5 accent-cyan-300">Latch PTT</label>
     </div>
     <button class="mt-5 min-h-16 w-full rounded-2xl border-2 border-cyan-200 bg-cyan-300 px-6 text-lg font-black text-slate-950 disabled:border-slate-600 disabled:bg-slate-700 disabled:text-slate-300"
-      type="button" :disabled="disabled || busy || state === 'stopping'" :aria-pressed="state === 'transmitting'" @pointerdown="activate" @pointerup="release" @pointercancel="release" @keydown="keydown" @keyup="keyup">
+      type="button" :disabled="disabled || busy || state === 'stopping'" :aria-pressed="state === 'transmitting'" @pointerdown="activate" @pointerup="release" @pointercancel="release" @keydown="keydown" @keyup="keyup" @blur="release">
       {{ label }}<span v-if="remaining !== undefined"> · {{ remaining }} s</span>
     </button>
     <p class="mt-3 min-h-6 text-center" aria-live="assertive">{{ busy ? 'The channel is busy.' : stopReason }}</p>

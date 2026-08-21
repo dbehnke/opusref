@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decodePacket, encodePacket, MediaKind, ProtocolError } from '../src/lib/orwb'
+import { decodePacket, encodePacket, MediaKind, parseControlMessage, ProtocolError } from '../src/lib/orwb'
 
 describe('ORWB media packets', () => {
   it('preserves one complete payload and network-order metadata', () => {
@@ -13,4 +13,10 @@ describe('ORWB media packets', () => {
     new Uint8Array(encoded)[26] = 1
     expect(() => decodePacket(encoded)).toThrow('Reserved')
   })
+})
+
+describe('control messages', () => {
+  it('accepts a version-one server envelope', () => { expect(parseControlMessage('{"api_version":1,"type":"ptt_busy","body":{}}').type).toBe('ptt_busy') })
+  it.each(['{"api_version":1,"type":"unknown","body":{}}', '{"api_version":1,"type":"status","body":{},"extra":1}', '{"api_version":2,"type":"status","body":{}}'])('rejects an invalid server envelope', input => expect(() => parseControlMessage(input)).toThrow(ProtocolError))
+  it('rejects more than 16 KiB', () => expect(() => parseControlMessage('{"api_version":1,"type":"error","body":{"text":"' + 'x'.repeat(16384) + '"}}')).toThrow('too large'))
 })

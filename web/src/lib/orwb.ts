@@ -53,3 +53,17 @@ export function makeRequest<T>(type: string, requestId: string, body: T): string
   if (!/^[\x20-\x7e]{1,64}$/.test(requestId)) throw new ProtocolError('The request ID is invalid.')
   return JSON.stringify({ api_version: 1, type, request_id: requestId, body })
 }
+
+const serverTypes = new Set(['hello_ok', 'status', 'stream_start', 'stream_end', 'ptt_granted', 'ptt_busy', 'ptt_ended', 'playback_opened', 'playback_state', 'discontinuity', 'error'])
+
+export function parseControlMessage(input: string): ControlMessage {
+  if (new TextEncoder().encode(input).byteLength > 16384) throw new ProtocolError('The control message is too large.')
+  let value: unknown
+  try { value = JSON.parse(input) } catch { throw new ProtocolError('The control message is not valid JSON.') }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ProtocolError('The control envelope is invalid.')
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record)
+  if (keys.some(key => !['api_version', 'type', 'request_id', 'body'].includes(key)) || record.api_version !== 1 || typeof record.type !== 'string' || !serverTypes.has(record.type) || !record.body || typeof record.body !== 'object' || Array.isArray(record.body)) throw new ProtocolError('The control envelope is invalid.')
+  if (record.request_id !== undefined && (typeof record.request_id !== 'string' || !/^[\x20-\x7e]{1,64}$/.test(record.request_id))) throw new ProtocolError('The response request ID is invalid.')
+  return record as unknown as ControlMessage
+}

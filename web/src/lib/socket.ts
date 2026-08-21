@@ -1,4 +1,4 @@
-import { decodePacket, makeRequest, type ControlMessage, type MediaPacket } from './orwb'
+import { decodePacket, makeRequest, parseControlMessage, type ControlMessage, type MediaPacket } from './orwb'
 
 export type SocketEvent = { control?: ControlMessage; media?: MediaPacket; closed?: { code: number; reason: string } }
 
@@ -15,7 +15,7 @@ export class OpusRefSocket extends EventTarget {
     this.socket.addEventListener('open', () => this.send('hello', { audio, ...(csrf ? { csrf_token: csrf } : {}) }))
     this.socket.addEventListener('message', event => {
       try {
-        const detail: SocketEvent = typeof event.data === 'string' ? { control: JSON.parse(event.data) } : { media: decodePacket(event.data) }
+        const detail: SocketEvent = typeof event.data === 'string' ? { control: parseControlMessage(event.data) } : { media: decodePacket(event.data) }
         this.dispatchEvent(new CustomEvent('event', { detail }))
       } catch { this.socket?.close(4400, 'invalid_message') }
     })
@@ -33,5 +33,6 @@ export class OpusRefSocket extends EventTarget {
     this.socket.send(packet)
     return true
   }
+  get bufferedAmount(): number { return this.socket?.bufferedAmount ?? 0 }
   close(): void { this.socket?.close(1000, 'page_close') }
 }

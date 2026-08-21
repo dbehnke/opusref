@@ -26,5 +26,6 @@ router.beforeEach(async to => {
   const session = useSessionStore()
   if (!session.loaded) await session.refresh()
   if (to.meta.auth && !session.authenticated) return { path: '/login', query: { next: to.fullPath } }
+  if (session.session.forced_password_change && to.path !== '/security') return '/security'
   if (to.meta.admin && !session.isAdmin) return '/'
 })

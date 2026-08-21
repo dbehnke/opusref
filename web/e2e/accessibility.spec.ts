@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/session', route => route.fulfill({ json: { api_version: 1, data: { authenticated: false, passkey_available: false } } }))
@@ -10,6 +11,7 @@ test('public dashboard uses user-initiated audio', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Live channel' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Listen live' })).toBeVisible()
   await expect(page.getByText('Channel idle')).toBeVisible()
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
 })
 
 test('login has visible labels and a bounded error', async ({ page }) => {
@@ -19,4 +21,5 @@ test('login has visible labels and a bounded error', async ({ page }) => {
   await page.getByLabel('Password').fill('wrong')
   await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page.getByRole('alert')).toHaveText('Sign-in failed. Check your credentials and try again.')
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
 })

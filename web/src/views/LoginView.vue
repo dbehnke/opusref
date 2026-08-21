@@ -8,7 +8,7 @@ import type { SessionInfo } from '../lib/types'
 
 const username = ref(''); const password = ref(''); const busy = ref(false); const error = ref('')
 const session = useSessionStore(); const route = useRoute(); const router = useRouter()
-async function submit() { busy.value = true; error.value = ''; try { await session.login(username.value, password.value); await router.replace(typeof route.query.next === 'string' ? route.query.next : '/') } catch { error.value = 'Sign-in failed. Check your credentials and try again.' } finally { busy.value = false } }
+async function submit() { busy.value = true; error.value = ''; try { await session.login(username.value, password.value); await router.replace(session.session.forced_password_change ? '/security' : typeof route.query.next === 'string' ? route.query.next : '/') } catch { error.value = 'Sign-in failed. Check your credentials and try again.' } finally { busy.value = false } }
 async function passkey() {
   busy.value = true; error.value = ''
   try {

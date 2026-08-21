@@ -17,7 +17,7 @@ const listening = ref(false)
 const error = ref('')
 const ptt = ref<InstanceType<typeof PTTControl>>()
 let audio: BrowserAudioSession | undefined
-const audioState = ref<AudioSessionState>({ connected: false, listening: false, ptt: 'idle', busy: false })
+const audioState = ref<AudioSessionState>({ connected: false, listening: false, ptt: 'idle', busy: false, activity: [], pttAvailable: false })
 let timer = 0
 const floorLabel = computed(() => status.value?.floor.active ? status.value.floor.source_callsign ?? 'Active source' : 'Channel idle')
 
@@ -55,7 +55,8 @@ onBeforeUnmount(() => { clearInterval(timer); void audio?.close() })
       <div><h2 id="listen-title" class="text-xl font-bold">Live audio</h2><p class="text-slate-400">Audio does not start automatically.</p></div>
       <AudioControl :active="listening" :disabled="capability?.supported === false" @toggle="toggleListen" />
     </section>
-    <PTTControl v-if="session.authenticated" ref="ptt" :disabled="!listening || !capability?.supported || session.session.forced_password_change" :busy="audioState.busy || (status?.floor.active && audioState.ptt === 'idle')" :remaining="audioState.remaining" :stop-reason="audioState.error" @request="audio?.requestPTT()" @stop="audio?.stopPTT()" />
-    <section class="surface p-5"><h2 class="text-xl font-bold">Recent activity</h2><p class="mt-3 text-slate-400">Sanitized activity appears here when the reflector reports an event.</p></section>
+    <PTTControl v-if="session.authenticated" ref="ptt" :disabled="!listening || !audioState.pttAvailable || !capability?.supported || session.session.forced_password_change" :busy="audioState.busy || (status?.floor.active && audioState.ptt === 'idle')" :remaining="audioState.remaining" :stop-reason="audioState.error" @request="audio?.requestPTT()" @stop="audio?.stopPTT()" />
+    <p v-if="session.authenticated && !session.session.source_callsign" class="surface border-amber-500 p-4" role="status">An administrator must assign a source callsign before you can talk.</p>
+    <section class="surface p-5"><h2 class="text-xl font-bold">Recent activity</h2><ul v-if="audioState.activity.length" class="mt-3 space-y-2" aria-live="polite"><li v-for="item in audioState.activity" :key="item.at" class="flex flex-wrap justify-between gap-2 border-b border-slate-800 py-2"><span>{{ item.text }}</span><time class="text-sm text-slate-400">{{ new Date(item.at).toLocaleTimeString() }}</time></li></ul><p v-else class="mt-3 text-slate-400">No recent activity.</p></section>
   </div>
 </template>
