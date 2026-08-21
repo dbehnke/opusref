@@ -1,0 +1,14 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { api } from '../lib/api'
+import type { AuditEvent } from '../lib/types'
+interface Operations { archive_bytes: number; quota_bytes: number; quota_full: boolean; connected_callsigns: string[]; alerts: { occurred_at: string; type: string; message: string }[] }
+const operations = ref<Operations>(); const audit = ref<AuditEvent[]>([]); const error = ref('')
+function size(bytes: number) { return new Intl.NumberFormat(undefined, { style: 'unit', unit: 'megabyte', maximumFractionDigits: 1 }).format(bytes / 1048576) }
+onMounted(async () => { try { [operations.value, audit.value] = await Promise.all([api.request<Operations>('/api/v1/admin/operations'), api.request<AuditEvent[]>('/api/v1/admin/audit')]) } catch { error.value = 'Operator details are unavailable.' } })
+</script>
+<template><div class="space-y-6"><header><h1 class="text-4xl font-black">Operations</h1><p class="mt-2 text-slate-400">Review storage, clients, alerts, and security actions.</p></header><p v-if="error" role="alert" class="text-red-200">{{ error }}</p>
+  <section v-if="operations" class="card-grid"><article class="surface p-5"><p class="text-sm text-slate-400">Archive use</p><p class="mt-2 text-2xl font-black">{{ size(operations.archive_bytes) }}</p><p class="text-sm">of {{ size(operations.quota_bytes) }}</p></article><article class="surface p-5"><p class="text-sm text-slate-400">Recorder</p><p class="mt-2 text-xl font-bold">{{ operations.quota_full ? 'Quota full' : 'Available' }}</p></article><article class="surface p-5 sm:col-span-2"><p class="text-sm text-slate-400">Connected callsigns</p><p class="mt-2 font-bold">{{ operations.connected_callsigns.join(', ') || 'None' }}</p></article></section>
+  <section class="surface p-6"><h2 class="text-2xl font-bold">Alerts</h2><ul class="mt-4 space-y-3"><li v-for="alert in operations?.alerts" :key="alert.occurred_at + alert.type" class="rounded-xl border border-amber-500/50 p-4"><strong>{{ alert.type }}</strong><p>{{ alert.message }}</p><time class="text-sm text-slate-400">{{ new Date(alert.occurred_at).toLocaleString() }}</time></li><li v-if="!operations?.alerts.length" class="text-slate-400">No active alerts.</li></ul></section>
+  <section class="surface overflow-x-auto p-6"><h2 class="text-2xl font-bold">Audit events</h2><table class="mt-4 w-full min-w-[36rem] text-left"><thead><tr class="border-b border-slate-600"><th class="p-3">Time</th><th class="p-3">Action</th><th class="p-3">Result</th><th class="p-3">Actor</th></tr></thead><tbody><tr v-for="event in audit" :key="event.id" class="border-b border-slate-800"><td class="p-3">{{ new Date(event.occurred_at).toLocaleString() }}</td><td class="p-3">{{ event.action }}</td><td class="p-3">{{ event.result }}</td><td class="p-3">{{ event.actor ?? 'System' }}</td></tr></tbody></table></section>
+</div></template>
