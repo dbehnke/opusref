@@ -89,7 +89,10 @@ Latch mode stops after the user activates the control a second time. The UI show
 these instructions and announces each latch state change. Passkey removal requires
 confirmation and identifies the passkey. Cancel receives initial focus. The modal
 contains keyboard focus and makes the background inert. Escape cancels the action
-and returns focus to the passkey control.
+before submission and returns focus to the passkey control. After submission, the
+modal stays open and announces `Removing passkey…` until the request ends. Escape
+and Cancel cannot dismiss an active request. If the request fails, the modal shows
+the error and returns focus to Cancel.
 
 Playwright uses loopback servers to test control messages, ORWB media, playback,
 close handling, anonymous downgrade, and the production bundle over HTTPS and

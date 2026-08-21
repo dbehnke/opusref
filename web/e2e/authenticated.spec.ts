@@ -121,3 +121,50 @@ test('passkey removal traps focus on the safe action and restores focus', async 
   await expect.poll(() => removed).toBe(true)
   await expect(page.getByRole('button', { name: 'Add passkey' })).toBeFocused()
 })
+
+test('submitted passkey removal ignores repeated dismissal until failure or success', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.route('**/api/v1/me/sessions?**', route => route.fulfill({ json: envelope({ items: [] }) }))
+  await page.route('**/api/v1/me/passkeys?**', route => route.fulfill({ json: envelope({ items: [{ id: 'key-1', name: 'Travel key', created_at: '2026-08-20T12:00:00Z' }] }) }))
+  await page.route('**/api/v1/me/reauth/password', route => route.fulfill({ json: envelope({ reauth_token: 'proof' }) }))
+  let finishDelete: ((success: boolean) => void) | undefined
+  let attempts = 0
+  await page.route('**/api/v1/me/passkeys/key-1', async route => {
+    attempts++
+    const success = await new Promise<boolean>(resolve => { finishDelete = resolve })
+    await route.fulfill(success ? { json: envelope({}) } : { status: 503, json: { code: 'unavailable', message: 'unavailable' } })
+  })
+  await page.goto('/security')
+  await page.getByLabel('Current password').fill('a secure password')
+  const submit = async () => {
+    await page.getByRole('button', { name: 'Remove Travel key' }).click()
+    await page.getByRole('button', { name: 'Remove passkey' }).click()
+    await expect(page.getByRole('status')).toHaveText('Removing passkey…')
+    await expect.poll(() => attempts).toBeGreaterThan(0)
+  }
+  const tryDismiss = async () => {
+    await page.keyboard.press('Escape'); await page.keyboard.press('Escape')
+    await page.evaluate(() => { const dialog = document.querySelector('dialog'); dialog?.dispatchEvent(new Event('cancel', { cancelable: true })); dialog?.dispatchEvent(new Event('cancel', { cancelable: true })) })
+    await expect(page.getByRole('alertdialog')).toBeVisible()
+    await expect(page.locator('#app')).toHaveJSProperty('inert', true)
+  }
+  await submit(); await tryDismiss()
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  const busyScreenshot = testInfo.outputPath('passkey-removal-busy-390px.png')
+  await page.screenshot({ path: busyScreenshot, fullPage: true })
+  await testInfo.attach('passkey-removal-busy-390px', { path: busyScreenshot, contentType: 'image/png' })
+  finishDelete?.(false)
+  await expect(page.getByRole('alert')).toHaveText('The passkey was not removed. Confirm your identity and try again.')
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused()
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  const failureScreenshot = testInfo.outputPath('passkey-removal-failure-390px.png')
+  await page.screenshot({ path: failureScreenshot, fullPage: true })
+  await testInfo.attach('passkey-removal-failure-390px', { path: failureScreenshot, contentType: 'image/png' })
+  const nextAttempt = attempts + 1
+  await page.getByRole('button', { name: 'Remove passkey' }).click()
+  await expect(page.getByRole('status')).toHaveText('Removing passkey…')
+  await expect.poll(() => attempts).toBe(nextAttempt)
+  await tryDismiss(); finishDelete?.(true)
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Add passkey' })).toBeFocused()
+})
