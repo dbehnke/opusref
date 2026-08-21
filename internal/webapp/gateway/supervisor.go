@@ -26,6 +26,7 @@ type SupervisedClient struct {
 	once                           sync.Once
 	dropped                        map[ReflectorStream]bool
 	initialBackoff, maximumBackoff time.Duration
+	observer                       func(string)
 }
 
 func NewSupervisedClient(factory ClientFactory, eventCapacity int) *SupervisedClient {
@@ -59,11 +60,13 @@ func (s *SupervisedClient) run(ctx context.Context) {
 	defer s.once.Do(func() { close(s.done); close(s.events) })
 	backoff := s.initialBackoff
 	for ctx.Err() == nil {
+		s.observe("attempt")
 		current, err := s.factory()
 		if err == nil {
 			err = current.Connect(ctx)
 		}
 		if err != nil {
+			s.observe("failure")
 			if current != nil {
 				_ = current.Close()
 			}
@@ -78,6 +81,7 @@ func (s *SupervisedClient) run(ctx context.Context) {
 		s.active = current
 		s.mu.Unlock()
 		s.ready.Store(true)
+		s.observe("success")
 		s.publish(ctx, client.Event{Kind: client.EventStatus, Message: "connected"})
 	connected:
 		for {
@@ -116,6 +120,19 @@ func (s *SupervisedClient) run(ctx context.Context) {
 				break connected
 			}
 		}
+	}
+}
+func (s *SupervisedClient) SetObserver(observer func(string)) {
+	s.mu.Lock()
+	s.observer = observer
+	s.mu.Unlock()
+}
+func (s *SupervisedClient) observe(result string) {
+	s.mu.RLock()
+	observer := s.observer
+	s.mu.RUnlock()
+	if observer != nil {
+		observer(result)
 	}
 }
 func jitter(duration time.Duration) time.Duration {

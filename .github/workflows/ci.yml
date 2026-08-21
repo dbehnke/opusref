@@ -23,6 +23,7 @@ jobs:
       - run: go test ./pkg/wire -run '^$' -fuzz=FuzzDecode -fuzztime=2s
       - run: go test ./pkg/wire -run '^$' -fuzz=FuzzValidate -fuzztime=2s
       - run: go test ./internal/webapp/socket -run '^$' -fuzz=FuzzDecodeMedia -fuzztime=2s
+      - run: go test ./internal/webapp/archive -run '^$' -fuzz=FuzzArchiveReader -fuzztime=2s
       - run: go build ./cmd/opusrefd ./cmd/opusrefctl ./cmd/opusrefweb
       - run: npm ci
         working-directory: web

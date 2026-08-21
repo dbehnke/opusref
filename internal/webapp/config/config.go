@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/dbehnke/opusref/pkg/wire"
+	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -173,7 +175,7 @@ func (c Config) Validate() error {
 			return errors.New("WebAuthn RP ID must not be an IP address")
 		}
 		u, err := url.Parse(c.Web.PublicOrigin)
-		if err != nil || u.Scheme != "https" || !domainSuffix(u.Hostname(), c.WebAuthn.RPID) {
+		if err != nil || u.Scheme != "https" || !validRPSuffix(u.Hostname(), c.WebAuthn.RPID) {
 			return errors.New("WebAuthn RP ID is not valid for the public origin")
 		}
 		found := false
@@ -191,9 +193,6 @@ func (c Config) Validate() error {
 			return errors.New("all queue and connection limits must be positive")
 		}
 	}
-	if c.Limits.PlaybackMaxDuration <= 0 {
-		return errors.New("playback maximum duration must be positive")
-	}
 	return nil
 }
 func (c Config) PasskeysEnabled() bool { return c.WebAuthn.RPID != "" && len(c.WebAuthn.Origins) > 0 }
@@ -205,8 +204,17 @@ func isLoopbackListen(address string) bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
-func domainSuffix(host, rp string) bool {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	rp = strings.ToLower(strings.TrimSuffix(rp, "."))
+func validRPSuffix(host, rp string) bool {
+	if host == "" || rp == "" || strings.HasSuffix(host, ".") || strings.HasSuffix(rp, ".") {
+		return false
+	}
+	host, hostErr := idna.Lookup.ToASCII(strings.ToLower(host))
+	rp, rpErr := idna.Lookup.ToASCII(strings.ToLower(rp))
+	if hostErr != nil || rpErr != nil || net.ParseIP(rp) != nil {
+		return false
+	}
+	if _, err := publicsuffix.EffectiveTLDPlusOne(rp); err != nil {
+		return false
+	}
 	return host == rp || strings.HasSuffix(host, "."+rp)
 }

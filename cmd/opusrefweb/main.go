@@ -226,6 +226,9 @@ func serve(args []string) error {
 		return err
 	}
 	defer archives.Close()
+	bindings, unsubscribeBindings := attribution.SubscribeBindings()
+	defer unsubscribeBindings()
+	go reconcileAttribution(runCtx, bindings, archives)
 	go func() {
 		ticker := time.NewTicker(c.Storage.PurgeInterval.Time())
 		defer ticker.Stop()
@@ -251,8 +254,28 @@ func serve(args []string) error {
 	monitorClient := reflectormonitor.New(c.Reflector.MonitoringURL)
 	go monitorClient.Run(runCtx, c.Reflector.MonitorPollInterval.Time())
 	go publishReceiver(runCtx, receiver, hub, archives, attribution)
-	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, LiveQueueBytes: c.Limits.LiveQueueBytes, PlaybackQueuePackets: c.Limits.PlaybackQueuePackets, PlaybackQueueBytes: c.Limits.PlaybackQueueBytes, ControlQueueMessages: c.Limits.ControlQueueMessages, MaxPlaybacks: c.Limits.MaxPlaybacks, PlaybackMaxDuration: c.Limits.PlaybackMaxDuration.Time(), MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives, ReadyCheck: func() bool { return receiver.Ready() && transmitter.Ready() && archives.Probe(context.Background()) }}, state)
+	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, LiveQueueBytes: c.Limits.LiveQueueBytes, PlaybackQueuePackets: c.Limits.PlaybackQueuePackets, PlaybackQueueBytes: c.Limits.PlaybackQueueBytes, ControlQueueMessages: c.Limits.ControlQueueMessages, MaxPlaybacks: c.Limits.MaxPlaybacks, MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives, ReadyCheck: func() bool { return receiver.Ready() && transmitter.Ready() && archives.Ready() }}, state)
+	archives.SetObserver(api.RecordArchive)
+	receiver.SetObserver(func(result string) { api.RecordReconnect("receive", result) })
+	transmitter.SetObserver(func(result string) { api.RecordReconnect("transmit", result) })
 	api.SetReady(false)
+	_ = archives.Probe(context.Background())
+	api.RefreshReadiness(context.Background())
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				probeCtx, probeCancel := context.WithTimeout(runCtx, 750*time.Millisecond)
+				_ = archives.Probe(probeCtx)
+				api.RefreshReadiness(probeCtx)
+				probeCancel()
+			}
+		}
+	}()
 	public := &http.Server{Addr: c.Web.HTTPListen, Handler: api.PublicHandler(), ReadHeaderTimeout: 5 * time.Second}
 	monitor := &http.Server{Addr: c.Web.MonitorListen, Handler: api.MonitorHandler(), ReadHeaderTimeout: 5 * time.Second}
 	publicListener, err := net.Listen("tcp", c.Web.HTTPListen)
@@ -268,6 +291,7 @@ func serve(args []string) error {
 	go func() { fail <- public.Serve(publicListener) }()
 	go func() { fail <- monitor.Serve(monitorListener) }()
 	api.SetReady(true)
+	api.RefreshReadiness(context.Background())
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -277,14 +301,46 @@ func serve(args []string) error {
 			return err
 		}
 	}
-	api.SetReady(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	httpErr := errors.Join(public.Shutdown(ctx), monitor.Shutdown(ctx))
-	api.Shutdown()
-	_ = ptt.StopActive(ctx)
-	runCancel()
-	return httpErr
+	return orderedShutdown(shutdownSteps{
+		beginDrain:  api.BeginDrain,
+		stopPTT:     func() error { return ptt.StopActive(ctx) },
+		closeWSS:    api.Shutdown,
+		archive:     archives.Close,
+		receiver:    receiver.Close,
+		transmitter: transmitter.Close,
+		cancel:      runCancel,
+		http:        func() error { return errors.Join(public.Shutdown(ctx), monitor.Shutdown(ctx)) },
+	})
+}
+
+type shutdownSteps struct {
+	beginDrain, closeWSS, archive, cancel func()
+	stopPTT, receiver, transmitter, http  func() error
+}
+
+func orderedShutdown(steps shutdownSteps) error {
+	steps.beginDrain()
+	var failures []error
+	failures = append(failures, steps.stopPTT())
+	steps.closeWSS()
+	steps.archive()
+	failures = append(failures, steps.receiver(), steps.transmitter())
+	steps.cancel()
+	failures = append(failures, steps.http())
+	return errors.Join(failures...)
+}
+
+func reconcileAttribution(ctx context.Context, bindings <-chan gateway.GrantBinding, archives *webarchive.Service) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case binding := <-bindings:
+			archives.Attribute(webarchive.StreamKey{SessionID: binding.Stream.SessionID, StreamID: binding.Stream.StreamID}, binding.UserID)
+		}
+	}
 }
 
 func publishReceiver(ctx context.Context, receiver client.Client, hub *gateway.LiveHub, archives *webarchive.Service, attribution *gateway.GrantAttribution) {

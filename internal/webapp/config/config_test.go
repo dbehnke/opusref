@@ -55,6 +55,28 @@ func TestPasskeysRequireValidHTTPSDomain(t *testing.T) {
 	}
 }
 
+func TestWebAuthnRPSuffixUsesRegistrablePublicSuffixRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, host, rp string
+		valid          bool
+	}{
+		{"exact", "radio.example.org", "radio.example.org", true},
+		{"parent", "radio.example.org", "example.org", true},
+		{"public_suffix", "radio.example.com", "com", false},
+		{"single_label", "localhost", "localhost", false},
+		{"unicode_idna", "radio.xn--bcher-kva.com", "bücher.com", true},
+		{"trailing_dot_host", "radio.example.org.", "example.org", false},
+		{"trailing_dot_rp", "radio.example.org", "example.org.", false},
+		{"unrelated", "radio.example.org", "example.com", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validRPSuffix(tc.host, tc.rp); got != tc.valid {
+				t.Fatalf("validRPSuffix(%q,%q)=%v", tc.host, tc.rp, got)
+			}
+		})
+	}
+}
+
 func TestLoadAcceptsDurationStrings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "web.yaml")
 	data := []byte("storage:\n  retention: 48h\nreflector:\n  monitor_poll_interval: 2s\n")

@@ -30,6 +30,8 @@ const (
 	PartialQuota
 	PartialWriteFailure
 	PartialServerShutdown
+	PartialProcessRestart
+	PartialTruncatedEntry
 )
 
 type commandKind uint8
@@ -39,6 +41,7 @@ const (
 	commandAudio
 	commandData
 	commandEnd
+	commandAttribute
 	commandClose
 )
 
@@ -64,6 +67,7 @@ type Service struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	healthy   atomic.Bool
+	observer  func(string, string)
 }
 type activeStream struct {
 	key          StreamKey
@@ -112,8 +116,26 @@ func (s *Service) Data(key StreamKey, sequence uint32) bool {
 func (s *Service) End(key StreamKey, reason string, partial bool) {
 	s.control(command{kind: commandEnd, key: key, reason: reason, partial: partial})
 }
+func (s *Service) Attribute(key StreamKey, webUserID string) {
+	if webUserID != "" {
+		s.control(command{kind: commandAttribute, key: key, webUserID: webUserID})
+	}
+}
 func (s *Service) Close() {
 	s.closeOnce.Do(func() { s.control(command{kind: commandClose}); <-s.closed })
+}
+func (s *Service) SetObserver(observer func(action, result string)) {
+	s.mu.Lock()
+	s.observer = observer
+	s.mu.Unlock()
+}
+func (s *Service) observe(action, result string) {
+	s.mu.Lock()
+	observer := s.observer
+	s.mu.Unlock()
+	if observer != nil {
+		observer(action, result)
+	}
 }
 func (s *Service) media(item command) bool {
 	select {
@@ -140,6 +162,8 @@ func (s *Service) control(item command) {
 func (s *Service) run(ctx context.Context) {
 	defer close(s.closed)
 	var active *activeStream
+	recent := map[StreamKey]string{}
+	var recentOrder []StreamKey
 	for {
 		select {
 		case <-ctx.Done():
@@ -188,6 +212,14 @@ func (s *Service) run(ctx context.Context) {
 					s.finish(active, item.reason)
 					active = nil
 				}
+			case commandAttribute:
+				if active != nil && active.key == item.key {
+					active.webUserID = item.webUserID
+				}
+				if recordingID := recent[item.key]; recordingID != "" {
+					_ = s.state.AttributeRecording(context.Background(), recordingID, item.webUserID)
+					delete(recent, item.key)
+				}
 			case commandClose:
 				if active != nil {
 					active.reasons |= PartialServerShutdown
@@ -200,6 +232,16 @@ func (s *Service) run(ctx context.Context) {
 			}
 			if item.ack != nil {
 				close(item.ack)
+			}
+			if active != nil && active.file != nil {
+				if _, exists := recent[active.key]; !exists {
+					recent[active.key] = active.id.String()
+					recentOrder = append(recentOrder, active.key)
+					if len(recentOrder) > 64 {
+						delete(recent, recentOrder[0])
+						recentOrder = recentOrder[1:]
+					}
+				}
 			}
 		}
 	}
@@ -256,17 +298,22 @@ func (s *Service) finish(active *activeStream, reason string) {
 		status = "partial"
 	}
 	if err := s.state.BeginRecordingFinalize(context.Background(), active.id.String(), status, reason, active.reasons); err != nil {
+		s.observe("finalize", "failure")
 		s.healthy.Store(false)
 		return
 	}
 	_, size, sum, err := active.file.Finalize()
 	if err != nil {
+		s.observe("finalize", "failure")
 		_ = s.state.MarkRecordingUnavailable(context.Background(), active.id.String(), "finalize_error", time.Now())
 		s.healthy.Store(false)
 		return
 	}
 	if err = s.state.FinishRecording(context.Background(), active.id.String(), status, reason, time.Now(), active.packets, size, sum); err != nil {
+		s.observe("finalize", "failure")
 		s.healthy.Store(false)
+	} else {
+		s.observe("finalize", map[bool]string{true: "partial", false: "success"}[status == "partial"])
 	}
 }
 func (s *Service) remainingQuota() int64 { s.mu.Lock(); defer s.mu.Unlock(); return s.quota - s.used }
@@ -316,21 +363,35 @@ func (s *Service) recover(ctx context.Context) error {
 			continue
 		}
 		filenameID, filenameErr := uuid.Parse(strings.TrimSuffix(name, extension))
+		var persisted store.RecordingRecoveryState
+		var persistedErr error
 		if filenameErr == nil {
 			seen[filenameID.String()] = true
+			persisted, persistedErr = s.state.RecordingRecoveryState(ctx, filenameID.String())
 		}
+		before, _ := os.Stat(path)
+		truncated := false
 		id, size, sum, validateErr := ValidateFile(path)
 		if validateErr != nil && extension == ".partial" {
 			if repairErr := RepairTornTrailingEntry(path); repairErr == nil {
 				id, size, sum, validateErr = ValidateFile(path)
+				after, _ := os.Stat(path)
+				truncated = before != nil && after != nil && after.Size() < before.Size()
 			}
 		}
 		if validateErr != nil {
-			if filenameErr == nil {
-				if _, statusErr := s.state.RecordingStatus(ctx, filenameID.String()); statusErr == nil {
-					if markErr := s.state.MarkRecordingUnavailable(ctx, filenameID.String(), "corrupt_archive", time.Now()); markErr != nil {
-						return markErr
-					}
+			if persistedErr == nil && persisted.Status == "creating" && extension == ".partial" {
+				if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					return removeErr
+				}
+				if err = s.state.DeleteCreatingRecording(ctx, filenameID.String()); err != nil {
+					return err
+				}
+				continue
+			}
+			if persistedErr == nil {
+				if markErr := s.state.MarkRecordingUnavailable(ctx, filenameID.String(), "corrupt_archive", time.Now()); markErr != nil {
+					return markErr
 				}
 			}
 			if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
@@ -338,14 +399,26 @@ func (s *Service) recover(ctx context.Context) error {
 			}
 			continue
 		}
-		status, statusErr := s.state.RecordingStatus(ctx, id.String())
-		if statusErr != nil {
+		if persistedErr != nil || filenameID != id {
 			if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
 				return renameErr
 			}
 			continue
 		}
-		if status == "deleting" {
+		count, countErr := CountPackets(path)
+		if countErr != nil {
+			return countErr
+		}
+		if persisted.Status == "creating" && extension == ".partial" && count == 0 {
+			if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err = s.state.DeleteCreatingRecording(ctx, id.String()); err != nil {
+				return err
+			}
+			continue
+		}
+		if persisted.Status == "deleting" {
 			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				return removeErr
 			}
@@ -357,35 +430,33 @@ func (s *Service) recover(ctx context.Context) error {
 			}
 			continue
 		}
+		if persisted.Status == "complete" || persisted.Status == "partial" {
+			if extension == ".partial" {
+				if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
+					return renameErr
+				}
+			}
+			continue
+		}
+		reasons := uint32(PartialProcessRestart)
+		if truncated {
+			reasons |= PartialTruncatedEntry
+		}
+		finalStatus, finalReason, _, prepareErr := s.state.PrepareRecoveryByState(ctx, id.String(), "partial", "process_restart", reasons)
+		if prepareErr != nil {
+			return prepareErr
+		}
 		if extension == ".partial" {
 			final := filepath.Join(s.directory, id.String()+".orar")
-			count, countErr := CountPackets(path)
-			if countErr != nil {
-				return countErr
-			}
-			if err = s.state.PrepareRecoveryFinalize(ctx, id.String(), "partial", "process_restart", PartialServerShutdown); err != nil {
-				return err
-			}
 			if err = os.Rename(path, final); err != nil {
 				return err
 			}
 			if err = syncDirectory(s.directory); err != nil {
 				return err
 			}
-			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), count, size, sum); err != nil {
-				return err
-			}
-		} else if status != "complete" && status != "partial" {
-			count, countErr := CountPackets(path)
-			if countErr != nil {
-				return countErr
-			}
-			if err = s.state.PrepareRecoveryFinalize(ctx, id.String(), "partial", "process_restart", PartialServerShutdown); err != nil {
-				return err
-			}
-			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), count, size, sum); err != nil {
-				return err
-			}
+		}
+		if err = s.state.FinishRecording(ctx, id.String(), finalStatus, finalReason, time.Now(), count, size, sum); err != nil {
+			return err
 		}
 	}
 	recoverable, err := s.state.RecoverableRecordingIDs(ctx)
@@ -394,7 +465,16 @@ func (s *Service) recover(ctx context.Context) error {
 	}
 	for _, id := range recoverable {
 		if !seen[id] {
-			if err = s.state.MarkRecordingUnavailable(ctx, id, "archive_missing", time.Now()); err != nil {
+			state, stateErr := s.state.RecordingRecoveryState(ctx, id)
+			if stateErr != nil {
+				return stateErr
+			}
+			if state.Status == "creating" {
+				err = s.state.DeleteCreatingRecording(ctx, id)
+			} else {
+				err = s.state.MarkRecordingUnavailable(ctx, id, "archive_missing", time.Now())
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -426,8 +506,12 @@ func (s *Service) Purge(ctx context.Context, retention time.Duration, now time.T
 	}
 	for _, id := range ids {
 		if err = s.Delete(ctx, id, now); err != nil {
+			s.observe("purge", "failure")
 			return err
 		}
+	}
+	if len(ids) > 0 {
+		s.observe("purge", "success")
 	}
 	return nil
 }
@@ -508,9 +592,11 @@ func (s *Service) delete(ctx context.Context, id, actor string, now time.Time) e
 		return err
 	}
 	if err = s.state.MarkRecordingDeleted(ctx, id, now); err != nil {
+		s.observe("delete", "failure")
 		return err
 	}
 	s.addUsed(-info.Size())
+	s.observe("delete", "success")
 	return nil
 }
 func (s *Service) ReadPackets(id string) ([]Packet, error) {

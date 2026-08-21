@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,42 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 		t.Fatal(err)
 	}
 	return New(Config{PublicOrigin: "https://radio.example.test", OpenAccess: true, SessionIdle: 12 * time.Hour, SessionAbsolute: 7 * 24 * time.Hour, MaxSessions: 3, Argon2: auth.DefaultParams()}, s), s
+}
+
+func TestReadinessIsCachedAndIdenticalAcrossSurfaces(t *testing.T) {
+	state, err := store.Open(context.Background(), t.TempDir()+"/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	hash, _ := auth.HashPassword("quiet marble nebula orchard", auth.DefaultParams())
+	_, _ = state.CreateUser(context.Background(), store.CreateUser{Username: "admin", Role: store.RoleAdmin, PasswordHash: hash})
+	var healthy atomic.Bool
+	var checks atomic.Int32
+	server := New(Config{OpenAccess: true, Argon2: auth.DefaultParams(), ReadyCheck: func() bool { checks.Add(1); return healthy.Load() }}, state)
+	before := checks.Load()
+	for index := 0; index < 3; index++ {
+		if server.statusData()["ready"] != false {
+			t.Fatal("public status was ready while dependency cache was false")
+		}
+	}
+	if checks.Load() != before {
+		t.Fatal("public status performed a synchronous dependency probe")
+	}
+	healthy.Store(true)
+	server.RefreshReadiness(context.Background())
+	if server.statusData()["ready"] != true {
+		t.Fatal("public status did not use refreshed readiness")
+	}
+	w := httptest.NewRecorder()
+	server.readyz(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("readyz=%d", w.Code)
+	}
+	server.BeginDrain()
+	if server.statusData()["ready"] != false {
+		t.Fatal("draining status remained ready")
+	}
 }
 
 func TestLocalHTTPSAndWSSHandshake(t *testing.T) {
@@ -73,6 +110,20 @@ func TestMediaOutputQueueEnforcesBytesAndHalfSecondSpan(t *testing.T) {
 	queue.taken(item)
 	if !queue.enqueue(socketOutput{kind: websocket.MessageBinary, data: make([]byte, 10), timestamp: 24_101}) {
 		t.Fatal("queue accounting did not release written bytes")
+	}
+}
+
+func TestMediaOutputQueueTracksRetainedHeadAfterPartialDrain(t *testing.T) {
+	queue := newMediaOutputQueue(8, 100)
+	first := socketOutput{kind: websocket.MessageBinary, data: []byte{1}, timestamp: 100}
+	second := socketOutput{kind: websocket.MessageBinary, data: []byte{2}, timestamp: 200}
+	if !queue.enqueue(first) || !queue.enqueue(second) {
+		t.Fatal("setup enqueue failed")
+	}
+	item := <-queue.items
+	queue.taken(item)
+	if !queue.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte{3}, timestamp: 24_101}) {
+		t.Fatal("departed queue head was retained in time accounting")
 	}
 }
 func TestSecurityHeadersAndMetricsIsolation(t *testing.T) {
@@ -143,6 +194,23 @@ func TestChannelIDUsesCanonicalLosslessDecimal(t *testing.T) {
 		if !tc.ok && err == nil {
 			t.Fatalf("%q accepted", tc.value)
 		}
+	}
+}
+
+func TestGlobalWebSocketLimitIsExactly250(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	server.cfg.MaxWebSockets = 250
+	for index := 0; index < 250; index++ {
+		if !server.acquireSocket("") {
+			t.Fatalf("socket %d was rejected", index+1)
+		}
+	}
+	if server.acquireSocket("") {
+		t.Fatal("socket 251 was accepted")
+	}
+	for index := 0; index < 250; index++ {
+		server.releaseSocket("")
 	}
 }
 

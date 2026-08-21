@@ -49,7 +49,6 @@ type Config struct {
 	PlaybackQueueBytes           int
 	ControlQueueMessages         int
 	MaxPlaybacks                 int
-	PlaybackMaxDuration          time.Duration
 	MaxConcurrentHashes          int
 	Passkeys                     *passkey.Manager
 	TrustedProxyCIDRs            []string
@@ -62,25 +61,26 @@ type Config struct {
 	ReadyCheck                   func() bool
 }
 type Server struct {
-	cfg                  Config
-	store                *store.Store
-	ready                atomic.Bool
-	public, monitor      http.Handler
-	hashSlots, hashQueue chan struct{}
-	dummyPasswordHash    string
-	limiter              *limit.Limiter
-	trustedProxies       []*net.IPNet
-	wsMu                 sync.Mutex
-	wsActive             int
-	wsBySession          map[string]int
-	shutdown             chan struct{}
-	shutdownOnce         sync.Once
-	channelMu            sync.Mutex
-	channelUsed          map[uint64]struct{}
-	revocationMu         sync.Mutex
-	revocationNext       uint64
-	revocations          map[uint64]socketRevocation
-	playbackSlots        chan struct{}
+	cfg                                    Config
+	store                                  *store.Store
+	accepting, dependenciesReady, draining atomic.Bool
+	public, monitor                        http.Handler
+	hashSlots, hashQueue                   chan struct{}
+	dummyPasswordHash                      string
+	limiter                                *limit.Limiter
+	trustedProxies                         []*net.IPNet
+	wsMu                                   sync.Mutex
+	wsActive                               int
+	wsBySession                            map[string]int
+	shutdown                               chan struct{}
+	shutdownOnce                           sync.Once
+	channelMu                              sync.Mutex
+	channelUsed                            map[uint64]struct{}
+	revocationMu                           sync.Mutex
+	revocationNext                         uint64
+	revocations                            map[uint64]socketRevocation
+	playbackSlots                          chan struct{}
+	telemetry                              *webTelemetry
 }
 type socketRevocation struct {
 	sessionID, userID string
@@ -97,22 +97,55 @@ func New(cfg Config, state *store.Store) *Server {
 		maxPlaybacks = 50
 	}
 	dummy, _ := auth.HashPassword("dummy authentication workload", cfg.Argon2)
-	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16), dummyPasswordHash: dummy, limiter: limit.New(), wsBySession: map[string]int{}, shutdown: make(chan struct{}), channelUsed: map[uint64]struct{}{}, revocations: map[uint64]socketRevocation{}, playbackSlots: make(chan struct{}, maxPlaybacks)}
+	s := &Server{cfg: cfg, store: state, hashSlots: make(chan struct{}, concurrent), hashQueue: make(chan struct{}, 16), dummyPasswordHash: dummy, limiter: limit.New(), wsBySession: map[string]int{}, shutdown: make(chan struct{}), channelUsed: map[uint64]struct{}{}, revocations: map[uint64]socketRevocation{}, playbackSlots: make(chan struct{}, maxPlaybacks), telemetry: newWebTelemetry()}
 	for _, value := range cfg.TrustedProxyCIDRs {
 		_, network, err := net.ParseCIDR(value)
 		if err == nil {
 			s.trustedProxies = append(s.trustedProxies, network)
 		}
 	}
-	s.ready.Store(true)
+	s.accepting.Store(true)
+	s.RefreshReadiness(context.Background())
 	s.public = s.security(s.publicMux())
 	s.monitor = s.security(s.monitorMux())
 	return s
 }
 func (s *Server) PublicHandler() http.Handler  { return s.public }
 func (s *Server) MonitorHandler() http.Handler { return s.monitor }
-func (s *Server) SetReady(v bool)              { s.ready.Store(v) }
-func (s *Server) Shutdown()                    { s.ready.Store(false); s.shutdownOnce.Do(func() { close(s.shutdown) }) }
+func (s *Server) SetReady(v bool)              { s.accepting.Store(v) }
+func (s *Server) BeginDrain() {
+	s.accepting.Store(false)
+	s.draining.Store(true)
+}
+func (s *Server) Shutdown() {
+	s.BeginDrain()
+	s.shutdownOnce.Do(func() { close(s.shutdown) })
+}
+func (s *Server) RefreshReadiness(ctx context.Context) bool {
+	ready := s.cfg.ReadyCheck == nil || s.cfg.ReadyCheck()
+	if ready {
+		n, err := s.store.EnabledAdminCount(ctx)
+		ready = err == nil && n > 0
+	}
+	if ready && s.cfg.ReflectorMonitor != nil {
+		snapshot, ok := s.cfg.ReflectorMonitor.Snapshot()
+		ready = ok && snapshot.Ready && s.cfg.ReflectorMonitor.Fresh(s.cfg.MonitorStaleAfter)
+	}
+	s.dependenciesReady.Store(ready)
+	return ready
+}
+func (s *Server) RecordArchive(action, result string) {
+	s.telemetry.inc("opusrefweb_archive_total", action, result)
+	if result == "failure" || result == "partial" {
+		s.telemetry.event("archive_"+result, map[bool]string{true: "error", false: "warning"}[result == "failure"], "An archive lifecycle operation requires operator attention.")
+	}
+}
+func (s *Server) RecordReconnect(client, result string) {
+	s.telemetry.inc("opusrefweb_reconnect_total", client, result)
+	if result == "failure" {
+		s.telemetry.event("reflector_reconnect", "warning", "A reflector client reconnect attempt failed.")
+	}
+}
 func (s *Server) publicMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
@@ -145,6 +178,7 @@ func (s *Server) publicMux() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/admin/accounts/{id}/passkeys", s.requireAdmin(s.clearAccountPasskeys))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.requireAdmin(s.listAudit))
 	mux.HandleFunc("GET /api/v1/admin/clients", s.requireAdmin(s.adminClients))
+	mux.HandleFunc("GET /api/v1/admin/events", s.requireAdmin(s.adminEvents))
 	mux.HandleFunc("GET /api/v1/public/status", s.publicStatus)
 	mux.HandleFunc("GET /api/v1/ws", s.webSocket)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -162,10 +196,10 @@ type socketOutput struct {
 	timestamp uint32
 }
 type mediaOutputQueue struct {
-	items                         chan socketOutput
-	mu                            sync.Mutex
-	bytes, maxBytes               int
-	firstTimestamp, lastTimestamp uint32
+	items           chan socketOutput
+	mu              sync.Mutex
+	bytes, maxBytes int
+	timestamps      []uint32
 }
 
 func newMediaOutputQueue(packets, maxBytes int) *mediaOutputQueue {
@@ -180,16 +214,13 @@ func newMediaOutputQueue(packets, maxBytes int) *mediaOutputQueue {
 func (q *mediaOutputQueue) enqueue(item socketOutput) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	spanTooLarge := len(q.items) > 0 && item.timestamp-q.firstTimestamp > 24_000
+	spanTooLarge := len(q.timestamps) > 0 && item.timestamp-q.timestamps[0] > 24_000
 	if spanTooLarge || q.bytes+len(item.data) > q.maxBytes {
 		return false
 	}
 	select {
 	case q.items <- item:
-		if len(q.items) == 1 {
-			q.firstTimestamp = item.timestamp
-		}
-		q.lastTimestamp = item.timestamp
+		q.timestamps = append(q.timestamps, item.timestamp)
 		q.bytes += len(item.data)
 		return true
 	default:
@@ -203,8 +234,8 @@ func (q *mediaOutputQueue) taken(item socketOutput) {
 	if q.bytes < 0 {
 		q.bytes = 0
 	}
-	if len(q.items) == 0 {
-		q.firstTimestamp, q.lastTimestamp = 0, 0
+	if len(q.timestamps) > 0 {
+		q.timestamps = q.timestamps[1:]
 	}
 }
 func (q *mediaOutputQueue) discard() {
@@ -213,7 +244,8 @@ func (q *mediaOutputQueue) discard() {
 	for len(q.items) > 0 {
 		<-q.items
 	}
-	q.bytes, q.firstTimestamp, q.lastTimestamp = 0, 0, 0
+	q.bytes = 0
+	q.timestamps = q.timestamps[:0]
 }
 
 func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +398,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		case output <- socketOutput{kind: websocket.MessageText, data: encoded}:
 			return true
 		default:
+			s.telemetry.inc("opusrefweb_queue_drops_total", "control")
+			s.telemetry.inc("opusrefweb_websocket_closes_total", "overload")
+			s.telemetry.event("control_overload", "error", "A WebSocket control queue overflowed.")
+			_ = conn.Close(4409, "overload")
+			cancel()
 			return false
 		}
 	}
@@ -394,6 +431,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 	var playbackChannel uint64
 	var playbackFile *webarchive.Playback
 	var playbackElapsed uint32
+	var playbackResumeElapsed uint32
 	var playbackSlot atomic.Bool
 	releasePlaybackSlot := func() {
 		if playbackSlot.Swap(false) {
@@ -523,8 +561,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 							continue
 						}
 						if liveOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: media.Timestamp}) {
+							s.telemetry.inc("opusrefweb_audio_packets_total", "live")
 							outboundSequence++
 						} else {
+							s.telemetry.inc("opusrefweb_queue_drops_total", "live")
+							s.telemetry.event("live_discontinuity", "warning", "A slow listener caused a live-audio discontinuity.")
 							liveOutput.discard()
 							old := outboundChannel
 							newChannel, channelErr := s.newChannel()
@@ -551,7 +592,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		playbackCancel = stop
 		channel := playbackChannel
 		archivePlayback := playbackFile
-		elapsed := playbackElapsed
+		elapsed := playbackResumeElapsed
 		playbackMu.Unlock()
 		go func() {
 			if archivePlayback == nil {
@@ -563,6 +604,8 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			defer cursor.Close()
 			previous := elapsed
+			accepted := playbackElapsed
+			var outboundSequence uint32
 			first := true
 			for {
 				packet, nextErr := cursor.Next()
@@ -584,17 +627,26 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				first = false
 				previous = packet.ArrivalMS
-				encoded, encodeErr := wsprotocol.EncodeMedia(wsprotocol.Media{Kind: wsprotocol.KindPlayback, ChannelID: channel, Sequence: uint32(cursor.Index() - 1), Timestamp: packet.Timestamp, Payload: packet.Payload})
+				encoded, encodeErr := wsprotocol.EncodeMedia(wsprotocol.Media{Kind: wsprotocol.KindPlayback, ChannelID: channel, Sequence: outboundSequence, Timestamp: packet.Timestamp, Payload: packet.Payload})
 				if encodeErr != nil {
 					return
 				}
 				if playbackOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: packet.Timestamp}) {
+					s.telemetry.inc("opusrefweb_audio_packets_total", "playback")
+					outboundSequence++
+					accepted = packet.ArrivalMS
 					playbackMu.Lock()
 					playbackElapsed = packet.ArrivalMS
+					playbackResumeElapsed = packet.ArrivalMS
 					playbackMu.Unlock()
 				} else {
+					s.telemetry.inc("opusrefweb_queue_drops_total", "playback")
+					s.telemetry.event("playback_paused", "warning", "Playback paused because its output queue was full.")
 					playbackOutput.discard()
-					sendLifecycle(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "paused", "elapsed_ms": previous}})
+					playbackMu.Lock()
+					playbackResumeElapsed = packet.ArrivalMS
+					playbackMu.Unlock()
+					sendLifecycle(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "paused", "elapsed_ms": accepted}})
 					return
 				}
 			}
@@ -604,6 +656,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackChannel = 0
 				playbackFile = nil
 				playbackElapsed = 0
+				playbackResumeElapsed = 0
 			}
 			playbackMu.Unlock()
 			if ownsChannel {
@@ -639,6 +692,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				_ = conn.Close(4400, "invalid_media_state")
 				break
 			}
+			s.telemetry.inc("opusrefweb_audio_packets_total", "transmit")
 			continue
 		}
 		control, decodeErr := wsprotocol.DecodeControl(data, wsprotocol.ClientToServer)
@@ -696,9 +750,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			grant, startErr := s.cfg.PTT.StartForUser(ctx, session.ID, session.UserID, session.Callsign)
 			if startErr != nil {
+				s.telemetry.inc("opusrefweb_ptt_total", "busy")
 				sendControl(map[string]any{"api_version": 1, "type": "ptt_busy", "request_id": control.RequestID, "body": map[string]any{}})
 				continue
 			}
+			s.telemetry.inc("opusrefweb_ptt_total", "grant")
 			sendControl(map[string]any{"api_version": 1, "type": "ptt_granted", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(grant.ChannelID, 10), "tot_seconds": 180}})
 		case "ptt_stop":
 			var stop struct {
@@ -717,6 +773,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "not_owner", "text": "The PTT channel is not owned by this session."}})
 				continue
 			}
+			s.telemetry.inc("opusrefweb_ptt_total", "stop")
 			sendControl(map[string]any{"api_version": 1, "type": "ptt_ended", "request_id": control.RequestID, "body": map[string]any{"channel_id": stop.ChannelID, "reason": "normal"}})
 		case "playback_open":
 			if !privileged() || session.PasswordChangeRequired || s.cfg.Archives == nil {
@@ -761,22 +818,13 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			duration := indexed.DurationMS()
-			maximumDuration := s.cfg.PlaybackMaxDuration
-			if maximumDuration <= 0 {
-				maximumDuration = 15 * time.Minute
-			}
-			if time.Duration(duration)*time.Millisecond > maximumDuration {
-				if acquiredPlaybackSlot {
-					releasePlaybackSlot()
-				}
-				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "recording_too_long", "text": "The recording exceeds the playback duration limit."}})
-				continue
-			}
 			playbackMu.Lock()
 			playbackChannel = channelID
 			playbackFile = indexed
 			playbackElapsed = 0
+			playbackResumeElapsed = 0
 			playbackMu.Unlock()
+			s.telemetry.inc("opusrefweb_playback_total", "open", "success")
 			sendControl(map[string]any{"api_version": 1, "type": "playback_opened", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(channelID, 10), "recording_id": open.RecordingID, "duration_ms": duration, "status": recording.Status}})
 			startPlayback()
 		case "playback_pause", "playback_resume", "playback_close":
@@ -803,6 +851,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackChannel = 0
 				playbackFile = nil
 				playbackElapsed = 0
+				playbackResumeElapsed = 0
 			}
 			playbackMu.Unlock()
 			if !valid {
@@ -816,6 +865,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				startPlayback()
 			}
 			state := map[string]string{"playback_pause": "paused", "playback_resume": "playing", "playback_close": "closed"}[control.Type]
+			s.telemetry.inc("opusrefweb_playback_total", strings.TrimPrefix(control.Type, "playback_"), "success")
 			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": action.ChannelID, "state": state, "elapsed_ms": elapsed}})
 		case "playback_seek":
 			if !privileged() {
@@ -841,7 +891,9 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackCancel()
 			}
 			playbackElapsed = uint32(seek.ElapsedMS)
+			playbackResumeElapsed = uint32(seek.ElapsedMS)
 			playbackMu.Unlock()
+			s.telemetry.inc("opusrefweb_playback_total", "seek", "success")
 			startPlayback()
 			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": seek.ChannelID, "state": "playing", "elapsed_ms": seek.ElapsedMS}})
 		default:
@@ -929,10 +981,21 @@ func (s *Server) monitorMux() http.Handler {
 		}
 		counts, _ := s.store.MonitoringCounts(context.Background(), time.Now())
 		var archiveUsed, archiveQuota int64
+		quotaFull, degraded := 0, 0
 		if s.cfg.Archives != nil {
 			archiveUsed, archiveQuota = s.cfg.Archives.Usage()
+			if s.cfg.Archives.QuotaFull() {
+				quotaFull, degraded = 1, 1
+			}
+			if !s.cfg.Archives.Ready() {
+				degraded = 1
+			}
 		}
-		_, _ = fmt.Fprintf(w, "# TYPE opusrefweb_up gauge\nopusrefweb_up 1\n# TYPE opusrefweb_ready gauge\nopusrefweb_ready %d\n# TYPE opusrefweb_websocket_connections gauge\nopusrefweb_websocket_connections %d\n# TYPE opusrefweb_accounts gauge\nopusrefweb_accounts %d\n# TYPE opusrefweb_sessions gauge\nopusrefweb_sessions %d\n# TYPE opusrefweb_recordings gauge\nopusrefweb_recordings %d\n# TYPE opusrefweb_archive_bytes gauge\nopusrefweb_archive_bytes %d\n# TYPE opusrefweb_archive_quota_bytes gauge\nopusrefweb_archive_quota_bytes %d\n# TYPE opusrefweb_authentication_failures_total counter\nopusrefweb_authentication_failures_total %d\n", ready, active, counts.Accounts, counts.Sessions, counts.Recordings, archiveUsed, archiveQuota, counts.AuthenticationFailures)
+		if ready == 0 {
+			degraded = 1
+		}
+		_, _ = fmt.Fprintf(w, "# TYPE opusrefweb_up gauge\nopusrefweb_up 1\n# TYPE opusrefweb_ready gauge\nopusrefweb_ready %d\n# TYPE opusrefweb_degraded gauge\nopusrefweb_degraded %d\n# TYPE opusrefweb_websocket_connections gauge\nopusrefweb_websocket_connections %d\n# TYPE opusrefweb_accounts gauge\nopusrefweb_accounts %d\n# TYPE opusrefweb_sessions gauge\nopusrefweb_sessions %d\n# TYPE opusrefweb_recordings gauge\nopusrefweb_recordings %d\n# TYPE opusrefweb_archive_bytes gauge\nopusrefweb_archive_bytes %d\n# TYPE opusrefweb_archive_quota_bytes gauge\nopusrefweb_archive_quota_bytes %d\n# TYPE opusrefweb_archive_quota_full gauge\nopusrefweb_archive_quota_full %d\n# TYPE opusrefweb_authentication_failures_total counter\nopusrefweb_authentication_failures_total %d\n", ready, degraded, active, counts.Accounts, counts.Sessions, counts.Recordings, archiveUsed, archiveQuota, quotaFull, counts.AuthenticationFailures)
+		_, _ = fmt.Fprint(w, s.telemetry.render())
 	})
 	return mux
 }
@@ -945,7 +1008,13 @@ func (s *Server) security(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Permissions-Policy", "microphone=(self), camera=(), geolocation=()")
-		next.ServeHTTP(w, r)
+		if s.draining.Load() && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "server_draining"})
+			return
+		}
+		observed := &observedWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(observed, r)
+		s.telemetry.inc("opusrefweb_http_requests_total", routeLabel(r.Pattern, r.URL.Path), statusClass(observed.status))
 	})
 }
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -953,16 +1022,6 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
 	if !s.operationalReady() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
-		return
-	}
-	n, err := s.store.EnabledAdminCount(context.Background())
-	monitorReady := true
-	if s.cfg.ReflectorMonitor != nil {
-		snapshot, ok := s.cfg.ReflectorMonitor.Snapshot()
-		monitorReady = ok && snapshot.Ready && s.cfg.ReflectorMonitor.Fresh(s.cfg.MonitorStaleAfter)
-	}
-	if err != nil || n == 0 || !monitorReady {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
 		return
 	}
@@ -995,6 +1054,7 @@ func (s *Server) statusData() map[string]any {
 		}
 	}
 	quotaFull := s.cfg.Archives != nil && s.cfg.Archives.QuotaFull()
+	s.telemetry.setQuota(quotaFull)
 	health := "ok"
 	if quotaFull {
 		health = "degraded"
@@ -1005,7 +1065,7 @@ func (s *Server) statusData() map[string]any {
 	return map[string]any{"health": health, "ready": s.operationalReady(), "reflector": reflector, "client_count": clientCount, "floor": floor, "recording": map[string]any{"available": s.cfg.Archives != nil && s.cfg.Archives.Ready(), "quota_full": quotaFull}, "server_time": time.Now().UTC().Format(time.RFC3339)}
 }
 func (s *Server) operationalReady() bool {
-	return s.ready.Load() && (s.cfg.ReadyCheck == nil || s.cfg.ReadyCheck())
+	return s.accepting.Load() && s.dependenciesReady.Load()
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	session, err := s.requestSession(r)
@@ -1038,6 +1098,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	limiterName := strings.ToLower(in.Username)
 	if !s.limiter.Allow("login_user", limiterName, 5, 15*time.Minute, time.Now()) || !s.limiter.Allow("login_ip", s.clientAddress(r), 5, 15*time.Minute, time.Now()) {
+		s.telemetry.inc("opusrefweb_auth_total", "password", "rate_limited")
+		s.telemetry.event("rate_limit", "warning", "A password authentication rate limit was reached.")
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -1061,6 +1123,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, rehash, err := auth.VerifyPassword(in.Password, hash, s.cfg.Argon2)
 	if err != nil || !ok || lookupErr != nil || user.Disabled {
+		s.telemetry.inc("opusrefweb_auth_total", "password", "failure")
 		var target *string
 		if lookupErr == nil {
 			target = &user.ID
@@ -1080,6 +1143,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: raw, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: session.AbsoluteExpiry})
+	s.telemetry.inc("opusrefweb_auth_total", "password", "success")
 	_ = s.store.WriteAudit(r.Context(), "login", "success", &user.ID, &user.ID, nil, "{}", time.Now())
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": session.Role, "username": user.Username, "source_callsign": user.Callsign, "csrf_token": csrf, "forced_password_change": session.PasswordChangeRequired, "passkey_available": false})
 }
@@ -1239,22 +1303,32 @@ func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	userID, err := s.cfg.Passkeys.FinishLogin(r.Context(), in.CeremonyID, in.Credential)
+	userID, err := s.cfg.Passkeys.FinishLoginAllowed(r.Context(), in.CeremonyID, in.Credential, func(userID string) bool {
+		return s.limiter.Allow("passkey_account", userID, 10, time.Minute, time.Now())
+	})
 	if err != nil {
 		var failure *passkey.VerificationFailure
+		result := "failure"
 		if errors.As(err, &failure) && failure.UserID != "" {
-			_ = s.limiter.Allow("passkey_account", failure.UserID, 10, 10*time.Minute, time.Now())
-			action := "passkey_login"
-			if failure.Regression {
-				action = "passkey_counter_regression"
+			outcome := "failure"
+			if failure.RateLimited {
+				result = "rate_limited"
 			}
-			s.audit(r.Context(), action, "failure", failure.UserID, failure.UserID, "")
+			if failure.Regression {
+				outcome = "sign_counter_regression"
+				result = "sign_counter_regression"
+			}
+			s.audit(r.Context(), "passkey_login", outcome, failure.UserID, failure.UserID, "")
+		} else {
+			s.audit(r.Context(), "passkey_login", "failure", "", "", "")
+		}
+		s.telemetry.inc("opusrefweb_auth_total", "passkey", result)
+		if result == "rate_limited" {
+			s.telemetry.event("rate_limit", "warning", "A passkey account rate limit was reached.")
+			writeError(w, http.StatusTooManyRequests, "rate_limited")
+			return
 		}
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
-		return
-	}
-	if !s.limiter.Allow("passkey_account", userID, 10, 10*time.Minute, time.Now()) {
-		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	user, err := s.store.FindUserByID(r.Context(), userID)
@@ -1269,6 +1343,7 @@ func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: raw, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: session.AbsoluteExpiry})
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "username": user.Username, "role": user.Role, "source_callsign": user.Callsign, "csrf_token": csrf, "forced_password_change": user.PasswordChangeRequired, "passkey_available": true})
+	s.telemetry.inc("opusrefweb_auth_total", "passkey", "success")
 	s.audit(r.Context(), "passkey_login", "success", user.ID, user.ID, "")
 }
 func (s *Server) passkeyEnrollOptions(w http.ResponseWriter, r *http.Request, session store.Session) {
@@ -1337,12 +1412,12 @@ func (s *Server) passkeyReauthVerify(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	if err := s.cfg.Passkeys.FinishReauth(r.Context(), in.CeremonyID, session.UserID, session.ID, in.Credential); err != nil {
-		action := "reauth_passkey"
+		outcome := "failure"
 		var failure *passkey.VerificationFailure
 		if errors.As(err, &failure) && failure.Regression {
-			action = "passkey_counter_regression"
+			outcome = "sign_counter_regression"
 		}
-		s.audit(r.Context(), action, "failure", session.UserID, session.UserID, "")
+		s.audit(r.Context(), "reauth_passkey", outcome, session.UserID, session.UserID, "")
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
@@ -1527,6 +1602,9 @@ func (s *Server) adminClients(w http.ResponseWriter, r *http.Request, _ store.Se
 		response["next_cursor"] = encodeAdminCursor(adminCursor{Kind: "clients", Offset: end})
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+func (s *Server) adminEvents(w http.ResponseWriter, _ *http.Request, _ store.Session) {
+	writeJSON(w, http.StatusOK, page(s.telemetry.recent()))
 }
 func (s *Server) clearAccountPasskeys(w http.ResponseWriter, r *http.Request, session store.Session) {
 	if !s.validCSRF(r, session) {
@@ -1866,7 +1944,13 @@ func (s *Server) audit(ctx context.Context, action, outcome, actor, target, reco
 	if recording != "" {
 		recordingID = &recording
 	}
-	_ = s.store.WriteAudit(ctx, action, outcome, actorID, targetID, recordingID, "{}", time.Now())
+	if err := s.store.WriteAudit(ctx, action, outcome, actorID, targetID, recordingID, "{}", time.Now()); err != nil {
+		s.telemetry.inc("opusrefweb_audit_writes_total", "failure")
+		s.telemetry.inc("opusrefweb_db_errors_total", "audit")
+		s.telemetry.event("audit_failure", "error", "An operator audit event could not be stored.")
+	} else {
+		s.telemetry.inc("opusrefweb_audit_writes_total", "success")
+	}
 }
 
 type recordingCursor struct {

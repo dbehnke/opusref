@@ -70,6 +70,19 @@ The service refuses readiness when no enabled administrator exists. Stop the
 service with SIGTERM. The process removes readiness before it closes the HTTP
 listeners and reflector clients.
 
+Readiness is a cached dependency state shared by `/readyz`, public status, and
+WebSocket `hello_ok`. A bounded background worker probes archive storage. Public
+requests do not perform file creation or `fsync`. During shutdown, the service
+rejects new work, stops PTT, closes WebSockets with 4410, finalizes the archive,
+closes both reflector clients, and then closes HTTP within one five-second
+grace period.
+
+The monitor listener exports fixed-cardinality HTTP, WebSocket, audio, queue,
+PTT, authentication, archive, playback, database, reconnect, and audit metric
+families. Callsigns and account identifiers are not metric labels. An
+administrator can read the newest 256 redacted operational alerts from
+`GET /api/v1/admin/events`; older entries are discarded in memory.
+
 The receive client and transmit client reconnect with a bounded exponential
 delay. Readiness is false unless both clients have authenticated reflector
 sessions. A reconnect does not change the browser API. A reflector revoke ends

@@ -19,3 +19,20 @@ func TestGrantAttributionCorrelatesAndRetiresReflectorStream(t *testing.T) {
 		t.Fatalf("retired user=%q", got)
 	}
 }
+
+func TestGrantAttributionPublishesExactLateBinding(t *testing.T) {
+	attribution := NewGrantAttribution()
+	bindings, cancel := attribution.SubscribeBindings()
+	defer cancel()
+	attribution.Begin("user-1")
+	key := ReflectorStream{SessionID: 88, StreamID: 3}
+	attribution.Bind(key, "user-1")
+	select {
+	case binding := <-bindings:
+		if binding.Stream != key || binding.UserID != "user-1" {
+			t.Fatalf("binding=%+v", binding)
+		}
+	default:
+		t.Fatal("binding was not published")
+	}
+}

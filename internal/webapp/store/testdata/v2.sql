@@ -1,0 +1,12 @@
+CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+INSERT INTO schema_migrations VALUES(2,'2026-01-01T00:00:00Z');
+CREATE TABLE users(id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE,role TEXT NOT NULL CHECK(role IN('admin','user')),callsign TEXT UNIQUE,webauthn_handle BLOB NOT NULL UNIQUE,password_hash TEXT NOT NULL,password_change_required INTEGER NOT NULL DEFAULT 0,disabled_at TEXT,deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE webauthn_credentials(id BLOB PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),rp_id TEXT NOT NULL,public_key BLOB NOT NULL,sign_count INTEGER NOT NULL,transports TEXT NOT NULL,backup_eligible INTEGER NOT NULL,backup_state INTEGER NOT NULL,label TEXT NOT NULL,created_at TEXT NOT NULL,last_used_at TEXT);
+CREATE TABLE sessions(token_hash BLOB PRIMARY KEY,id TEXT NOT NULL UNIQUE,user_id TEXT NOT NULL REFERENCES users(id),csrf_hash BLOB NOT NULL,reauth_hash BLOB,reauth_expiry TEXT,created_at TEXT NOT NULL,last_seen TEXT NOT NULL,absolute_expiry TEXT NOT NULL,revoked_at TEXT);
+CREATE TABLE recordings(id TEXT PRIMARY KEY,node_callsign TEXT NOT NULL,source_callsign TEXT NOT NULL,web_user_id TEXT,start_at TEXT NOT NULL,end_at TEXT,status TEXT NOT NULL,intended_status TEXT,partial_reasons INTEGER NOT NULL DEFAULT 0,end_reason TEXT,packet_count INTEGER NOT NULL DEFAULT 0,first_sequence INTEGER,last_sequence INTEGER,first_timestamp INTEGER,last_timestamp INTEGER,byte_size INTEGER NOT NULL DEFAULT 0,relative_path TEXT NOT NULL UNIQUE,sha256 BLOB,created_at TEXT NOT NULL,deleted_at TEXT);
+CREATE TABLE user_tombstones(user_id TEXT PRIMARY KEY,username TEXT NOT NULL,source_callsign TEXT,deleted_at TEXT NOT NULL);
+CREATE TABLE audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,occurred_at TEXT NOT NULL,action TEXT NOT NULL,outcome TEXT NOT NULL,actor_id TEXT,target_id TEXT,recording_id TEXT,details TEXT NOT NULL DEFAULT '{}');
+INSERT INTO users(id,username,role,webauthn_handle,password_hash,created_at,updated_at) VALUES('fixture-user','fixture','admin',X'0102','fixture-hash','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+CREATE INDEX recordings_browse ON recordings(status,start_at DESC,id DESC);
+CREATE INDEX recordings_retention ON recordings(status,end_at);
+CREATE INDEX audit_browse ON audit_events(id DESC);

@@ -73,7 +73,7 @@ func TestRecoveryRepairsOnlyTornTrailingEntryAndFinalizesPartial(t *testing.T) {
 	}
 	defer service.Close()
 	recording, err := state.RecordingByID(ctx, id.String())
-	if err != nil || recording.Status != "partial" || recording.PartialReasons&PartialServerShutdown == 0 || recording.PacketCount != 1 {
+	if err != nil || recording.Status != "partial" || recording.PartialReasons&PartialProcessRestart == 0 || recording.PartialReasons&PartialTruncatedEntry == 0 || recording.PacketCount != 1 {
 		t.Fatalf("recording=%+v err=%v", recording, err)
 	}
 	if _, err = os.Stat(filepath.Join(directory, id.String()+".orar")); err != nil {
@@ -81,7 +81,7 @@ func TestRecoveryRepairsOnlyTornTrailingEntryAndFinalizesPartial(t *testing.T) {
 	}
 }
 
-func TestRecoveryMarksMissingKnownArchiveUnavailable(t *testing.T) {
+func TestRecoveryRemovesMissingCreatingRow(t *testing.T) {
 	ctx := context.Background()
 	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -97,10 +97,137 @@ func TestRecoveryMarksMissingKnownArchiveUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	var status, reason string
-	err = state.DB().QueryRowContext(ctx, "SELECT status,end_reason FROM recordings WHERE id=?", id).Scan(&status, &reason)
-	if err != nil || status != "unavailable" || reason != "archive_missing" {
-		t.Fatalf("status=%q reason=%q err=%v", status, reason, err)
+	var count int
+	err = state.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM recordings WHERE id=?", id).Scan(&count)
+	if err != nil || count != 0 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestRecoveryPreservesFinalizingIntentAfterRename(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	id := uuid.New()
+	if err = state.InsertRecording(ctx, id.String(), "WEB", "N0CALL", "", id.String()+".orar", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.OpenRecording(ctx, id.String()); err != nil {
+		t.Fatal(err)
+	}
+	file, err := CreateFile(directory, id, MaxFileSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Append(Packet{Payload: []byte{7}})
+	if err = state.BeginRecordingFinalize(ctx, id.String(), "complete", "normal", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err = file.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(ctx, state, directory, MaxFileSize, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	recording, err := state.RecordingByID(ctx, id.String())
+	if err != nil || recording.Status != "complete" || recording.EndReason != "normal" || recording.PartialReasons&PartialProcessRestart == 0 {
+		t.Fatalf("recording=%+v err=%v", recording, err)
+	}
+}
+
+func TestRecoveryTurnsAlreadyRenamedOpenFilePartial(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	id := uuid.New()
+	if err = state.InsertRecording(ctx, id.String(), "WEB", "N0CALL", "", id.String()+".orar", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.OpenRecording(ctx, id.String()); err != nil {
+		t.Fatal(err)
+	}
+	file, err := CreateFile(directory, id, MaxFileSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Append(Packet{Payload: []byte{1}})
+	if _, _, _, err = file.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(ctx, state, directory, MaxFileSize, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	recording, err := state.RecordingByID(ctx, id.String())
+	if err != nil || recording.Status != "partial" || recording.EndReason != "process_restart" || recording.PartialReasons&PartialProcessRestart == 0 {
+		t.Fatalf("recording=%+v err=%v", recording, err)
+	}
+}
+
+func TestRecoveryMarksMissingOpenArchiveUnavailable(t *testing.T) {
+	ctx := context.Background()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	id := uuid.NewString()
+	if err = state.InsertRecording(ctx, id, "WEB", "N0CALL", "", id+".orar", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.OpenRecording(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(ctx, state, t.TempDir(), MaxFileSize, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	stateValue, err := state.RecordingRecoveryState(ctx, id)
+	if err != nil || stateValue.Status != "unavailable" || stateValue.EndReason != "archive_missing" {
+		t.Fatalf("state=%+v err=%v", stateValue, err)
+	}
+}
+
+func TestRecoveryRemovesHeaderOnlyCreatingPartial(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	id := uuid.New()
+	if err = state.InsertRecording(ctx, id.String(), "WEB", "N0CALL", "", id.String()+".orar", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(directory, id.String()+".partial"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = NewWriter(file, id)
+	_ = file.Sync()
+	_ = file.Close()
+	service, err := NewService(ctx, state, directory, MaxFileSize, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	var count int
+	_ = state.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM recordings WHERE id=?", id.String()).Scan(&count)
+	if count != 0 {
+		t.Fatalf("creating row remains: %d", count)
 	}
 }
 
@@ -133,6 +260,30 @@ func TestServiceKeepsBackToBackStreamsSeparate(t *testing.T) {
 		if readErr != nil || len(packets) != 1 {
 			t.Fatalf("packets=%+v err=%v", packets, readErr)
 		}
+	}
+}
+
+func TestLateExactGrantBindingUpdatesReceiveBeforeGrantRecording(t *testing.T) {
+	ctx := context.Background()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	service, err := NewService(ctx, state, t.TempDir(), MaxFileSize, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	key := StreamKey{SessionID: 77, StreamID: 9}
+	service.Start(key, "WEB", "N0CALL", "", time.Now())
+	service.Audio(key, 0, 0, []byte{1}, time.Now())
+	service.Attribute(key, "user-1")
+	service.End(key, "normal", false)
+	var userID string
+	err = state.DB().QueryRowContext(ctx, `SELECT web_user_id FROM recordings`).Scan(&userID)
+	if err != nil || userID != "user-1" {
+		t.Fatalf("web_user_id=%q err=%v", userID, err)
 	}
 }
 
@@ -242,6 +393,24 @@ func TestQuotaFullKeepsRetainedRecordingAndClearsAfterDelete(t *testing.T) {
 	}
 }
 
+func TestDefaultTenGiBQuotaIsSimulatedWithoutAllocation(t *testing.T) {
+	state, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	const quota = int64(10 * 1024 * 1024 * 1024)
+	service, err := NewService(context.Background(), state, t.TempDir(), quota, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	used, configured := service.Usage()
+	if used != 0 || configured != quota {
+		t.Fatalf("used=%d quota=%d", used, configured)
+	}
+}
+
 func TestSparsePlaybackStreamsMoreThan4096PacketsAndSeeks(t *testing.T) {
 	ctx := context.Background()
 	state, err := store.Open(ctx, t.TempDir()+"/state.db")
@@ -292,7 +461,7 @@ func TestSparsePlaybackStreamsMoreThan4096PacketsAndSeeks(t *testing.T) {
 	}
 	defer cursor.Close()
 	packet, err := cursor.Next()
-	if err != nil || packet.ArrivalMS < 80_000 {
+	if err != nil || packet.ArrivalMS > 80_000 || packet.ArrivalMS < 79_980 {
 		t.Fatalf("packet=%+v err=%v", packet, err)
 	}
 }

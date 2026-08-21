@@ -63,18 +63,22 @@ func (p *Playback) NewCursor(elapsed uint32) (*PlaybackCursor, error) {
 		cursor.offset = item.offset
 		cursor.packet = item.packet
 	}
-	for cursor.offset < cursor.size {
-		packet, next, readErr := readPacketAt(cursor.file, cursor.size, cursor.offset)
+	chosenOffset, chosenPacket := cursor.offset, cursor.packet
+	scanOffset, scanPacket := cursor.offset, cursor.packet
+	for scanOffset < cursor.size {
+		packet, next, readErr := readPacketAt(cursor.file, cursor.size, scanOffset)
 		if readErr != nil {
 			cursor.Close()
 			return nil, readErr
 		}
-		if packet.ArrivalMS >= elapsed {
+		if packet.ArrivalMS > elapsed {
 			break
 		}
-		cursor.offset = next
-		cursor.packet++
+		chosenOffset, chosenPacket = scanOffset, scanPacket
+		scanOffset = next
+		scanPacket++
 	}
+	cursor.offset, cursor.packet = chosenOffset, chosenPacket
 	return cursor, nil
 }
 

@@ -31,8 +31,9 @@ type Manager struct {
 }
 
 type VerificationFailure struct {
-	UserID     string
-	Regression bool
+	UserID      string
+	Regression  bool
+	RateLimited bool
 }
 
 func (e *VerificationFailure) Error() string { return "passkey verification failed" }
@@ -94,6 +95,9 @@ func (m *Manager) BeginLogin() (string, any, error) {
 	return id, options, nil
 }
 func (m *Manager) FinishLogin(ctx context.Context, id string, credential json.RawMessage) (string, error) {
+	return m.FinishLoginAllowed(ctx, id, credential, nil)
+}
+func (m *Manager) FinishLoginAllowed(ctx context.Context, id string, credential json.RawMessage, allow func(string) bool) (string, error) {
 	item, err := m.take(id, "login", "", "")
 	if err != nil {
 		return "", err
@@ -104,9 +108,16 @@ func (m *Manager) FinishLogin(ctx context.Context, id string, credential json.Ra
 	validated, err := m.engine.FinishDiscoverableLogin(func(_, handle []byte) (webauthn.User, error) {
 		candidate, loadErr := m.loadByHandle(ctx, handle)
 		resolved = candidate
+		if loadErr == nil && allow != nil && !allow(candidate.userID) {
+			return nil, &VerificationFailure{UserID: candidate.userID, RateLimited: true}
+		}
 		return candidate, loadErr
 	}, item.data, request)
 	if err != nil {
+		var limited *VerificationFailure
+		if errors.As(err, &limited) && limited.RateLimited {
+			return "", limited
+		}
 		return "", &VerificationFailure{UserID: resolved.userID}
 	}
 	if validated.Authenticator.CloneWarning {

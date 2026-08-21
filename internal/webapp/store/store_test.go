@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,44 @@ import (
 
 	"github.com/dbehnke/opusref/internal/webapp/auth"
 )
+
+func TestHistoricalSchemaFixturesMigrateWithDataPreserved(t *testing.T) {
+	for _, version := range []string{"v1", "v2", "v3"} {
+		t.Run(version, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			script, err := os.ReadFile(filepath.Join("testdata", version+".sql"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = db.Exec(string(script)); err != nil {
+				t.Fatal(err)
+			}
+			_ = db.Close()
+			state, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			var schema int
+			var username string
+			if err = state.DB().QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&schema); err != nil || schema != 4 {
+				t.Fatalf("schema=%d err=%v", schema, err)
+			}
+			if err = state.DB().QueryRow(`SELECT username FROM users WHERE id='fixture-user'`).Scan(&username); err != nil || username != "fixture" {
+				t.Fatalf("username=%q err=%v", username, err)
+			}
+			var suspectedColumn int
+			_ = state.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('webauthn_credentials') WHERE name='suspected_at'`).Scan(&suspectedColumn)
+			if suspectedColumn != 1 {
+				t.Fatal("v4 suspected_at column is absent")
+			}
+		})
+	}
+}
 
 func TestAccountAndSessionLifecycle(t *testing.T) {
 	s, err := Open(context.Background(), t.TempDir()+"/state.db")
@@ -88,6 +127,25 @@ func TestOpenRejectsSecondProcessOwner(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsCorruptDatabaseAndReleasesOwnership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	if err := os.WriteFile(path, []byte("not a sqlite database"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := Open(context.Background(), path); err == nil {
+		state.Close()
+		t.Fatal("corrupt database was accepted")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	state, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ownership lock was not released: %v", err)
+	}
+	state.Close()
+}
+
 func TestPasskeyRegressionStatePersists(t *testing.T) {
 	state, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -129,6 +187,62 @@ func TestTombstonePurgePreservesRecordingAttribution(t *testing.T) {
 	_ = state.DB().QueryRow(`SELECT COUNT(*) FROM user_tombstones WHERE user_id='used'`).Scan(&remaining)
 	if remaining != 1 {
 		t.Fatal("attributed tombstone was removed")
+	}
+}
+
+func TestTombstonePurgeWaitsForAuditAndReleasesIdentifiers(t *testing.T) {
+	ctx := context.Background()
+	state, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	hash, _ := auth.HashPassword("quiet marble nebula orchard", auth.DefaultParams())
+	_, _ = state.CreateUser(ctx, CreateUser{Username: "operator", Role: RoleAdmin, PasswordHash: hash})
+	user, err := state.CreateUser(ctx, CreateUser{Username: "reuse.me", Callsign: "N0CALL", Role: RoleUser, PasswordHash: hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted := time.Now().Add(-31 * 24 * time.Hour)
+	if err = state.DeleteUser(ctx, user.ID, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.WriteAudit(ctx, "account_delete", "success", &user.ID, &user.ID, nil, "", deleted); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := state.PurgeTombstones(ctx, time.Now().Add(-30*24*time.Hour)); err != nil || count != 0 {
+		t.Fatalf("audit-referenced count=%d err=%v", count, err)
+	}
+	if _, err = state.DB().ExecContext(ctx, `DELETE FROM audit_events WHERE actor_id=? OR target_id=?`, user.ID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := state.PurgeTombstones(ctx, time.Now().Add(-30*24*time.Hour)); err != nil || count != 1 {
+		t.Fatalf("released count=%d err=%v", count, err)
+	}
+	if _, err = state.CreateUser(ctx, CreateUser{Username: "reuse.me", Callsign: "N0CALL", Role: RoleUser, PasswordHash: hash}); err != nil {
+		t.Fatalf("identifiers were not released: %v", err)
+	}
+}
+
+func TestRecordingRetentionUsesExactTwentyFourHourCutoff(t *testing.T) {
+	ctx := context.Background()
+	state, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	for id, ended := range map[string]time.Time{"expired": now.Add(-24*time.Hour - time.Second), "retained": now.Add(-24*time.Hour + time.Second)} {
+		if err = state.InsertRecording(ctx, id, "WEB", "N0CALL", "", id+".orar", ended); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = state.DB().ExecContext(ctx, `UPDATE recordings SET status='complete',end_at=? WHERE id=?`, ended.Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, err := state.ExpiredRecordings(ctx, now.Add(-24*time.Hour))
+	if err != nil || len(ids) != 1 || ids[0] != "expired" {
+		t.Fatalf("ids=%v err=%v", ids, err)
 	}
 }
 

@@ -243,6 +243,17 @@ func (s *Store) InsertRecording(ctx context.Context, id, node, source, webUserID
 	_, err := s.db.ExecContext(ctx, `INSERT INTO recordings(id,node_callsign,source_callsign,web_user_id,start_at,status,relative_path,created_at)VALUES(?,?,?,?,?,'creating',?,?)`, id, node, source, nullString(webUserID), start.UTC().Format(time.RFC3339Nano), path, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
+func (s *Store) AttributeRecording(ctx context.Context, id, webUserID string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET web_user_id=? WHERE id=? AND web_user_id IS NULL`, webUserID, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count > 1 {
+		return errors.New("recording attribution update affected multiple rows")
+	}
+	return nil
+}
 func (s *Store) OpenRecording(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE recordings SET status='open' WHERE id=? AND status='creating'", id)
 	return err
@@ -294,6 +305,64 @@ func (s *Store) RecordingStatus(ctx context.Context, id string) (string, error) 
 	var status string
 	err := s.db.QueryRowContext(ctx, "SELECT status FROM recordings WHERE id=?", id).Scan(&status)
 	return status, err
+}
+
+type RecordingRecoveryState struct {
+	Status, IntendedStatus, EndReason string
+	PartialReasons                    uint32
+}
+
+func (s *Store) RecordingRecoveryState(ctx context.Context, id string) (RecordingRecoveryState, error) {
+	var value RecordingRecoveryState
+	err := s.db.QueryRowContext(ctx, `SELECT status,COALESCE(intended_status,''),COALESCE(end_reason,''),partial_reasons FROM recordings WHERE id=?`, id).Scan(&value.Status, &value.IntendedStatus, &value.EndReason, &value.PartialReasons)
+	return value, err
+}
+
+func (s *Store) PrepareRecoveryByState(ctx context.Context, id, fallbackStatus, fallbackReason string, reasons uint32) (string, string, uint32, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer tx.Rollback()
+	var current RecordingRecoveryState
+	if err = tx.QueryRowContext(ctx, `SELECT status,COALESCE(intended_status,''),COALESCE(end_reason,''),partial_reasons FROM recordings WHERE id=?`, id).Scan(&current.Status, &current.IntendedStatus, &current.EndReason, &current.PartialReasons); err != nil {
+		return "", "", 0, err
+	}
+	status, reason := fallbackStatus, fallbackReason
+	if current.Status == "finalizing" {
+		status, reason = current.IntendedStatus, current.EndReason
+	}
+	if status != "complete" && status != "partial" {
+		return "", "", 0, errors.New("recording recovery status is invalid")
+	}
+	if reason == "" {
+		reason = fallbackReason
+	}
+	combined := current.PartialReasons | reasons
+	result, err := tx.ExecContext(ctx, `UPDATE recordings SET status='finalizing',intended_status=?,end_reason=?,partial_reasons=? WHERE id=? AND status IN('creating','open','finalizing')`, status, reason, combined, id)
+	if err != nil {
+		return "", "", 0, err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return "", "", 0, sql.ErrNoRows
+	}
+	if err = tx.Commit(); err != nil {
+		return "", "", 0, err
+	}
+	return status, reason, combined, nil
+}
+
+func (s *Store) DeleteCreatingRecording(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM recordings WHERE id=? AND status='creating'`, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 func (s *Store) RecoverableRecordingIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM recordings WHERE status IN('creating','open','finalizing')`)
@@ -963,14 +1032,48 @@ func (s *Store) DeleteUser(ctx context.Context, id string, now time.Time) error 
 }
 
 func (s *Store) PurgeTombstones(ctx context.Context, before time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM user_tombstones
-WHERE deleted_at<? AND NOT EXISTS(
-  SELECT 1 FROM recordings WHERE recordings.web_user_id=user_tombstones.user_id
-)`, before.UTC().Format(time.RFC3339Nano))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM user_tombstones t
+WHERE deleted_at<?
+AND NOT EXISTS(SELECT 1 FROM recordings r WHERE r.web_user_id=t.user_id)
+AND NOT EXISTS(SELECT 1 FROM audit_events a WHERE a.actor_id=t.user_id OR a.target_id=t.user_id)`, before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM webauthn_credentials WHERE user_id=?`, id); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, id); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM users WHERE id=? AND deleted_at IS NOT NULL`, id); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM user_tombstones WHERE user_id=?`, id); err != nil {
+			return 0, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(ids)), nil
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID string, now time.Time, idle, absolute time.Duration, max int) (string, string, Session, error) {

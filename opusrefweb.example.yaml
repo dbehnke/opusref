@@ -47,6 +47,7 @@ limits:
   archive_queue_packets: 512
   archive_queue_bytes: 1048576
   max_playbacks: 50
+  # Compatibility setting. Version 1 does not reject retained archives by duration.
   playback_max_duration: 15m
 logging:
   level: "info"

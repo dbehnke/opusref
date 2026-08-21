@@ -2,6 +2,8 @@ package archive
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"testing"
 
@@ -15,6 +17,35 @@ func (w *shortWriter) Write(p []byte) (int, error) {
 		p = p[:1]
 	}
 	return w.Buffer.Write(p)
+}
+
+func FuzzArchiveReader(f *testing.F) {
+	var valid bytes.Buffer
+	writer, _ := NewWriter(&valid, uuid.MustParse("00000000-0000-0000-0000-000000000001"))
+	_ = writer.WritePacket(Packet{Sequence: 1, Timestamp: 960, ArrivalMS: 20, Payload: []byte{0xf8, 0xff}})
+	f.Add(valid.Bytes())
+	f.Add([]byte("ORAR"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			t.Skip()
+		}
+		reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return
+		}
+		for {
+			packet, nextErr := reader.Next()
+			if nextErr != nil {
+				if !errors.Is(nextErr, io.EOF) {
+					return
+				}
+				return
+			}
+			if len(packet.Payload) < 1 || len(packet.Payload) > MaxPayload {
+				t.Fatal("reader returned invalid payload length")
+			}
+		}
+	})
 }
 
 func TestArchivePreservesOpaquePackets(t *testing.T) {
