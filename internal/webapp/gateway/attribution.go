@@ -34,6 +34,14 @@ func (a *GrantAttribution) Cancel(userID string) {
 	}
 	a.mu.Unlock()
 }
+func (a *GrantAttribution) Bind(key ReflectorStream, userID string) {
+	a.mu.Lock()
+	a.grants[key] = userID
+	if a.pending == userID {
+		a.pending = ""
+	}
+	a.mu.Unlock()
+}
 func (a *GrantAttribution) Observe(event client.Event) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

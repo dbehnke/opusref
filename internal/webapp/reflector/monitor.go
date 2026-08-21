@@ -25,6 +25,7 @@ type Stream struct {
 }
 type Snapshot struct {
 	ReflectorID string       `json:"reflector_id"`
+	DisplayName string       `json:"display_name"`
 	Ready       bool         `json:"ready"`
 	ClientCount int          `json:"client_count"`
 	Clients     []ClientInfo `json:"-"`

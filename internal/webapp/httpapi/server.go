@@ -157,8 +157,63 @@ func (s *Server) publicMux() http.Handler {
 }
 
 type socketOutput struct {
-	kind websocket.MessageType
-	data []byte
+	kind      websocket.MessageType
+	data      []byte
+	timestamp uint32
+}
+type mediaOutputQueue struct {
+	items                         chan socketOutput
+	mu                            sync.Mutex
+	bytes, maxBytes               int
+	firstTimestamp, lastTimestamp uint32
+}
+
+func newMediaOutputQueue(packets, maxBytes int) *mediaOutputQueue {
+	if packets <= 0 {
+		packets = 64
+	}
+	if maxBytes <= 0 {
+		maxBytes = packets * 1200
+	}
+	return &mediaOutputQueue{items: make(chan socketOutput, packets), maxBytes: maxBytes}
+}
+func (q *mediaOutputQueue) enqueue(item socketOutput) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	spanTooLarge := len(q.items) > 0 && item.timestamp-q.firstTimestamp > 24_000
+	if spanTooLarge || q.bytes+len(item.data) > q.maxBytes {
+		return false
+	}
+	select {
+	case q.items <- item:
+		if len(q.items) == 1 {
+			q.firstTimestamp = item.timestamp
+		}
+		q.lastTimestamp = item.timestamp
+		q.bytes += len(item.data)
+		return true
+	default:
+		return false
+	}
+}
+func (q *mediaOutputQueue) taken(item socketOutput) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.bytes -= len(item.data)
+	if q.bytes < 0 {
+		q.bytes = 0
+	}
+	if len(q.items) == 0 {
+		q.firstTimestamp, q.lastTimestamp = 0, 0
+	}
+}
+func (q *mediaOutputQueue) discard() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) > 0 {
+		<-q.items
+	}
+	q.bytes, q.firstTimestamp, q.lastTimestamp = 0, 0, 0
 }
 
 func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
@@ -238,10 +293,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	output := make(chan socketOutput, queueCapacity(s.cfg.ControlQueueMessages, 0, 16*1024))
-	liveOutput := make(chan socketOutput, queueCapacity(s.cfg.LiveQueuePackets, s.cfg.LiveQueueBytes, 1200))
-	playbackOutput := make(chan socketOutput, queueCapacity(s.cfg.PlaybackQueuePackets, s.cfg.PlaybackQueueBytes, 1200))
+	liveOutput := newMediaOutputQueue(s.cfg.LiveQueuePackets, s.cfg.LiveQueueBytes)
+	playbackOutput := newMediaOutputQueue(s.cfg.PlaybackQueuePackets, s.cfg.PlaybackQueueBytes)
 	writerDone := make(chan error, 1)
 	go func() {
+		var pendingMedia *socketOutput
 		for {
 			var item socketOutput
 			select {
@@ -250,13 +306,29 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			case item = <-output:
 			default:
-				select {
-				case <-ctx.Done():
-					writerDone <- ctx.Err()
-					return
-				case item = <-output:
-				case item = <-liveOutput:
-				case item = <-playbackOutput:
+				if pendingMedia != nil {
+					item = *pendingMedia
+					pendingMedia = nil
+				} else {
+					select {
+					case <-ctx.Done():
+						writerDone <- ctx.Err()
+						return
+					case item = <-output:
+					case item = <-liveOutput.items:
+						liveOutput.taken(item)
+					case item = <-playbackOutput.items:
+						playbackOutput.taken(item)
+					}
+					if item.kind == websocket.MessageBinary {
+						select {
+						case control := <-output:
+							copy := item
+							pendingMedia = &copy
+							item = control
+						default:
+						}
+					}
 				}
 			}
 			writeCtx, stop := context.WithTimeout(ctx, 5*time.Second)
@@ -291,7 +363,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			replays[direct.RequestID] = entry
 		}
 		select {
-		case output <- socketOutput{websocket.MessageText, encoded}:
+		case output <- socketOutput{kind: websocket.MessageText, data: encoded}:
 			return true
 		default:
 			return false
@@ -303,17 +375,25 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 		select {
-		case output <- socketOutput{websocket.MessageText, encoded}:
+		case output <- socketOutput{kind: websocket.MessageText, data: encoded}:
 			return true
 		default:
 			return false
 		}
 	}
+	sendLifecycle := func(value any) bool {
+		if sendUnsolicited(value) {
+			return true
+		}
+		_ = conn.Close(4409, "overload")
+		cancel()
+		return false
+	}
 	var playbackMu sync.Mutex
 	var playbackCancel context.CancelFunc
 	var playbackChannel uint64
-	var playbackPackets []webarchive.Packet
-	var playbackIndex int
+	var playbackFile *webarchive.Playback
+	var playbackElapsed uint32
 	var playbackSlot atomic.Bool
 	releasePlaybackSlot := func() {
 		if playbackSlot.Swap(false) {
@@ -321,7 +401,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer releasePlaybackSlot()
-	bodyResult := map[string]any{"authenticated": authState.Load(), "ptt_available": authState.Load() && !session.PasswordChangeRequired && session.Callsign != "" && s.cfg.PTT != nil, "passkey_available": s.cfg.Passkeys != nil, "limits": map[string]any{"media_bytes": 1200, "control_bytes": 16384, "live_queue_packets": s.cfg.LiveQueuePackets}, "status": map[string]any{"health": "ok", "ready": s.operationalReady()}}
+	bodyResult := map[string]any{"authenticated": authState.Load(), "ptt_available": authState.Load() && !session.PasswordChangeRequired && session.Callsign != "" && s.cfg.PTT != nil, "passkey_available": s.cfg.Passkeys != nil, "limits": map[string]any{"media_bytes": 1200, "control_bytes": 16384, "live_queue_packets": s.cfg.LiveQueuePackets}, "status": s.statusData()}
 	if authState.Load() {
 		bodyResult["role"] = session.Role
 	}
@@ -329,8 +409,10 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close(4409, "overload")
 		return
 	}
+	var rawSession string
+	invalidateAuth := func() {}
 	if authState.Load() {
-		invalidate := func() {
+		invalidateAuth = func() {
 			if !authState.Swap(false) {
 				return
 			}
@@ -345,10 +427,8 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			playbackMu.Unlock()
 			releasePlaybackSlot()
 			if s.cfg.OpenAccess {
-				encoded, _ := json.Marshal(map[string]any{"api_version": 1, "type": "status", "body": map[string]any{"authenticated": false, "reason": "session_invalid"}})
-				select {
-				case output <- socketOutput{websocket.MessageText, encoded}:
-				default:
+				if !sendUnsolicited(map[string]any{"api_version": 1, "type": "error", "body": map[string]any{"code": "session_invalid", "text": "Your session ended. Live listening remains available."}}) {
+					_ = conn.Close(4409, "overload")
 					cancel()
 				}
 				return
@@ -356,9 +436,10 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(4401, "session_invalid")
 			cancel()
 		}
-		unregister := s.registerRevocation(session.ID, session.UserID, invalidate)
+		unregister := s.registerRevocation(session.ID, session.UserID, invalidateAuth)
 		defer unregister()
 		cookie, _ := r.Cookie(CookieName)
+		rawSession = cookie.Value
 		go func(raw string) {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
@@ -368,12 +449,23 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				case <-ticker.C:
 					if _, checkErr := s.store.AuthenticateSessionWithIdle(context.Background(), raw, time.Now(), s.cfg.SessionIdle); checkErr != nil {
-						invalidate()
+						invalidateAuth()
 						return
 					}
 				}
 			}
 		}(cookie.Value)
+	}
+	privileged := func() bool {
+		if !authState.Load() || rawSession == "" {
+			return false
+		}
+		fresh, checkErr := s.store.AuthenticateSessionWithIdle(context.Background(), rawSession, time.Now(), s.cfg.SessionIdle)
+		if checkErr != nil || fresh.ID != session.ID || fresh.UserID != session.UserID || fresh.Role != session.Role || fresh.PasswordChangeRequired != session.PasswordChangeRequired {
+			invalidateAuth()
+			return false
+		}
+		return true
 	}
 	if s.cfg.PTT != nil {
 		endEvents, unsubscribe := s.cfg.PTT.SubscribeEnds()
@@ -385,7 +477,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				case ended := <-endEvents:
 					if ended.Session == session.ID {
-						sendUnsolicited(map[string]any{"api_version": 1, "type": "ptt_ended", "body": map[string]any{"channel_id": strconv.FormatUint(ended.ChannelID, 10), "reason": ended.Reason}})
+						sendLifecycle(map[string]any{"api_version": 1, "type": "ptt_ended", "body": map[string]any{"channel_id": strconv.FormatUint(ended.ChannelID, 10), "reason": ended.Reason}})
 					}
 				}
 			}
@@ -401,6 +493,9 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		liveCancel = cancelSub
 		defer liveCancel()
 		go func() {
+			var outboundChannel uint64
+			var outboundSequence uint32
+			var source string
 			for {
 				select {
 				case <-ctx.Done():
@@ -411,21 +506,36 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 					}
 					switch event.Kind {
 					case gateway.LiveStart:
-						sendUnsolicited(map[string]any{"api_version": 1, "type": "stream_start", "body": map[string]any{"channel_id": strconv.FormatUint(event.ChannelID, 10), "source_callsign": event.SourceCallsign, "started_at": time.Now().UTC().Format(time.RFC3339), "tot_seconds": 180}})
+						outboundChannel, outboundSequence, source = event.ChannelID, 0, event.SourceCallsign
+						sendLifecycle(map[string]any{"api_version": 1, "type": "stream_start", "body": map[string]any{"channel_id": strconv.FormatUint(outboundChannel, 10), "source_callsign": source, "started_at": time.Now().UTC().Format(time.RFC3339), "tot_seconds": 180}})
 					case gateway.LiveEnd:
-						sendUnsolicited(map[string]any{"api_version": 1, "type": "stream_end", "body": map[string]any{"channel_id": strconv.FormatUint(event.ChannelID, 10), "reason": event.Reason}})
+						sendLifecycle(map[string]any{"api_version": 1, "type": "stream_end", "body": map[string]any{"channel_id": strconv.FormatUint(outboundChannel, 10), "reason": event.Reason}})
+						outboundChannel = 0
 					case gateway.LiveDiscontinuity:
-						sendUnsolicited(map[string]any{"api_version": 1, "type": "discontinuity", "body": map[string]any{"old_channel_id": strconv.FormatUint(event.OldChannelID, 10), "new_channel_id": strconv.FormatUint(event.ChannelID, 10), "reason": event.Reason}})
+						old := outboundChannel
+						outboundChannel, outboundSequence = event.ChannelID, 0
+						sendLifecycle(map[string]any{"api_version": 1, "type": "discontinuity", "body": map[string]any{"old_channel_id": strconv.FormatUint(old, 10), "new_channel_id": strconv.FormatUint(outboundChannel, 10), "reason": event.Reason}})
 					case gateway.LiveMedia:
-						encoded, encodeErr := wsprotocol.EncodeMedia(event.Media)
+						media := event.Media
+						media.ChannelID, media.Sequence = outboundChannel, outboundSequence
+						encoded, encodeErr := wsprotocol.EncodeMedia(media)
 						if encodeErr != nil {
 							continue
 						}
-						select {
-						case liveOutput <- socketOutput{websocket.MessageBinary, encoded}:
-						default:
-							cancel()
-							return
+						if liveOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: media.Timestamp}) {
+							outboundSequence++
+						} else {
+							liveOutput.discard()
+							old := outboundChannel
+							newChannel, channelErr := s.newChannel()
+							if channelErr != nil {
+								cancel()
+								return
+							}
+							outboundChannel, outboundSequence = newChannel, 0
+							if !sendLifecycle(map[string]any{"api_version": 1, "type": "discontinuity", "body": map[string]any{"old_channel_id": strconv.FormatUint(old, 10), "new_channel_id": strconv.FormatUint(newChannel, 10), "reason": "slow_consumer"}}) || !sendLifecycle(map[string]any{"api_version": 1, "type": "stream_start", "body": map[string]any{"channel_id": strconv.FormatUint(newChannel, 10), "source_callsign": source, "started_at": time.Now().UTC().Format(time.RFC3339), "tot_seconds": 180}}) {
+								return
+							}
 						}
 					}
 				}
@@ -440,14 +550,29 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		playCtx, stop := context.WithCancel(ctx)
 		playbackCancel = stop
 		channel := playbackChannel
-		start := playbackIndex
-		packets := playbackPackets
+		archivePlayback := playbackFile
+		elapsed := playbackElapsed
 		playbackMu.Unlock()
 		go func() {
-			var previous uint32
-			for index := start; index < len(packets); index++ {
-				packet := packets[index]
-				if index > start {
+			if archivePlayback == nil {
+				return
+			}
+			cursor, cursorErr := archivePlayback.NewCursor(elapsed)
+			if cursorErr != nil {
+				return
+			}
+			defer cursor.Close()
+			previous := elapsed
+			first := true
+			for {
+				packet, nextErr := cursor.Next()
+				if errors.Is(nextErr, io.EOF) {
+					break
+				}
+				if nextErr != nil {
+					return
+				}
+				if !first {
 					wait := time.Duration(packet.ArrivalMS-previous) * time.Millisecond
 					timer := time.NewTimer(wait)
 					select {
@@ -457,31 +582,19 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 					case <-timer.C:
 					}
 				}
+				first = false
 				previous = packet.ArrivalMS
-				encoded, encodeErr := wsprotocol.EncodeMedia(wsprotocol.Media{Kind: wsprotocol.KindPlayback, ChannelID: channel, Sequence: uint32(index - start), Timestamp: packet.Timestamp, Payload: packet.Payload})
+				encoded, encodeErr := wsprotocol.EncodeMedia(wsprotocol.Media{Kind: wsprotocol.KindPlayback, ChannelID: channel, Sequence: uint32(cursor.Index() - 1), Timestamp: packet.Timestamp, Payload: packet.Payload})
 				if encodeErr != nil {
 					return
 				}
-				select {
-				case playbackOutput <- socketOutput{websocket.MessageBinary, encoded}:
+				if playbackOutput.enqueue(socketOutput{kind: websocket.MessageBinary, data: encoded, timestamp: packet.Timestamp}) {
 					playbackMu.Lock()
-					playbackIndex = index + 1
+					playbackElapsed = packet.ArrivalMS
 					playbackMu.Unlock()
-				case <-playCtx.Done():
-					return
-				default:
-					playbackMu.Lock()
-					ownsChannel := playbackChannel == channel
-					if ownsChannel {
-						playbackChannel = 0
-						playbackPackets = nil
-						playbackIndex = 0
-					}
-					playbackMu.Unlock()
-					if ownsChannel {
-						releasePlaybackSlot()
-					}
-					sendUnsolicited(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "closed", "elapsed_ms": previous}})
+				} else {
+					playbackOutput.discard()
+					sendLifecycle(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "paused", "elapsed_ms": previous}})
 					return
 				}
 			}
@@ -489,14 +602,14 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			ownsChannel := playbackChannel == channel
 			if ownsChannel {
 				playbackChannel = 0
-				playbackPackets = nil
-				playbackIndex = 0
+				playbackFile = nil
+				playbackElapsed = 0
 			}
 			playbackMu.Unlock()
 			if ownsChannel {
 				releasePlaybackSlot()
 			}
-			sendUnsolicited(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "closed", "elapsed_ms": previous}})
+			sendLifecycle(map[string]any{"api_version": 1, "type": "playback_state", "body": map[string]any{"channel_id": strconv.FormatUint(channel, 10), "state": "closed", "elapsed_ms": previous}})
 		}()
 	}
 	defer func() {
@@ -517,7 +630,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				_ = conn.Close(4400, "invalid_media")
 				break
 			}
-			if !authState.Load() || s.cfg.PTT == nil {
+			if !privileged() || s.cfg.PTT == nil {
 				_ = conn.Close(4403, "forbidden")
 				break
 			}
@@ -537,7 +650,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		for len(replayOrder) > 0 {
 			oldest := replayOrder[0]
-			if now.Sub(replays[oldest].stored) <= 2*time.Minute {
+			if now.Sub(replays[oldest].stored) <= 30*time.Second {
 				break
 			}
 			delete(replays, oldest)
@@ -550,7 +663,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(prior.result) > 0 {
 				select {
-				case output <- socketOutput{websocket.MessageText, prior.result}:
+				case output <- socketOutput{kind: websocket.MessageText, data: prior.result}:
 				default:
 					_ = conn.Close(4409, "overload")
 					return
@@ -573,7 +686,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				_ = conn.Close(4400, "invalid_request")
 				return
 			}
-			if !authState.Load() || session.PasswordChangeRequired || session.Callsign == "" || s.cfg.PTT == nil {
+			if !privileged() || session.PasswordChangeRequired || session.Callsign == "" || s.cfg.PTT == nil {
 				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "PTT is not available."}})
 				continue
 			}
@@ -600,10 +713,13 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				_ = conn.Close(4400, "invalid_request")
 				return
 			}
-			_ = s.cfg.PTT.Stop(ctx, session.ID, channelID)
+			if !privileged() || s.cfg.PTT.Stop(ctx, session.ID, channelID) != nil {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "not_owner", "text": "The PTT channel is not owned by this session."}})
+				continue
+			}
 			sendControl(map[string]any{"api_version": 1, "type": "ptt_ended", "request_id": control.RequestID, "body": map[string]any{"channel_id": stop.ChannelID, "reason": "normal"}})
 		case "playback_open":
-			if !authState.Load() || session.PasswordChangeRequired || s.cfg.Archives == nil {
+			if !privileged() || session.PasswordChangeRequired || s.cfg.Archives == nil {
 				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "Playback is not available."}})
 				continue
 			}
@@ -626,9 +742,9 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			recording, readErr := s.store.RecordingByID(ctx, open.RecordingID)
-			var packets []webarchive.Packet
+			var indexed *webarchive.Playback
 			if readErr == nil {
-				packets, readErr = s.cfg.Archives.ReadPackets(open.RecordingID)
+				indexed, readErr = s.cfg.Archives.OpenPlayback(open.RecordingID)
 			}
 			if readErr != nil {
 				if acquiredPlaybackSlot {
@@ -644,10 +760,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			duration := uint32(0)
-			if len(packets) > 0 {
-				duration = packets[len(packets)-1].ArrivalMS
-			}
+			duration := indexed.DurationMS()
 			maximumDuration := s.cfg.PlaybackMaxDuration
 			if maximumDuration <= 0 {
 				maximumDuration = 15 * time.Minute
@@ -661,12 +774,16 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			playbackMu.Lock()
 			playbackChannel = channelID
-			playbackPackets = packets
-			playbackIndex = 0
+			playbackFile = indexed
+			playbackElapsed = 0
 			playbackMu.Unlock()
 			sendControl(map[string]any{"api_version": 1, "type": "playback_opened", "request_id": control.RequestID, "body": map[string]any{"channel_id": strconv.FormatUint(channelID, 10), "recording_id": open.RecordingID, "duration_ms": duration, "status": recording.Status}})
 			startPlayback()
 		case "playback_pause", "playback_resume", "playback_close":
+			if !privileged() {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "Playback is not available."}})
+				continue
+			}
 			var action struct {
 				ChannelID string `json:"channel_id"`
 			}
@@ -681,13 +798,11 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 				playbackCancel()
 			}
 			elapsed := 0
-			if playbackIndex > 0 && playbackIndex <= len(playbackPackets) {
-				elapsed = int(playbackPackets[playbackIndex-1].ArrivalMS)
-			}
+			elapsed = int(playbackElapsed)
 			if valid && control.Type == "playback_close" {
 				playbackChannel = 0
-				playbackPackets = nil
-				playbackIndex = 0
+				playbackFile = nil
+				playbackElapsed = 0
 			}
 			playbackMu.Unlock()
 			if !valid {
@@ -703,6 +818,10 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			state := map[string]string{"playback_pause": "paused", "playback_resume": "playing", "playback_close": "closed"}[control.Type]
 			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": action.ChannelID, "state": state, "elapsed_ms": elapsed}})
 		case "playback_seek":
+			if !privileged() {
+				sendControl(map[string]any{"api_version": 1, "type": "error", "request_id": control.RequestID, "body": map[string]any{"code": "forbidden", "text": "Playback is not available."}})
+				continue
+			}
 			var seek struct {
 				ChannelID string `json:"channel_id"`
 				ElapsedMS int    `json:"elapsed_ms"`
@@ -721,14 +840,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 			if playbackCancel != nil {
 				playbackCancel()
 			}
-			index := 0
-			for index < len(playbackPackets) && int(playbackPackets[index].ArrivalMS) < seek.ElapsedMS {
-				index++
-			}
-			if index > 0 {
-				index--
-			}
-			playbackIndex = index
+			playbackElapsed = uint32(seek.ElapsedMS)
 			playbackMu.Unlock()
 			startPlayback()
 			sendControl(map[string]any{"api_version": 1, "type": "playback_state", "request_id": control.RequestID, "body": map[string]any{"channel_id": seek.ChannelID, "state": "playing", "elapsed_ms": seek.ElapsedMS}})
@@ -845,7 +957,11 @@ func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	n, err := s.store.EnabledAdminCount(context.Background())
-	monitorReady := s.cfg.ReflectorMonitor == nil || s.cfg.ReflectorMonitor.Fresh(s.cfg.MonitorStaleAfter)
+	monitorReady := true
+	if s.cfg.ReflectorMonitor != nil {
+		snapshot, ok := s.cfg.ReflectorMonitor.Snapshot()
+		monitorReady = ok && snapshot.Ready && s.cfg.ReflectorMonitor.Fresh(s.cfg.MonitorStaleAfter)
+	}
 	if err != nil || n == 0 || !monitorReady {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
 		return
@@ -859,12 +975,16 @@ func (s *Server) publicStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	writeJSON(w, http.StatusOK, s.statusData())
+}
+func (s *Server) statusData() map[string]any {
 	reflector := map[string]any{"id": "", "display_name": ""}
 	clientCount := 0
 	floor := map[string]any{"active": false}
 	if s.cfg.ReflectorMonitor != nil {
 		if snapshot, ok := s.cfg.ReflectorMonitor.Snapshot(); ok {
 			reflector["id"] = snapshot.ReflectorID
+			reflector["display_name"] = snapshot.DisplayName
 			clientCount = snapshot.ClientCount
 			floor = map[string]any{"active": snapshot.Stream.Active}
 			if snapshot.Stream.Active {
@@ -875,7 +995,14 @@ func (s *Server) publicStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	quotaFull := s.cfg.Archives != nil && s.cfg.Archives.QuotaFull()
-	writeJSON(w, http.StatusOK, map[string]any{"health": "ok", "ready": s.operationalReady(), "reflector": reflector, "client_count": clientCount, "floor": floor, "recording": map[string]any{"available": s.cfg.Archives != nil, "quota_full": quotaFull}, "server_time": time.Now().UTC().Format(time.RFC3339)})
+	health := "ok"
+	if quotaFull {
+		health = "degraded"
+	}
+	if s.cfg.Archives != nil && !s.cfg.Archives.Ready() {
+		health = "unavailable"
+	}
+	return map[string]any{"health": health, "ready": s.operationalReady(), "reflector": reflector, "client_count": clientCount, "floor": floor, "recording": map[string]any{"available": s.cfg.Archives != nil && s.cfg.Archives.Ready(), "quota_full": quotaFull}, "server_time": time.Now().UTC().Format(time.RFC3339)}
 }
 func (s *Server) operationalReady() bool {
 	return s.ready.Load() && (s.cfg.ReadyCheck == nil || s.cfg.ReadyCheck())
@@ -1114,7 +1241,20 @@ func (s *Server) passkeyLoginVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, err := s.cfg.Passkeys.FinishLogin(r.Context(), in.CeremonyID, in.Credential)
 	if err != nil {
+		var failure *passkey.VerificationFailure
+		if errors.As(err, &failure) && failure.UserID != "" {
+			_ = s.limiter.Allow("passkey_account", failure.UserID, 10, 10*time.Minute, time.Now())
+			action := "passkey_login"
+			if failure.Regression {
+				action = "passkey_counter_regression"
+			}
+			s.audit(r.Context(), action, "failure", failure.UserID, failure.UserID, "")
+		}
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
+		return
+	}
+	if !s.limiter.Allow("passkey_account", userID, 10, 10*time.Minute, time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	user, err := s.store.FindUserByID(r.Context(), userID)
@@ -1192,7 +1332,17 @@ func (s *Server) passkeyReauthVerify(w http.ResponseWriter, r *http.Request, ses
 		CeremonyID string          `json:"ceremony_id"`
 		Credential json.RawMessage `json:"credential"`
 	}
-	if decodeExact(r, &in) != nil || s.cfg.Passkeys.FinishReauth(r.Context(), in.CeremonyID, session.UserID, session.ID, in.Credential) != nil {
+	if decodeExact(r, &in) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if err := s.cfg.Passkeys.FinishReauth(r.Context(), in.CeremonyID, session.UserID, session.ID, in.Credential); err != nil {
+		action := "reauth_passkey"
+		var failure *passkey.VerificationFailure
+		if errors.As(err, &failure) && failure.Regression {
+			action = "passkey_counter_regression"
+		}
+		s.audit(r.Context(), action, "failure", session.UserID, session.UserID, "")
 		writeError(w, http.StatusUnauthorized, "authentication_failed")
 		return
 	}
@@ -1308,11 +1458,10 @@ func (s *Server) deleteRecording(w http.ResponseWriter, r *http.Request, session
 		writeError(w, http.StatusServiceUnavailable, "archive_unavailable")
 		return
 	}
-	if err := s.cfg.Archives.Delete(r.Context(), r.PathValue("id"), time.Now()); err != nil {
+	if err := s.cfg.Archives.DeleteAs(r.Context(), r.PathValue("id"), session.UserID, time.Now()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "recording_delete_failed")
 		return
 	}
-	s.audit(r.Context(), "recording_delete", "success", session.UserID, "", r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request, _ store.Session) {

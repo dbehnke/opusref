@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/dbehnke/opusref/internal/webapp/auth"
 	"github.com/dbehnke/opusref/internal/webapp/store"
 )
@@ -25,6 +26,54 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 		t.Fatal(err)
 	}
 	return New(Config{PublicOrigin: "https://radio.example.test", OpenAccess: true, SessionIdle: 12 * time.Hour, SessionAbsolute: 7 * 24 * time.Hour, MaxSessions: 3, Argon2: auth.DefaultParams()}, s), s
+}
+
+func TestLocalHTTPSAndWSSHandshake(t *testing.T) {
+	state, err := store.Open(context.Background(), t.TempDir()+"/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	server := New(Config{OpenAccess: true, Argon2: auth.DefaultParams()}, state)
+	tlsServer := httptest.NewUnstartedServer(server.PublicHandler())
+	server.cfg.PublicOrigin = "https://" + tlsServer.Listener.Addr().String()
+	tlsServer.StartTLS()
+	defer tlsServer.Close()
+	wssURL := "wss" + strings.TrimPrefix(tlsServer.URL, "https") + "/api/v1/ws"
+	header := http.Header{}
+	header.Set("Origin", server.cfg.PublicOrigin)
+	conn, _, err := websocket.Dial(context.Background(), wssURL, &websocket.DialOptions{HTTPClient: tlsServer.Client(), HTTPHeader: header})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	hello := []byte(`{"api_version":1,"type":"hello","request_id":"h1","body":{"audio":{"encoder":true,"decoder":true,"context_rate":48000},"csrf_token":""}}`)
+	if err = conn.Write(context.Background(), websocket.MessageText, hello); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := conn.Read(context.Background())
+	if err != nil || !strings.Contains(string(response), `"type":"hello_ok"`) {
+		t.Fatalf("response=%s err=%v", response, err)
+	}
+}
+
+func TestMediaOutputQueueEnforcesBytesAndHalfSecondSpan(t *testing.T) {
+	queue := newMediaOutputQueue(8, 10)
+	first := socketOutput{kind: websocket.MessageBinary, data: make([]byte, 6), timestamp: 100}
+	if !queue.enqueue(first) {
+		t.Fatal("first media was rejected")
+	}
+	if queue.enqueue(socketOutput{kind: websocket.MessageBinary, data: make([]byte, 5), timestamp: 200}) {
+		t.Fatal("byte limit was not enforced")
+	}
+	if queue.enqueue(socketOutput{kind: websocket.MessageBinary, data: []byte{1}, timestamp: 24_101}) {
+		t.Fatal("time-span limit was not enforced")
+	}
+	item := <-queue.items
+	queue.taken(item)
+	if !queue.enqueue(socketOutput{kind: websocket.MessageBinary, data: make([]byte, 10), timestamp: 24_101}) {
+		t.Fatal("queue accounting did not release written bytes")
+	}
 }
 func TestSecurityHeadersAndMetricsIsolation(t *testing.T) {
 	server, s := newTestServer(t)

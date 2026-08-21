@@ -52,6 +52,8 @@ type remoteKey struct {
 	stream uint32
 }
 
+func (s *udpSender) sessionID() uint64 { return s.session }
+
 func (s *udpSender) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
 		return s.conn.Close()

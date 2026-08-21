@@ -58,9 +58,8 @@ must have mode `0600`.
 
 1. Copy `opusrefweb.example.yaml` to an operator-controlled path.
 2. Set the final HTTPS origin and WebAuthn RP ID.
-3. Install the first 10,000 entries from the SecLists common-credentials list at
-   the configured `password_blocklist_file`. The service rejects a missing,
-   invalid, or oversized file.
+3. Optionally configure `password_blocklist_file` with site-specific additions.
+   The service always applies its pinned, embedded SecLists 10k corpus first.
 4. Create the storage directory with mode `0700`.
 5. Run `opusrefweb auth benchmark --config FILE`.
 6. Run `opusrefweb admin create --config FILE --username NAME` on a TTY.
@@ -77,8 +76,10 @@ sessions. A reconnect does not change the browser API. A reflector revoke ends
 the active browser PTT channel.
 
 The WebSocket writer uses separate bounded control, live-audio, and playback
-queues. Control output has priority. A full media queue closes the affected
-connection. One slow browser cannot block the reflector clients.
+queues. Control output has priority. A full live queue drops its queued media
+and announces a discontinuity with a new channel. A full playback queue pauses
+playback for an explicit resume or seek. A full control queue closes the socket
+with code 4409. One slow browser cannot block the reflector clients.
 
 ## Passkey flow
 
@@ -116,8 +117,9 @@ flowchart TD
     A[First audio packet] --> B[Create database row]
     B --> C[Create and sync partial file]
     C --> D[Append opaque Opus packets]
-    D --> E[Sync and rename final file]
-    E --> F[Commit complete or partial state]
+    D --> E[Commit finalizing intent]
+    E --> F[Sync and rename final file]
+    F --> I[Sync directory and commit final state]
     G[Process restart] --> H[Validate partial and final files]
     H --> I[Finalize known files]
     H --> J[Quarantine orphan or corrupt files]
@@ -133,7 +135,9 @@ archive directory. Playback indexes at most 4,096 packets and 1 MiB of index
 data. The default playback duration limit is 15 minutes. Deletion uses the
 database `deleting` state and a `.deleting` file. Startup
 completes an interrupted deletion. Retention removes expired recordings first.
-Quota cleanup then removes the oldest recordings until use is at most 90 percent.
+Quota-full mode stops new archive writes and keeps retained recordings. The
+service stays ready and reports degraded recording state. Retention cleanup is
+the only automatic operation that deletes recordings.
 
 ## API pagination
 

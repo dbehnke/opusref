@@ -13,12 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/dbehnke/opusref/internal/webapp/auth"
 	"github.com/dbehnke/opusref/pkg/wire"
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 type Role string
@@ -73,10 +74,11 @@ type PasskeySummary struct {
 	Name       string     `json:"name"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Suspected  bool       `json:"suspected"`
 }
 
 func (s *Store) ListPasskeys(ctx context.Context, userID string) ([]PasskeySummary, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id,label,created_at,last_used_at FROM webauthn_credentials WHERE user_id=? ORDER BY created_at", userID)
+	rows, err := s.db.QueryContext(ctx, "SELECT id,label,created_at,last_used_at,suspected_at IS NOT NULL FROM webauthn_credentials WHERE user_id=? ORDER BY created_at", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +89,7 @@ func (s *Store) ListPasskeys(ctx context.Context, userID string) ([]PasskeySumma
 		var item PasskeySummary
 		var created string
 		var last sql.NullString
-		if err = rows.Scan(&id, &item.Name, &created, &last); err != nil {
+		if err = rows.Scan(&id, &item.Name, &created, &last, &item.Suspected); err != nil {
 			return nil, err
 		}
 		item.ID = base64.RawURLEncoding.EncodeToString(id)
@@ -158,6 +160,7 @@ type Recording struct {
 	StartedAt                                           time.Time
 	EndedAt                                             *time.Time
 	PacketCount, ByteSize                               int64
+	PartialReasons                                      uint32
 	SHA256                                              []byte
 }
 type RecordingQuery struct {
@@ -175,7 +178,7 @@ func (s *Store) QueryRecordings(ctx context.Context, query RecordingQuery) ([]Re
 	if limit < 1 || limit > 201 {
 		limit = 50
 	}
-	statement := `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,relative_path,sha256 FROM recordings WHERE status IN('complete','partial')`
+	statement := `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256 FROM recordings WHERE status IN('complete','partial')`
 	args := []any{}
 	if query.Source != "" {
 		statement += " AND source_callsign=?"
@@ -209,7 +212,7 @@ func (s *Store) QueryRecordings(ctx context.Context, query RecordingQuery) ([]Re
 		var item Recording
 		var start string
 		var end sql.NullString
-		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.RelativePath, &item.SHA256); err != nil {
+		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256); err != nil {
 			return nil, err
 		}
 		item.StartedAt, _ = time.Parse(time.RFC3339Nano, start)
@@ -225,7 +228,7 @@ func (s *Store) RecordingByID(ctx context.Context, id string) (Recording, error)
 	var item Recording
 	var start string
 	var end sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,relative_path,sha256 FROM recordings WHERE id=? AND status IN('complete','partial')`, id).Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.RelativePath, &item.SHA256)
+	err := s.db.QueryRowContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,partial_reasons,relative_path,sha256 FROM recordings WHERE id=? AND status IN('complete','partial')`, id).Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.PartialReasons, &item.RelativePath, &item.SHA256)
 	if err != nil {
 		return item, err
 	}
@@ -244,17 +247,69 @@ func (s *Store) OpenRecording(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE recordings SET status='open' WHERE id=? AND status='creating'", id)
 	return err
 }
+func (s *Store) BeginRecordingFinalize(ctx context.Context, id, intendedStatus, reason string, partialReasons uint32) error {
+	if intendedStatus != "complete" && intendedStatus != "partial" {
+		return errors.New("recording status is invalid")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET status='finalizing',intended_status=?,end_reason=?,partial_reasons=? WHERE id=? AND status='open'`, intendedStatus, reason, partialReasons, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) PrepareRecoveryFinalize(ctx context.Context, id, intendedStatus, reason string, partialReasons uint32) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET status='finalizing',intended_status=?,end_reason=?,partial_reasons=partial_reasons|? WHERE id=? AND status IN('creating','open','finalizing')`, intendedStatus, reason, partialReasons, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
 func (s *Store) FinishRecording(ctx context.Context, id, status, reason string, end time.Time, packets, size int64, sum []byte) error {
 	if status != "complete" && status != "partial" {
 		return errors.New("recording status is invalid")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE recordings SET status=?,end_reason=?,end_at=?,packet_count=?,byte_size=?,sha256=? WHERE id=? AND status IN('creating','open','finalizing')`, status, reason, end.UTC().Format(time.RFC3339Nano), packets, size, sum, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET status=?,intended_status=NULL,end_reason=?,end_at=?,packet_count=?,byte_size=?,sha256=? WHERE id=? AND status='finalizing' AND intended_status=?`, status, reason, end.UTC().Format(time.RFC3339Nano), packets, size, sum, id, status)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) MarkRecordingUnavailable(ctx context.Context, id, reason string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE recordings SET status='unavailable',intended_status=NULL,end_reason=?,end_at=? WHERE id=?`, reason, now.UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 func (s *Store) RecordingStatus(ctx context.Context, id string) (string, error) {
 	var status string
 	err := s.db.QueryRowContext(ctx, "SELECT status FROM recordings WHERE id=?", id).Scan(&status)
 	return status, err
+}
+func (s *Store) RecoverableRecordingIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM recordings WHERE status IN('creating','open','finalizing')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 func (s *Store) ExpiredRecordings(ctx context.Context, before time.Time) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM recordings WHERE status IN('complete','partial') AND end_at<?`, before.UTC().Format(time.RFC3339Nano))
@@ -305,6 +360,25 @@ func (s *Store) BeginRecordingDelete(ctx context.Context, id string) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+func (s *Store) BeginRecordingDeleteAudited(ctx context.Context, id, actor string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, "UPDATE recordings SET intended_status=status,status='deleting' WHERE id=? AND status IN('complete','partial')", id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(occurred_at,action,outcome,actor_id,recording_id,details)VALUES(?,'recording_delete','success',?,?, '{}')`, now.UTC().Format(time.RFC3339Nano), actor, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) DeletingRecordings(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT id FROM recordings WHERE status='deleting'")
@@ -390,7 +464,7 @@ func (s *Store) webAuthnMaterial(ctx context.Context, where string, arg any, rpI
 	if err := s.db.QueryRowContext(ctx, "SELECT u.id,u.username,u.webauthn_handle FROM users u WHERE "+where+" AND u.disabled_at IS NULL AND u.deleted_at IS NULL", arg).Scan(&out.UserID, &out.Username, &out.Handle); err != nil {
 		return out, err
 	}
-	query := "SELECT public_key FROM webauthn_credentials WHERE user_id=?"
+	query := "SELECT public_key FROM webauthn_credentials WHERE user_id=? AND suspected_at IS NULL"
 	args := []any{out.UserID}
 	if rpID != "" {
 		query += " AND rp_id=?"
@@ -429,7 +503,22 @@ func (s *Store) UpdateWebAuthnCredential(ctx context.Context, userID string, id,
 	return nil
 }
 
-type Store struct{ db *sql.DB }
+func (s *Store) MarkWebAuthnCredentialSuspected(ctx context.Context, userID string, id []byte, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE webauthn_credentials SET suspected_at=? WHERE id=? AND user_id=?`, now.UTC().Format(time.RFC3339Nano), id, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+type Store struct {
+	db       *sql.DB
+	lockFile *os.File
+}
 type MonitoringCounts struct {
 	Accounts, Sessions, Recordings, AuthenticationFailures int64
 }
@@ -452,26 +541,43 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := rejectSymlink(path); err != nil {
 		return nil, err
 	}
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open database ownership lock: %w", err)
+	}
+	if err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		return nil, errors.New("database is owned by another opusrefweb process")
+	}
+	releaseLock := func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		releaseLock()
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	if _, err = db.ExecContext(ctx, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
 		db.Close()
+		releaseLock()
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, lockFile: lockFile}
 	if err = s.backupBeforeMigration(ctx, path); err != nil {
 		db.Close()
+		releaseLock()
 		return nil, err
 	}
 	if err = s.migrate(ctx); err != nil {
 		db.Close()
+		releaseLock()
 		return nil, err
 	}
 	if err = os.Chmod(path, 0600); err != nil {
 		db.Close()
+		releaseLock()
 		return nil, err
 	}
 	return s, nil
@@ -482,12 +588,34 @@ func (s *Store) backupBeforeMigration(ctx context.Context, path string) error {
 		return err
 	}
 	var version int
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version == 0 || version >= 2 {
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version == 0 || version >= 4 {
 		return err
 	}
 	backup := fmt.Sprintf("%s.pre-v%d-%d.bak", path, version, time.Now().UnixNano())
-	quoted := strings.ReplaceAll(backup, "'", "''")
-	if _, err := s.db.ExecContext(ctx, "VACUUM INTO '"+quoted+"'"); err != nil {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration backup connection: %w", err)
+	}
+	defer connection.Close()
+	err = connection.Raw(func(driverConn any) error {
+		backuper, ok := driverConn.(interface {
+			NewBackup(string) (*sqlite.Backup, error)
+		})
+		if !ok {
+			return errors.New("SQLite driver does not support online backup")
+		}
+		operation, backupErr := backuper.NewBackup(backup)
+		if backupErr != nil {
+			return backupErr
+		}
+		if _, backupErr = operation.Step(-1); backupErr != nil {
+			_, _ = operation.Commit()
+			return backupErr
+		}
+		_, backupErr = operation.Commit()
+		return backupErr
+	})
+	if err != nil {
 		return fmt.Errorf("create migration backup: %w", err)
 	}
 	if err := os.Chmod(backup, 0600); err != nil {
@@ -508,7 +636,23 @@ func rejectSymlink(path string) error {
 	}
 	return nil
 }
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.lockFile != nil {
+		if lockErr := syscall.Flock(int(s.lockFile.Fd()), syscall.LOCK_UN); err == nil {
+			err = lockErr
+		}
+		if closeErr := s.lockFile.Close(); err == nil {
+			err = closeErr
+		}
+		s.lockFile = nil
+	}
+	return err
+}
+func (s *Store) Ping(ctx context.Context) error {
+	var one int
+	return s.db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
+}
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
 		return err
@@ -517,7 +661,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 2 {
+	if version > 4 {
 		return errors.New("database schema is newer than this program")
 	}
 	if version == 1 {
@@ -532,9 +676,51 @@ CREATE INDEX IF NOT EXISTS audit_browse ON audit_events(id DESC);
 INSERT INTO schema_migrations(version,applied_at)VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));`); err != nil {
 			return err
 		}
-		return tx.Commit()
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		return s.migrate(ctx)
 	}
 	if version == 2 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, `CREATE TRIGGER IF NOT EXISTS recordings_status_insert BEFORE INSERT ON recordings WHEN NEW.status NOT IN('creating','open','finalizing','complete','partial','deleting','deleted','unavailable') BEGIN SELECT RAISE(ABORT,'invalid recording status'); END;
+CREATE TRIGGER IF NOT EXISTS recordings_status_update BEFORE UPDATE OF status ON recordings WHEN NEW.status NOT IN('creating','open','finalizing','complete','partial','deleting','deleted','unavailable') BEGIN SELECT RAISE(ABORT,'invalid recording status'); END;
+INSERT INTO schema_migrations(version,applied_at)VALUES(3,strftime('%Y-%m-%dT%H:%M:%fZ','now'));`); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		return s.migrate(ctx)
+	}
+	if version == 3 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		var columnCount int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('webauthn_credentials') WHERE name='suspected_at'`).Scan(&columnCount); err != nil {
+			return err
+		}
+		if columnCount == 0 {
+			if _, err = tx.ExecContext(ctx, `ALTER TABLE webauthn_credentials ADD COLUMN suspected_at TEXT`); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at)VALUES(4,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		return s.migrate(ctx)
+	}
+	if version == 4 {
 		return nil
 	}
 	schema := `
@@ -774,6 +960,17 @@ func (s *Store) DeleteUser(ctx context.Context, id string, now time.Time) error 
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) PurgeTombstones(ctx context.Context, before time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM user_tombstones
+WHERE deleted_at<? AND NOT EXISTS(
+  SELECT 1 FROM recordings WHERE recordings.web_user_id=user_tombstones.user_id
+)`, before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID string, now time.Time, idle, absolute time.Duration, max int) (string, string, Session, error) {

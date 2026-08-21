@@ -30,6 +30,13 @@ type Manager struct {
 	ceremonies map[string]ceremony
 }
 
+type VerificationFailure struct {
+	UserID     string
+	Regression bool
+}
+
+func (e *VerificationFailure) Error() string { return "passkey verification failed" }
+
 func New(rpID, name string, origins []string, state *store.Store) (*Manager, error) {
 	if rpID == "" {
 		return nil, nil
@@ -100,10 +107,11 @@ func (m *Manager) FinishLogin(ctx context.Context, id string, credential json.Ra
 		return candidate, loadErr
 	}, item.data, request)
 	if err != nil {
-		return "", errors.New("passkey verification failed")
+		return "", &VerificationFailure{UserID: resolved.userID}
 	}
 	if validated.Authenticator.CloneWarning {
-		return "", errors.New("passkey sign counter regressed")
+		_ = m.store.MarkWebAuthnCredentialSuspected(ctx, resolved.userID, validated.ID, time.Now())
+		return "", &VerificationFailure{UserID: resolved.userID, Regression: true}
 	}
 	encoded, _ := json.Marshal(validated)
 	if err = m.store.UpdateWebAuthnCredential(ctx, resolved.userID, validated.ID, encoded, validated.Authenticator.SignCount, validated.Flags.BackupEligible, validated.Flags.BackupState, time.Now()); err != nil {
@@ -149,8 +157,12 @@ func (m *Manager) FinishReauth(ctx context.Context, id, userID, sessionID string
 	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(response))
 	request.Header.Set("Content-Type", "application/json")
 	credential, err := m.engine.FinishLogin(u, item.data, request)
-	if err != nil || credential.Authenticator.CloneWarning {
-		return errors.New("passkey verification failed")
+	if err != nil {
+		return &VerificationFailure{UserID: userID}
+	}
+	if credential.Authenticator.CloneWarning {
+		_ = m.store.MarkWebAuthnCredentialSuspected(ctx, userID, credential.ID, time.Now())
+		return &VerificationFailure{UserID: userID, Regression: true}
 	}
 	encoded, _ := json.Marshal(credential)
 	return m.store.UpdateWebAuthnCredential(ctx, userID, credential.ID, encoded, credential.Authenticator.SignCount, credential.Flags.BackupEligible, credential.Flags.BackupState, time.Now())

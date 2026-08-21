@@ -34,6 +34,7 @@ type Snapshot struct {
 	Version       string           `json:"version"`
 	UptimeSeconds float64          `json:"uptime_seconds"`
 	ReflectorID   string           `json:"reflector_id,omitempty"`
+	DisplayName   string           `json:"display_name,omitempty"`
 	Ready         bool             `json:"ready"`
 	Clients       int              `json:"client_count"`
 	ClientList    []ClientSnapshot `json:"-"`

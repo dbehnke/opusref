@@ -64,6 +64,11 @@ func (m *PTTManager) StartForUser(ctx context.Context, session, userID, callsign
 		}
 		return Grant{}, err
 	}
+	if identity, ok := m.tx.(client.GrantIdentity); ok && m.attribution != nil {
+		if sessionID, streamID, confirmed := identity.ConfirmedGrant(); confirmed {
+			m.attribution.Bind(ReflectorStream{SessionID: sessionID, StreamID: streamID}, userID)
+		}
+	}
 	channel, err := m.channel()
 	if err != nil {
 		_ = m.tx.EndStream(ctx)
@@ -110,6 +115,15 @@ func (m *PTTManager) StopSession(ctx context.Context, session string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state.session != session {
+		return nil
+	}
+	m.state = pttState{}
+	return m.tx.EndStream(ctx)
+}
+func (m *PTTManager) StopActive(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state.channel == 0 {
 		return nil
 	}
 	m.state = pttState{}

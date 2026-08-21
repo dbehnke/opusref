@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,13 +67,13 @@ func (s *SupervisedClient) run(ctx context.Context) {
 			if current != nil {
 				_ = current.Close()
 			}
-			if !waitContext(ctx, backoff) {
+			if !waitContext(ctx, jitter(backoff)) {
 				return
 			}
 			backoff = min(backoff*2, s.maximumBackoff)
 			continue
 		}
-		backoff = s.initialBackoff
+		connectedAt := time.Now()
 		s.mu.Lock()
 		s.active = current
 		s.mu.Unlock()
@@ -93,21 +94,34 @@ func (s *SupervisedClient) run(ctx context.Context) {
 				s.clear(current)
 				_ = current.Close()
 				s.publish(ctx, client.Event{Kind: client.EventStatus, Message: "disconnected", Synthetic: true})
-				if !waitContext(ctx, backoff) {
+				if time.Since(connectedAt) >= 30*time.Second {
+					backoff = s.initialBackoff
+				}
+				if !waitContext(ctx, jitter(backoff)) {
 					return
 				}
+				backoff = min(backoff*2, s.maximumBackoff)
 				break connected
 			case <-current.Done():
 				s.clear(current)
 				_ = current.Close()
 				s.publish(ctx, client.Event{Kind: client.EventStatus, Message: "disconnected", Synthetic: true})
-				if !waitContext(ctx, backoff) {
+				if time.Since(connectedAt) >= 30*time.Second {
+					backoff = s.initialBackoff
+				}
+				if !waitContext(ctx, jitter(backoff)) {
 					return
 				}
+				backoff = min(backoff*2, s.maximumBackoff)
 				break connected
 			}
 		}
 	}
+}
+func jitter(duration time.Duration) time.Duration {
+	// Spread reconnects uniformly across ±20 percent to avoid synchronized clients.
+	factor := 0.8 + rand.Float64()*0.4
+	return time.Duration(float64(duration) * factor)
 }
 func (s *SupervisedClient) clear(current client.Client) {
 	s.ready.Store(false)
@@ -153,6 +167,16 @@ func (s *SupervisedClient) withActive(call func(client.Client) error) error {
 }
 func (s *SupervisedClient) RequestStream(ctx context.Context, source string) error {
 	return s.withActive(func(active client.Client) error { return active.RequestStream(ctx, source) })
+}
+func (s *SupervisedClient) ConfirmedGrant() (uint64, uint32, bool) {
+	s.mu.RLock()
+	active := s.active
+	s.mu.RUnlock()
+	provider, ok := active.(client.GrantIdentity)
+	if !ok {
+		return 0, 0, false
+	}
+	return provider.ConfirmedGrant()
 }
 func (s *SupervisedClient) SendAudio(ctx context.Context, timestamp uint32, payload []byte) error {
 	return s.withActive(func(active client.Client) error { return active.SendAudio(ctx, timestamp, payload) })

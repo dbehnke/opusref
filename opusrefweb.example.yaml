@@ -29,7 +29,8 @@ authentication:
   argon2_iterations: 3
   argon2_parallelism: 4
   max_concurrent_hashes: 2
-  password_blocklist_file: /etc/opusref/seclists-10k-most-common.txt
+  # Optional additive UTF-8 blocklist. A pinned SecLists 10k corpus is embedded.
+  password_blocklist_file: ""
 webauthn:
   rp_id: "opusref.example.org"
   rp_name: "OpusRef"

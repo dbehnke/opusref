@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dbehnke/opusref/internal/webapp/store"
@@ -18,6 +20,18 @@ type StreamKey struct {
 	SessionID uint64
 	StreamID  uint32
 }
+
+const (
+	PartialUnknownPrefix uint32 = 1 << iota
+	PartialSequenceGap
+	PartialBackpressure
+	PartialSyntheticEnd
+	PartialMissingEnd
+	PartialQuota
+	PartialWriteFailure
+	PartialServerShutdown
+)
+
 type commandKind uint8
 
 const (
@@ -49,6 +63,7 @@ type Service struct {
 	dropped   map[StreamKey]bool
 	closed    chan struct{}
 	closeOnce sync.Once
+	healthy   atomic.Bool
 }
 type activeStream struct {
 	key          StreamKey
@@ -58,8 +73,7 @@ type activeStream struct {
 	started      time.Time
 	file         *File
 	packets      int64
-	partial      bool
-	reason       string
+	reasons      uint32
 	seen         bool
 	lastSequence uint32
 }
@@ -76,6 +90,7 @@ func NewService(ctx context.Context, state *store.Store, directory string, quota
 		return nil, errors.New("archive directory is invalid")
 	}
 	service := &Service{state: state, directory: directory, quota: quota, commands: make(chan command, queuePackets+4), dropped: map[StreamKey]bool{}, closed: make(chan struct{})}
+	service.healthy.Store(true)
 	if err = service.recover(ctx); err != nil {
 		return nil, err
 	}
@@ -129,7 +144,8 @@ func (s *Service) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			if active != nil {
-				s.finish(active, "partial", "server_shutdown")
+				active.reasons |= PartialServerShutdown
+				s.finish(active, "server_shutdown")
 			}
 			return
 		case item := <-s.commands:
@@ -140,13 +156,13 @@ func (s *Service) run(ctx context.Context) {
 			}
 			s.mu.Unlock()
 			if active != nil && dropped {
-				active.partial = true
-				active.reason = "archive_backpressure"
+				active.reasons |= PartialBackpressure
 			}
 			switch item.kind {
 			case commandStart:
 				if active != nil {
-					s.finish(active, "partial", "missing_end")
+					active.reasons |= PartialMissingEnd
+					s.finish(active, "missing_end")
 				}
 				active = &activeStream{key: item.key, id: uuid.New(), node: item.node, source: item.source, webUserID: item.webUserID, started: item.started}
 			case commandAudio, commandData:
@@ -154,12 +170,10 @@ func (s *Service) run(ctx context.Context) {
 					break
 				}
 				if !active.seen && item.sequence != 0 {
-					active.partial = true
-					active.reason = "unknown_prefix"
+					active.reasons |= PartialUnknownPrefix
 				}
 				if active.seen && item.sequence != active.lastSequence+1 {
-					active.partial = true
-					active.reason = "sequence_gap"
+					active.reasons |= PartialSequenceGap
 				}
 				active.seen = true
 				active.lastSequence = item.sequence
@@ -168,20 +182,16 @@ func (s *Service) run(ctx context.Context) {
 				}
 			case commandEnd:
 				if active != nil && active.key == item.key {
-					status := "complete"
-					if item.partial || active.partial {
-						status = "partial"
+					if item.partial {
+						active.reasons |= PartialSyntheticEnd
 					}
-					reason := item.reason
-					if active.reason != "" {
-						reason = active.reason
-					}
-					s.finish(active, status, reason)
+					s.finish(active, item.reason)
 					active = nil
 				}
 			case commandClose:
 				if active != nil {
-					s.finish(active, "partial", "server_shutdown")
+					active.reasons |= PartialServerShutdown
+					s.finish(active, "server_shutdown")
 				}
 				if item.ack != nil {
 					close(item.ack)
@@ -201,27 +211,23 @@ func (s *Service) write(active *activeStream, item command) {
 		available := s.used+need <= s.quota
 		s.mu.Unlock()
 		if !available {
-			active.partial = true
-			active.reason = "quota_limit"
+			active.reasons |= PartialQuota
 			return
 		}
 		relative := active.id.String() + ".orar"
 		if err := s.state.InsertRecording(context.Background(), active.id.String(), active.node, active.source, active.webUserID, relative, active.started); err != nil {
-			active.partial = true
-			active.reason = "database_error"
+			active.reasons |= PartialWriteFailure
 			return
 		}
 		file, err := CreateFile(s.directory, active.id, s.remainingQuota())
 		if err != nil {
-			active.partial = true
-			active.reason = "archive_create"
+			active.reasons |= PartialWriteFailure
 			return
 		}
 		active.file = file
 		s.addUsed(HeaderSize)
 		if err = s.state.OpenRecording(context.Background(), active.id.String()); err != nil {
-			active.partial = true
-			active.reason = "database_error"
+			active.reasons |= PartialWriteFailure
 			return
 		}
 	}
@@ -231,27 +237,37 @@ func (s *Service) write(active *activeStream, item command) {
 		offset = 0
 	}
 	if err := active.file.Append(Packet{Sequence: item.sequence, Timestamp: item.timestamp, ArrivalMS: uint32(offset), Payload: item.payload}); err != nil {
-		active.partial = true
 		if errors.Is(err, ErrLimit) {
-			active.reason = "file_or_quota_limit"
+			active.reasons |= PartialQuota
 		} else {
-			active.reason = "archive_write"
+			active.reasons |= PartialWriteFailure
 		}
 		return
 	}
 	active.packets++
 	s.addUsed(active.file.writer.Size() - before)
 }
-func (s *Service) finish(active *activeStream, status, reason string) {
+func (s *Service) finish(active *activeStream, reason string) {
 	if active.file == nil {
+		return
+	}
+	status := "complete"
+	if active.reasons != 0 {
+		status = "partial"
+	}
+	if err := s.state.BeginRecordingFinalize(context.Background(), active.id.String(), status, reason, active.reasons); err != nil {
+		s.healthy.Store(false)
 		return
 	}
 	_, size, sum, err := active.file.Finalize()
 	if err != nil {
-		status = "partial"
-		reason = "finalize_error"
+		_ = s.state.MarkRecordingUnavailable(context.Background(), active.id.String(), "finalize_error", time.Now())
+		s.healthy.Store(false)
+		return
 	}
-	_ = s.state.FinishRecording(context.Background(), active.id.String(), status, reason, time.Now(), active.packets, size, sum)
+	if err = s.state.FinishRecording(context.Background(), active.id.String(), status, reason, time.Now(), active.packets, size, sum); err != nil {
+		s.healthy.Store(false)
+	}
 }
 func (s *Service) remainingQuota() int64 { s.mu.Lock(); defer s.mu.Unlock(); return s.quota - s.used }
 func (s *Service) addUsed(value int64)   { s.mu.Lock(); s.used += value; s.mu.Unlock() }
@@ -277,6 +293,7 @@ func (s *Service) recover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	seen := map[string]bool{}
 	for _, entry := range entries {
 		name := entry.Name()
 		path := filepath.Join(s.directory, name)
@@ -298,8 +315,24 @@ func (s *Service) recover(ctx context.Context) error {
 		if extension != ".partial" && extension != ".orar" {
 			continue
 		}
+		filenameID, filenameErr := uuid.Parse(strings.TrimSuffix(name, extension))
+		if filenameErr == nil {
+			seen[filenameID.String()] = true
+		}
 		id, size, sum, validateErr := ValidateFile(path)
+		if validateErr != nil && extension == ".partial" {
+			if repairErr := RepairTornTrailingEntry(path); repairErr == nil {
+				id, size, sum, validateErr = ValidateFile(path)
+			}
+		}
 		if validateErr != nil {
+			if filenameErr == nil {
+				if _, statusErr := s.state.RecordingStatus(ctx, filenameID.String()); statusErr == nil {
+					if markErr := s.state.MarkRecordingUnavailable(ctx, filenameID.String(), "corrupt_archive", time.Now()); markErr != nil {
+						return markErr
+					}
+				}
+			}
 			if renameErr := os.Rename(path, path+".quarantine"); renameErr != nil {
 				return renameErr
 			}
@@ -312,16 +345,56 @@ func (s *Service) recover(ctx context.Context) error {
 			}
 			continue
 		}
+		if status == "deleting" {
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+			if err = syncDirectory(s.directory); err != nil {
+				return err
+			}
+			if err = s.state.MarkRecordingDeleted(ctx, id.String(), time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
 		if extension == ".partial" {
 			final := filepath.Join(s.directory, id.String()+".orar")
+			count, countErr := CountPackets(path)
+			if countErr != nil {
+				return countErr
+			}
+			if err = s.state.PrepareRecoveryFinalize(ctx, id.String(), "partial", "process_restart", PartialServerShutdown); err != nil {
+				return err
+			}
 			if err = os.Rename(path, final); err != nil {
 				return err
 			}
-			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), 0, size, sum); err != nil {
+			if err = syncDirectory(s.directory); err != nil {
+				return err
+			}
+			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), count, size, sum); err != nil {
 				return err
 			}
 		} else if status != "complete" && status != "partial" {
-			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), 0, size, sum); err != nil {
+			count, countErr := CountPackets(path)
+			if countErr != nil {
+				return countErr
+			}
+			if err = s.state.PrepareRecoveryFinalize(ctx, id.String(), "partial", "process_restart", PartialServerShutdown); err != nil {
+				return err
+			}
+			if err = s.state.FinishRecording(ctx, id.String(), "partial", "process_restart", time.Now(), count, size, sum); err != nil {
+				return err
+			}
+		}
+	}
+	recoverable, err := s.state.RecoverableRecordingIDs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range recoverable {
+		if !seen[id] {
+			if err = s.state.MarkRecordingUnavailable(ctx, id, "archive_missing", time.Now()); err != nil {
 				return err
 			}
 		}
@@ -356,33 +429,35 @@ func (s *Service) Purge(ctx context.Context, retention time.Duration, now time.T
 			return err
 		}
 	}
-	return s.enforceQuota(ctx, now)
-}
-func (s *Service) enforceQuota(ctx context.Context, now time.Time) error {
-	target := s.quota * 9 / 10
-	for s.usedBytes() > target {
-		ids, err := s.state.OldestRecordings(ctx, 100)
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return nil
-		}
-		for _, id := range ids {
-			if err = s.Delete(ctx, id, now); err != nil {
-				return err
-			}
-			if s.usedBytes() <= target {
-				return nil
-			}
-		}
-	}
 	return nil
 }
 func (s *Service) usedBytes() int64           { s.mu.Lock(); defer s.mu.Unlock(); return s.used }
 func (s *Service) Usage() (used, quota int64) { return s.usedBytes(), s.quota }
 func (s *Service) QuotaFull() bool            { s.mu.Lock(); defer s.mu.Unlock(); return s.used >= s.quota }
-func (s *Service) Ready() bool                { return !s.QuotaFull() }
+func (s *Service) Ready() bool                { return s.healthy.Load() }
+func (s *Service) Probe(ctx context.Context) bool {
+	if err := s.state.Ping(ctx); err != nil {
+		s.healthy.Store(false)
+		return false
+	}
+	file, err := os.CreateTemp(s.directory, ".writable-probe-")
+	if err == nil {
+		_, err = file.Write([]byte{0})
+		if err == nil {
+			err = file.Sync()
+		}
+		closeErr := file.Close()
+		removeErr := os.Remove(file.Name())
+		if err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = removeErr
+		}
+	}
+	s.healthy.Store(err == nil)
+	return err == nil
+}
 func (s *Service) validatedPath(id string) (string, error) {
 	parsed, err := uuid.Parse(id)
 	if err != nil || parsed.String() != id {
@@ -397,11 +472,22 @@ func (s *Service) validatedPath(id string) (string, error) {
 }
 func (s *Service) Path(id string) string { path, _ := s.validatedPath(id); return path }
 func (s *Service) Delete(ctx context.Context, id string, now time.Time) error {
+	return s.delete(ctx, id, "", now)
+}
+func (s *Service) DeleteAs(ctx context.Context, id, actor string, now time.Time) error {
+	return s.delete(ctx, id, actor, now)
+}
+func (s *Service) delete(ctx context.Context, id, actor string, now time.Time) error {
 	path, err := s.validatedPath(id)
 	if err != nil {
 		return err
 	}
-	if err = s.state.BeginRecordingDelete(ctx, id); err != nil {
+	if actor != "" {
+		err = s.state.BeginRecordingDeleteAudited(ctx, id, actor, now)
+	} else {
+		err = s.state.BeginRecordingDelete(ctx, id)
+	}
+	if err != nil {
 		return err
 	}
 	deleting := filepath.Join(s.directory, id+".deleting")
@@ -472,6 +558,25 @@ func (s *Service) ReadPackets(id string) ([]Packet, error) {
 		}
 		packets = append(packets, packet)
 	}
+}
+func (s *Service) OpenPlayback(id string) (*Playback, error) {
+	path, err := s.validatedPath(id)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("archive file is invalid")
+	}
+	recording, err := s.state.RecordingByID(context.Background(), id)
+	if err != nil || recording.RelativePath != id+".orar" || recording.ByteSize != info.Size() {
+		return nil, errors.New("archive metadata does not match the file")
+	}
+	_, _, checksum, err := ValidateFile(path)
+	if err != nil || !bytes.Equal(checksum, recording.SHA256) {
+		return nil, errors.New("archive checksum is invalid")
+	}
+	return buildPlayback(path, info.Size())
 }
 func syncDirectory(path string) error {
 	directory, err := os.Open(path)

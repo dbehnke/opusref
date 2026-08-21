@@ -17,6 +17,10 @@ type fakeTX struct {
 	err              error
 }
 
+type confirmedTX struct{ fakeTX }
+
+func (*confirmedTX) ConfirmedGrant() (uint64, uint32, bool) { return 12, 34, true }
+
 func (f *fakeTX) RequestStream(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -83,5 +87,17 @@ func TestPTTReflectorEndClearsOwnerAndNotifies(t *testing.T) {
 	}
 	if _, err = m.Start(context.Background(), "session-b", "N0CALL"); err != nil {
 		t.Fatalf("floor was not cleared: %v", err)
+	}
+}
+
+func TestPTTBindsConfirmedGrantBeforeAsynchronousEvent(t *testing.T) {
+	attribution := NewGrantAttribution()
+	m := NewPTTManager(&confirmedTX{})
+	m.SetAttribution(attribution)
+	if _, err := m.StartForUser(context.Background(), "session", "user-1", "N0CALL"); err != nil {
+		t.Fatal(err)
+	}
+	if got := attribution.User(ReflectorStream{SessionID: 12, StreamID: 34}); got != "user-1" {
+		t.Fatalf("attribution=%q", got)
 	}
 }

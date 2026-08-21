@@ -47,6 +47,15 @@ func TestPasswordPolicy(t *testing.T) {
 	}
 }
 
+func TestEmbeddedSecListsCorpusIsLoaded(t *testing.T) {
+	if len(builtInCommon) < 9900 {
+		t.Fatalf("embedded common-password corpus has only %d normalized entries", len(builtInCommon))
+	}
+	if err := (Policy{}).Check("films+pic+galeries"); err == nil || err.Code != PolicyCommon {
+		t.Fatalf("SecLists password was not rejected: %#v", err)
+	}
+}
+
 func TestUsernameValidation(t *testing.T) {
 	if got, err := NormalizeUsername("Alice.Name"); err != nil || got != "alice.name" {
 		t.Fatalf("got %q: %v", got, err)

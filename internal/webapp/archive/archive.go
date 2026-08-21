@@ -237,3 +237,80 @@ func ValidateFile(path string) (uuid.UUID, int64, []byte, error) {
 	}
 	return reader.ID(), info.Size(), h.Sum(nil), nil
 }
+func CountPackets(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	reader, err := NewReader(file, info.Size())
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for {
+		_, err = reader.Next()
+		if errors.Is(err, io.EOF) {
+			return count, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+}
+
+// RepairTornTrailingEntry truncates only an incomplete final header or payload.
+// It rejects semantic corruption in every complete entry.
+func RepairTornTrailingEntry(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Size() < HeaderSize || info.Size() > MaxFileSize {
+		return errors.New("archive size is invalid")
+	}
+	header := make([]byte, HeaderSize)
+	if _, err = file.ReadAt(header, 0); err != nil || string(header[:4]) != "ORAR" || binary.BigEndian.Uint16(header[4:6]) != 1 || binary.BigEndian.Uint16(header[6:8]) != HeaderSize {
+		return errors.New("archive header is invalid")
+	}
+	offset := int64(HeaderSize)
+	for offset < info.Size() {
+		entry := make([]byte, EntryHeaderSize)
+		n, readErr := file.ReadAt(entry, offset)
+		if readErr != nil && (errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)) && n < EntryHeaderSize {
+			if err = file.Truncate(offset); err != nil {
+				return err
+			}
+			return file.Sync()
+		}
+		if readErr != nil {
+			return readErr
+		}
+		if binary.BigEndian.Uint16(entry[14:16]) != 0 {
+			return errors.New("entry flags are not zero")
+		}
+		length := int64(binary.BigEndian.Uint16(entry[12:14]))
+		if length < 1 || length > MaxPayload {
+			return errors.New("entry length is invalid")
+		}
+		n, readErr = file.ReadAt(make([]byte, length), offset+EntryHeaderSize)
+		if readErr != nil && (errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)) && int64(n) < length {
+			if err = file.Truncate(offset); err != nil {
+				return err
+			}
+			return file.Sync()
+		}
+		if readErr != nil {
+			return readErr
+		}
+		offset += EntryHeaderSize + length
+	}
+	return nil
+}

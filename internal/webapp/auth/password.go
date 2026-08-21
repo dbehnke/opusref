@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -148,7 +149,23 @@ type Policy struct {
 	Additional         map[string]struct{}
 }
 
-var builtInCommon = map[string]struct{}{"password": {}, "passwordpassword": {}, "123456789012345": {}, "qwertyuiopasdfgh": {}, "letmeinletmeinletmein": {}}
+//go:embed data/10k-most-common.txt
+var embeddedCommonPasswords string
+
+var builtInCommon = loadEmbeddedCommonPasswords()
+
+func loadEmbeddedCommonPasswords() map[string]struct{} {
+	result := make(map[string]struct{}, 10000)
+	for _, value := range strings.Split(embeddedCommonPasswords, "\n") {
+		if key := comparisonKey(value); key != "" {
+			result[key] = struct{}{}
+		}
+	}
+	for _, value := range []string{"password", "passwordpassword", "123456789012345", "qwertyuiopasdfgh", "letmeinletmeinletmein"} {
+		result[comparisonKey(value)] = struct{}{}
+	}
+	return result
+}
 
 func (p Policy) Check(value string) *PolicyError {
 	value = NormalizePassword(value)

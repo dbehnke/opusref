@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -235,6 +236,7 @@ func serve(args []string) error {
 			case now := <-ticker.C:
 				_ = archives.Purge(runCtx, c.Storage.Retention.Time(), now)
 				_, _ = state.PurgeAudit(runCtx, now.Add(-c.Storage.AuditRetention.Time()))
+				_, _ = state.PurgeTombstones(runCtx, now.Add(-30*24*time.Hour))
 			}
 		}
 	}()
@@ -249,12 +251,23 @@ func serve(args []string) error {
 	monitorClient := reflectormonitor.New(c.Reflector.MonitoringURL)
 	go monitorClient.Run(runCtx, c.Reflector.MonitorPollInterval.Time())
 	go publishReceiver(runCtx, receiver, hub, archives, attribution)
-	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, LiveQueueBytes: c.Limits.LiveQueueBytes, PlaybackQueuePackets: c.Limits.PlaybackQueuePackets, PlaybackQueueBytes: c.Limits.PlaybackQueueBytes, ControlQueueMessages: c.Limits.ControlQueueMessages, MaxPlaybacks: c.Limits.MaxPlaybacks, PlaybackMaxDuration: c.Limits.PlaybackMaxDuration.Time(), MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives, ReadyCheck: func() bool { return receiver.Ready() && transmitter.Ready() && archives.Ready() }}, state)
+	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, LiveQueueBytes: c.Limits.LiveQueueBytes, PlaybackQueuePackets: c.Limits.PlaybackQueuePackets, PlaybackQueueBytes: c.Limits.PlaybackQueueBytes, ControlQueueMessages: c.Limits.ControlQueueMessages, MaxPlaybacks: c.Limits.MaxPlaybacks, PlaybackMaxDuration: c.Limits.PlaybackMaxDuration.Time(), MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives, ReadyCheck: func() bool { return receiver.Ready() && transmitter.Ready() && archives.Probe(context.Background()) }}, state)
+	api.SetReady(false)
 	public := &http.Server{Addr: c.Web.HTTPListen, Handler: api.PublicHandler(), ReadHeaderTimeout: 5 * time.Second}
 	monitor := &http.Server{Addr: c.Web.MonitorListen, Handler: api.MonitorHandler(), ReadHeaderTimeout: 5 * time.Second}
+	publicListener, err := net.Listen("tcp", c.Web.HTTPListen)
+	if err != nil {
+		return fmt.Errorf("bind public listener: %w", err)
+	}
+	monitorListener, err := net.Listen("tcp", c.Web.MonitorListen)
+	if err != nil {
+		_ = publicListener.Close()
+		return fmt.Errorf("bind monitoring listener: %w", err)
+	}
 	fail := make(chan error, 2)
-	go func() { fail <- public.ListenAndServe() }()
-	go func() { fail <- monitor.ListenAndServe() }()
+	go func() { fail <- public.Serve(publicListener) }()
+	go func() { fail <- monitor.Serve(monitorListener) }()
+	api.SetReady(true)
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -264,11 +277,14 @@ func serve(args []string) error {
 			return err
 		}
 	}
-	api.Shutdown()
-	runCancel()
+	api.SetReady(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return errors.Join(public.Shutdown(ctx), monitor.Shutdown(ctx))
+	httpErr := errors.Join(public.Shutdown(ctx), monitor.Shutdown(ctx))
+	api.Shutdown()
+	_ = ptt.StopActive(ctx)
+	runCancel()
+	return httpErr
 }
 
 func publishReceiver(ctx context.Context, receiver client.Client, hub *gateway.LiveHub, archives *webarchive.Service, attribution *gateway.GrantAttribution) {

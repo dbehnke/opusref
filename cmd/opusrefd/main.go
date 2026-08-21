@@ -52,7 +52,7 @@ func run() error {
 		registry.AddEvent(monitor.Event{Type: event.Type, Severity: event.Severity, Details: event.Details})
 	})
 	logRuntimeStart(logger, cfg)
-	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID})
+	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID, DisplayName: cfg.Reflector.DisplayName})
 	httpServer := &http.Server{Addr: cfg.Monitoring.HTTPListen, Handler: registry.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	errHTTP := make(chan error, 1)
 	if cfg.Monitoring.HTTPListen != "" {
@@ -89,13 +89,13 @@ func run() error {
 				for _, c := range s.Clients {
 					clients = append(clients, monitor.ClientSnapshot{NodeCallsign: c.NodeCallsign, RemoteAddress: c.RemoteAddress, SessionID: c.SessionID, ConnectedAt: c.ConnectedAt, LastActivity: c.LastActivity})
 				}
-				registry.Publish(monitor.Snapshot{Ready: s.Ready, ReflectorID: cfg.Reflector.ID, Clients: len(clients), ClientList: clients, Floor: s.Floor, Stream: monitor.StreamSnapshot{Active: s.Floor.Active, SessionID: s.Floor.SessionID, StreamID: s.Floor.StreamID, NodeCallsign: s.Floor.NodeCallsign, SourceCallsign: s.Floor.SourceCallsign, StartedAt: s.Floor.StartedAt, LastFrameAt: s.Floor.LastFrameAt, RemainingTransmitSeconds: s.Floor.RemainingTransmitTime.Seconds()}})
+				registry.Publish(monitor.Snapshot{Ready: s.Ready, ReflectorID: cfg.Reflector.ID, DisplayName: cfg.Reflector.DisplayName, Clients: len(clients), ClientList: clients, Floor: s.Floor, Stream: monitor.StreamSnapshot{Active: s.Floor.Active, SessionID: s.Floor.SessionID, StreamID: s.Floor.StreamID, NodeCallsign: s.Floor.NodeCallsign, SourceCallsign: s.Floor.SourceCallsign, StartedAt: s.Floor.StartedAt, LastFrameAt: s.Floor.LastFrameAt, RemainingTransmitSeconds: s.Floor.RemainingTransmitTime.Seconds()}})
 			}
 		}
 	}()
 	err = waitForTermination(ctx, stop, errHTTP, errRun)
 	close(monitorDone)
-	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID})
+	registry.Publish(monitor.Snapshot{Ready: false, ReflectorID: cfg.Reflector.ID, DisplayName: cfg.Reflector.DisplayName})
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timers.ShutdownGrace)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)

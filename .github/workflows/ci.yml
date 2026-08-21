@@ -19,6 +19,10 @@ jobs:
       - run: go test -count=1 ./...
       - run: go test -race -count=1 ./...
       - run: go vet ./...
+      # Short fuzz smoke tests keep all wire decoders in the default CI gate.
+      - run: go test ./pkg/wire -run '^$' -fuzz=FuzzDecode -fuzztime=2s
+      - run: go test ./pkg/wire -run '^$' -fuzz=FuzzValidate -fuzztime=2s
+      - run: go test ./internal/webapp/socket -run '^$' -fuzz=FuzzDecodeMedia -fuzztime=2s
       - run: go build ./cmd/opusrefd ./cmd/opusrefctl ./cmd/opusrefweb
       - run: npm ci
         working-directory: web
@@ -31,7 +35,7 @@ jobs:
       - run: npm run build
         working-directory: web
       - run: git diff --exit-code -- web/dist
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps chromium firefox webkit
         working-directory: web
-      - run: npm run test:e2e -- --project=chromium
+      - run: npm run test:e2e
         working-directory: web

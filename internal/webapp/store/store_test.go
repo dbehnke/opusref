@@ -56,7 +56,7 @@ func TestMigrationCreatesRestrictedBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = state.DB().Exec("DELETE FROM schema_migrations WHERE version=2"); err != nil {
+	if _, err = state.DB().Exec("DELETE FROM schema_migrations WHERE version>=2"); err != nil {
 		t.Fatal(err)
 	}
 	_ = state.Close()
@@ -72,6 +72,63 @@ func TestMigrationCreatesRestrictedBackup(t *testing.T) {
 	info, err := os.Stat(backups[0])
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("backup mode=%v err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestOpenRejectsSecondProcessOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if second, err := Open(context.Background(), path); err == nil {
+		second.Close()
+		t.Fatal("second database owner was accepted")
+	}
+}
+
+func TestPasskeyRegressionStatePersists(t *testing.T) {
+	state, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	hash, _ := auth.HashPassword("quiet marble nebula orchard", auth.DefaultParams())
+	user, _ := state.CreateUser(context.Background(), CreateUser{Username: "alice", Role: RoleUser, PasswordHash: hash})
+	id := []byte{1, 2, 3}
+	if err = state.SaveWebAuthnCredential(context.Background(), user.ID, "example.test", "key", id, []byte(`{}`), 4, "", false, false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.MarkWebAuthnCredentialSuspected(context.Background(), user.ID, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	items, err := state.ListPasskeys(context.Background(), user.ID)
+	if err != nil || len(items) != 1 || !items[0].Suspected {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+}
+
+func TestTombstonePurgePreservesRecordingAttribution(t *testing.T) {
+	state, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	old := time.Now().Add(-31 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err = state.DB().Exec(`INSERT INTO user_tombstones(user_id,username,deleted_at) VALUES('used','a',?),('unused','b',?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = state.DB().Exec(`INSERT INTO recordings(id,node_callsign,source_callsign,web_user_id,start_at,status,relative_path,created_at) VALUES('r','WEB','N0CALL','used',?,'complete','r.orar',?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := state.PurgeTombstones(context.Background(), time.Now().Add(-30*24*time.Hour)); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	var remaining int
+	_ = state.DB().QueryRow(`SELECT COUNT(*) FROM user_tombstones WHERE user_id='used'`).Scan(&remaining)
+	if remaining != 1 {
+		t.Fatal("attributed tombstone was removed")
 	}
 }
 
