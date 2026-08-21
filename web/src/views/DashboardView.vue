@@ -35,7 +35,9 @@ async function toggleListen() {
     if (audio.state.ptt === 'idle') ptt.value?.ended()
   })
   const supported = await audio.start()
-  capability.value = supported ? { supported: true } : { supported: false, reason: audio.state.error }
+  if (audio.state.capabilityError) capability.value = { supported: false, reason: audio.state.capabilityError }
+  else capability.value = { supported: true }
+  if (!supported) { error.value = audio.state.error ?? 'The live connection could not start.'; await audio.close(); audio = undefined; listening.value = false }
 }
 onMounted(() => { refresh(); timer = window.setInterval(refresh, 1000) })
 onBeforeUnmount(() => { clearInterval(timer); void audio?.close() })

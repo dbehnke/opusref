@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 
 const envelope = (data: unknown) => ({ api_version: 1, data })
 const session = { authenticated: true, username: 'admin', role: 'admin', csrf_token: 'csrf', passkey_available: true, forced_password_change: false }
@@ -36,11 +37,68 @@ test('administrator account creation uses reauthentication and PATCH editing', a
   await expect.poll(() => created).toBe(true)
 })
 
-test('operations composes only the locked status, client, and audit routes', async ({ page }) => {
+test('operations shows bounded operator alerts with refresh, empty, and accessible states', async ({ page }, testInfo) => {
   await page.route('**/api/v1/admin/clients?**', route => route.fulfill({ json: envelope({ items: [] }) }))
   await page.route('**/api/v1/admin/audit?**', route => route.fulfill({ json: envelope({ items: [] }) }))
+  let eventLoads = 0
+  await page.route('**/api/v1/admin/events', route => { const load = eventLoads++; if (load === 2) return route.fulfill({ status: 503, json: { code: 'unavailable', message: 'unavailable' } }); return route.fulfill({ json: envelope({ items: load === 0 ? [{ id: 7, time: '2026-08-21T12:00:00Z', kind: 'archive_quota', severity: 'warning', message: 'Archive quota is full.' }] : [] }) }) })
   await page.goto('/admin/operations')
   await expect(page.getByText('No clients are connected.')).toBeVisible()
   await expect(page.getByText('No audit events are available.')).toBeVisible()
+  await expect(page.getByText('Archive quota is full.')).toBeVisible()
+  await expect(page.getByText('warning', { exact: true })).toBeVisible()
   await expect(page.getByText('Available', { exact: true }).first()).toBeVisible()
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+  const operationsScreenshot = testInfo.outputPath('operations-alerts-desktop.png'); await page.screenshot({ path: operationsScreenshot, fullPage: true }); await testInfo.attach('operations-alerts-desktop', { path: operationsScreenshot, contentType: 'image/png' })
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByText('No operator alerts are available.')).toBeVisible()
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByText('Operator alerts are unavailable. Select Refresh to try again.')).toBeVisible()
+})
+
+test('mobile account cards keep every action reachable by touch and keyboard', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/admin/accounts?**', route => route.fulfill({ json: envelope({ items: [{ id: 'user-1', username: 'operator', role: 'user', source_callsign: 'N0CALL', disabled: false, forced_password_change: false }] }) }))
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 900 })
+    await page.goto('/admin/accounts')
+    await page.getByLabel('Your current password').fill('a secure administrator password')
+    const account = page.getByRole('article', { name: 'Account operator' })
+    await expect(account).toBeVisible()
+    const names = ['Edit', 'Disable', 'Revoke sessions', 'Clear passkeys', 'Delete']
+    for (const name of names) {
+      const control = account.getByRole('button', { name })
+      await control.scrollIntoViewIfNeeded()
+      await expect(control).toBeInViewport()
+      expect(await control.evaluate(element => element.tabIndex)).toBe(0)
+      await control.focus()
+      await expect(control).toBeFocused()
+      const box = await control.boundingBox()
+      expect(box?.height).toBeGreaterThanOrEqual(44)
+      expect(box?.x).toBeGreaterThanOrEqual(0)
+      expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(width)
+    }
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    const accountScreenshot = testInfo.outputPath(`account-actions-${width}px.png`); await page.screenshot({ path: accountScreenshot, fullPage: true }); await testInfo.attach(`account-actions-${width}px`, { path: accountScreenshot, contentType: 'image/png' })
+  }
+})
+
+test('passkey removal requires confirmation and returns focus', async ({ page }) => {
+  await page.route('**/api/v1/me/sessions?**', route => route.fulfill({ json: envelope({ items: [] }) }))
+  await page.route('**/api/v1/me/passkeys?**', route => route.fulfill({ json: envelope({ items: [{ id: 'key-1', name: 'Travel key', created_at: '2026-08-20T12:00:00Z' }] }) }))
+  await page.route('**/api/v1/me/reauth/password', route => route.fulfill({ json: envelope({ reauth_token: 'proof' }) }))
+  let removed = false
+  await page.route('**/api/v1/me/passkeys/key-1', route => { removed = route.request().method() === 'DELETE'; return route.fulfill({ json: envelope({}) }) })
+  await page.goto('/security')
+  await page.getByLabel('Current password').fill('a secure password')
+  await page.getByRole('button', { name: 'Remove Travel key' }).click()
+  const dialog = page.getByRole('alertdialog', { name: 'Remove Travel key?' })
+  await expect(dialog).toContainText('This passkey cannot be used again.')
+  await dialog.getByRole('button', { name: 'Cancel' }).click()
+  expect(removed).toBe(false)
+  await expect(page.getByRole('button', { name: 'Remove Travel key' })).toBeFocused()
+  await page.getByRole('button', { name: 'Remove Travel key' }).click()
+  await dialog.getByRole('button', { name: 'Remove passkey' }).click()
+  await expect.poll(() => removed).toBe(true)
 })

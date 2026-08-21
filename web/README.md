@@ -70,6 +70,25 @@ access mode, the browser stops PTT and playback. It keeps anonymous live listeni
 available. If the WebSocket closes, the UI requires the user to select Listen live
 again. It does not restart audio without a user action.
 
+The audio start operation waits for the WebSocket hello response. A connection
+failure does not disable playback. The recording page keeps a Retry playback
+control available. A device capability failure disables playback and explains the
+unsupported capability.
+
+An account with a temporary password can use only the Security page and the sign
+out control. The page explains how to change the password. The main navigation
+shows the other authenticated pages after the password change succeeds.
+
+The Operations page gets the bounded operator event list from
+`/api/v1/admin/events`. It shows severity, time, type, and redacted operator text.
+It has separate loading, empty, and error states. The Accounts page uses cards on
+small screens so that each account action stays visible.
+
+Latch PTT is off by default. Hold mode stops when the user releases the control.
+Latch mode stops after the user activates the control a second time. The UI shows
+these instructions and announces each latch state change. Passkey removal requires
+confirmation and identifies the passkey.
+
 Playwright uses loopback servers to test control messages, ORWB media, playback,
 close handling, anonymous downgrade, and the production bundle over HTTPS and
 same-origin WSS. The local HTTPS certificate is test-only. The system release gate

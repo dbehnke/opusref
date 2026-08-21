@@ -10,6 +10,7 @@ export interface AudioSessionState {
   busy: boolean
   remaining?: number
   error?: string
+  capabilityError?: string
   playback?: { channelId: string; state: 'playing' | 'paused'; elapsedMs: number; recordingId?: string; durationMs?: number; status?: 'complete' | 'partial' }
   currentSource?: string
   activity: { text: string; at: string }[]
@@ -36,6 +37,7 @@ export class BrowserAudioSession extends EventTarget {
   private playbackExpectedSequence?: number
   private readonly playbackRequests = new Map<string, { action: 'open' | 'pause' | 'resume' | 'seek' | 'close'; epoch: number }>()
   private capabilityResolve?: (supported: boolean) => void
+  private readinessResolve?: (ready: boolean) => void
   private closing = false
   private readonly visibilityStop = () => { if (document.visibilityState === 'hidden') void this.close() }
   private readonly pageHideStop = () => { void this.close() }
@@ -57,9 +59,9 @@ export class BrowserAudioSession extends EventTarget {
     this.worker = new Worker(new URL('../workers/audio.worker.ts', import.meta.url), { type: 'module' })
     this.worker.addEventListener('message', event => this.onWorker(event.data))
     const supported = await new Promise<boolean>(resolve => { this.capabilityResolve = resolve; this.worker!.postMessage({ type: 'capability' }); setTimeout(() => resolve(false), 5000) })
-    if (!supported) { this.worker.terminate(); this.worker = undefined; this.update({ error: 'This browser does not support raw Opus audio.' }); return false }
+    if (!supported) { this.worker.terminate(); this.worker = undefined; const message = 'This browser does not support raw Opus audio.'; this.update({ error: message, capabilityError: message }); return false }
     this.context = new AudioContext({ sampleRate: 48000 })
-    if (this.context.sampleRate !== 48000) { await this.context.close(); this.worker.terminate(); this.update({ error: 'This device cannot use a 48 kHz audio context.' }); return false }
+    if (this.context.sampleRate !== 48000) { await this.context.close(); this.worker.terminate(); const message = 'This device cannot use a 48 kHz audio context.'; this.update({ error: message, capabilityError: message }); return false }
     await this.context.audioWorklet.addModule('/opusref-audio-worklet.js')
     this.audioNode = new AudioWorkletNode(this.context, 'opusref-audio', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] })
     this.audioNode.connect(this.context.destination)
@@ -69,9 +71,17 @@ export class BrowserAudioSession extends EventTarget {
       if (event.data.type === 'playback-overflow' && event.data.epoch === this.playoutEpoch) this.pausePlaybackForOverload('Playback paused because the device audio queue was full.')
     })
     this.audioNode.port.start()
+    const ready = new Promise<boolean>(resolve => {
+      this.readinessResolve = resolve
+      window.setTimeout(() => { if (this.readinessResolve === resolve) { this.readinessResolve = undefined; resolve(false) } }, 5000)
+    })
     this.socket.connect({ encoder: true, decoder: true, context_rate: 48000 }, this.csrf)
-    this.update({ listening: true })
-    return true
+    this.update({ listening: true, error: undefined, capabilityError: undefined })
+    if (await ready) return true
+    this.closing = true
+    this.socket.close()
+    this.update({ listening: false, connected: false, error: 'The live connection did not become ready. Select Play or Retry playback to reconnect.' })
+    return false
   }
 
   async requestPTT(): Promise<void> {
@@ -134,7 +144,7 @@ export class BrowserAudioSession extends EventTarget {
   }
 
   private onSocket(event: SocketEvent) {
-    if (event.closed) { this.stopMicrophone(); if (this.state.playback) this.closePlayback(); else this.resetPlayout(); this.update({ connected: false, listening: false, ptt: 'idle', error: this.closing ? undefined : 'The live connection closed. Select Listen live to reconnect.' }); return }
+    if (event.closed) { this.readinessResolve?.(false); this.readinessResolve = undefined; this.stopMicrophone(); if (this.state.playback) this.closePlayback(); else this.resetPlayout(); this.update({ connected: false, listening: false, ptt: 'idle', error: this.closing ? this.state.error : 'The live connection closed. Select Listen live to reconnect.' }); return }
     if (event.media && this.state.ptt !== 'transmitting') {
       const live = event.media.kind === MediaKind.Live && event.media.channelId === this.liveChannel && !this.state.playback
       const playback = event.media.kind === MediaKind.Playback && event.media.channelId.toString() === this.state.playback?.channelId
@@ -147,7 +157,7 @@ export class BrowserAudioSession extends EventTarget {
     }
     const control = event.control
     if (!control) return
-    if (control.type === 'hello_ok') { const body = control.body as { ptt_available?: boolean; status?: PublicStatus }; this.update({ connected: true, pttAvailable: body.ptt_available === true, status: body.status }) }
+    if (control.type === 'hello_ok') { const body = control.body as { ptt_available?: boolean; status?: PublicStatus }; this.readinessResolve?.(true); this.readinessResolve = undefined; this.update({ connected: true, pttAvailable: body.ptt_available === true, status: body.status, error: undefined }) }
     else if (control.type === 'status') this.update({ status: control.body as PublicStatus })
     else if (control.type === 'stream_start') { const body = control.body as { channel_id: string; source_callsign: string }; try { const id = parseChannelId(body.channel_id); if (this.liveChannel) this.retire(this.liveChannel); this.liveChannel = id; if (!this.state.playback) this.resetPlayout(); this.update({ currentSource: body.source_callsign }); this.activity(`${body.source_callsign} started a transmission.`) } catch { this.socket.close() } }
     else if (control.type === 'stream_end') { const body = control.body as { channel_id: string; reason: string }; try { const id = parseChannelId(body.channel_id); this.retire(id); if (id === this.liveChannel) { this.liveChannel = undefined; this.update({ currentSource: undefined }); this.activity(`The transmission ended: ${body.reason}.`) } } catch { this.socket.close() } }

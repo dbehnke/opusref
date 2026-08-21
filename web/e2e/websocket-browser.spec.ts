@@ -81,6 +81,41 @@ test('browser socket preserves playback controls, partial status, and media', as
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 
+test('audio startup waits for delayed hello readiness before playback can send', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'The production audio capability path runs in Chromium here.')
+  const server = new WebSocketServer({ port: 0, perMessageDeflate: false })
+  await new Promise<void>(resolve => server.once('listening', resolve))
+  const address = server.address(); if (typeof address === 'string' || !address) throw new Error('WebSocket server did not bind')
+  const requests: string[] = []
+  server.on('connection', socket => socket.on('message', data => {
+    const request = JSON.parse(data.toString()); requests.push(request.type)
+    if (request.type === 'hello') setTimeout(() => socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: request.request_id, body: { authenticated: true, ptt_available: false } })), 150)
+    if (request.type === 'playback_open') socket.send(JSON.stringify({ api_version: 1, type: 'playback_opened', request_id: request.request_id, body: { channel_id: '9', recording_id: 'recording-1', duration_ms: 1000, status: 'complete' } }))
+  }))
+  try {
+    await page.goto('/')
+    const result = await page.evaluate(async endpoint => {
+      // @ts-expect-error Vite serves these source modules during browser tests.
+      const { OpusRefSocket } = await import('/src/lib/socket.ts')
+      // @ts-expect-error Vite serves these source modules during browser tests.
+      const { BrowserAudioSession } = await import('/src/lib/audio-session.ts')
+      const audio = new BrowserAudioSession('csrf', new OpusRefSocket(endpoint))
+      const startedAt = performance.now()
+      const started = await audio.start()
+      const elapsed = performance.now() - startedAt
+      if (started) audio.openPlayback('recording-1')
+      const deadline = performance.now() + 2000
+      while (!audio.state.playback && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      const result = { started, connected: audio.state.connected, elapsed, recordingId: audio.state.playback?.recordingId, error: audio.state.error }
+      await audio.close()
+      return result
+    }, `http://127.0.0.1:${address.port}/api/v1/ws`)
+    expect(result).toMatchObject({ started: true, connected: true, recordingId: 'recording-1', error: undefined })
+    expect(result.elapsed).toBeGreaterThanOrEqual(100)
+    expect(requests).toEqual(['hello', 'playback_open'])
+  } finally { for (const client of server.clients) client.terminate(); await new Promise<void>(resolve => server.close(() => resolve())) }
+})
+
 test('browser retires playback media across pause, resume, and seek barriers', async ({ page, browserName }) => {
   test.skip(browserName !== 'chromium', 'The production audio worker path runs in Chromium here.')
   const server = new WebSocketServer({ port: 0, perMessageDeflate: false })
