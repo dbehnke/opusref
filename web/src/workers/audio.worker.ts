@@ -14,6 +14,7 @@ let channelId = 0n
 let sequence = 0
 let nextInputTimestamp = 0
 let socketBufferedAmount = 0
+let playoutEpoch = 0
 const jitter = new JitterBuffer()
 
 function fail(code: string, message: string) { scope.postMessage({ type: 'error', code, message }) }
@@ -42,15 +43,16 @@ function configureEncoder() {
   encoder.configure(encoderConfig())
 }
 
-function configureDecoder() {
+function configureDecoder(epoch: number) {
   decoder = new AudioDecoder({
-    error: () => fail('decode_failed', 'The browser could not decode audio.'),
+    error: () => { if (epoch === playoutEpoch) fail('decode_failed', 'The browser could not decode audio.') },
     output: (audio: any) => {
+      if (epoch !== playoutEpoch) { audio.close(); return }
       const frames = audio.numberOfFrames
       const timestamp = Math.round(audio.timestamp * 48000 / 1000000) >>> 0
       const pcm = new Float32Array(frames); audio.copyTo(pcm, { planeIndex: 0 }); audio.close()
       const result = jitter.push(timestamp, pcm)
-      if (result !== 'queued') scope.postMessage({ type: 'jitter-reset', reason: result })
+      if (result !== 'queued') scope.postMessage({ type: 'jitter-reset', epoch, reason: result })
     },
   })
   decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 })
@@ -61,7 +63,7 @@ scope.onmessage = event => {
   if (data.type === 'capability') return void capability()
   if (data.type === 'start-transmit') { channelId = BigInt(data.channelId); sequence = 0; nextInputTimestamp = 0; configureEncoder(); return }
   if (data.type === 'stop-transmit') { encoder?.close(); encoder = undefined; return }
-  if (data.type === 'reset-playout') { decoder?.reset(); jitter.reset(); return }
+  if (data.type === 'reset-playout') { playoutEpoch = data.epoch; try { decoder?.close() } catch {} decoder = undefined; jitter.reset(); return }
   if (data.type === 'socket-buffer') { socketBufferedAmount = data.bytes; return }
   if (data.type === 'pcm') {
     if (!encoder || encoder.encodeQueueSize >= 4 || socketBufferedAmount >= 65536 || !(data.pcm instanceof Float32Array) || data.pcm.length !== 960) return fail('transmit_overload', 'PTT stopped because the transmit queue was full.')
@@ -71,14 +73,15 @@ scope.onmessage = event => {
     return
   }
   if (data.type === 'media') {
+    if (data.epoch !== playoutEpoch) return
     const packet = data.packet instanceof ArrayBuffer ? decodePacket(data.packet) : data.packet
     if (packet.kind === MediaKind.Transmit) return fail('invalid_direction', 'The server sent an invalid media kind.')
-    if (!decoder) configureDecoder()
+    if (!decoder) configureDecoder(playoutEpoch)
     if (decoder.decodeQueueSize >= 4) return fail('receive_overload', 'Audio restarted because the receive queue was full.')
     decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: packet.timestamp * 1000000 / 48000, data: packet.payload }))
   }
 }
 
 setInterval(() => {
-  for (const pcm of jitter.take(performance.now())) scope.postMessage({ type: 'pcm', pcm }, [pcm.buffer])
+  for (const pcm of jitter.take(performance.now())) scope.postMessage({ type: 'pcm', epoch: playoutEpoch, pcm }, [pcm.buffer])
 }, 10)

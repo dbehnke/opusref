@@ -81,6 +81,51 @@ test('browser socket preserves playback controls, partial status, and media', as
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 
+test('browser retires playback media across pause, resume, and seek barriers', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'The production audio worker path runs in Chromium here.')
+  const server = new WebSocketServer({ port: 0, perMessageDeflate: false })
+  await new Promise<void>(resolve => server.once('listening', resolve))
+  const address = server.address(); if (typeof address === 'string' || !address) throw new Error('WebSocket server did not bind')
+  const packet = (sequence: number, timestamp: number) => { const value = Buffer.alloc(33); value.write('ORWB', 0); value.writeUInt8(1, 4); value.writeUInt8(3, 5); value.writeBigUInt64BE(9n, 8); value.writeUInt32BE(sequence, 16); value.writeUInt32BE(timestamp, 20); value.writeUInt16BE(1, 24); value.writeUInt8(0xf8, 32); return value }
+  server.on('connection', socket => socket.on('message', data => {
+    if (!Buffer.isBuffer(data)) return
+    const request = JSON.parse(data.toString())
+    if (request.type === 'hello') socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: request.request_id, body: { authenticated: true, ptt_available: false } }))
+    if (request.type === 'playback_open') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_opened', request_id: request.request_id, body: { channel_id: '9', recording_id: 'recording-1', duration_ms: 10_000, status: 'complete' } })); socket.send(packet(0, 0)) }
+    if (request.type === 'playback_pause') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'paused', elapsed_ms: 20 } })); socket.send(packet(1, 960)) }
+    if (request.type === 'playback_resume') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'playing', elapsed_ms: 20 } })); socket.send(packet(1, 960)) }
+    if (request.type === 'playback_seek') { socket.send(packet(2, 1920)); socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'playing', elapsed_ms: 1000 } })); socket.send(packet(0, 48_000)) }
+  }))
+  try {
+    await page.goto('/')
+    const state = await page.evaluate(async endpoint => {
+      // @ts-expect-error Vite serves these source modules during browser tests.
+      const { OpusRefSocket } = await import('/src/lib/socket.ts')
+      // @ts-expect-error Vite serves these source modules during browser tests.
+      const { BrowserAudioSession } = await import('/src/lib/audio-session.ts')
+      const audio = new BrowserAudioSession('csrf', new OpusRefSocket(endpoint))
+      const waitFor = async (predicate: () => boolean) => { const start = performance.now(); while (!predicate()) { if (performance.now() - start > 5000) throw new Error('playback epoch timeout'); await new Promise(resolve => setTimeout(resolve, 10)) } }
+      if (!await audio.start()) throw new Error(audio.state.error)
+      await waitFor(() => audio.state.connected)
+      audio.openPlayback('recording-1')
+      await waitFor(() => (audio as any).playbackExpectedSequence === 1)
+      audio.playback('playback_pause', '9')
+      await waitFor(() => audio.state.playback?.state === 'paused')
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const afterPause = (audio as any).playbackExpectedSequence
+      audio.playback('playback_resume', '9')
+      await waitFor(() => (audio as any).playbackExpectedSequence === 2)
+      const afterResume = (audio as any).playbackExpectedSequence
+      audio.seek('9', 1000)
+      await waitFor(() => audio.state.playback?.elapsedMs >= 1000 && (audio as any).playbackExpectedSequence === 1)
+      const result = { afterPause, afterResume, afterSeek: (audio as any).playbackExpectedSequence, error: audio.state.error }
+      await audio.close()
+      return result
+    }, `http://127.0.0.1:${address.port}/api/v1/ws`)
+    expect(state).toEqual({ afterPause: 1, afterResume: 2, afterSeek: 1, error: undefined })
+  } finally { for (const client of server.clients) client.terminate(); await new Promise<void>(resolve => server.close(() => resolve())) }
+})
+
 test('open-access browser session downgrades immediately after revocation', async ({ page, browserName }) => {
   test.skip(browserName !== 'chromium', 'The production audio capability path runs in Chromium here.')
   const server = new WebSocketServer({ port: 0, perMessageDeflate: false })

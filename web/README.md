@@ -43,6 +43,11 @@ of decoded data. It drops expired PCM. It inserts at most 120 ms of silence for 
 positive gap. It resets after a timestamp jump greater than two seconds. A seek or
 discontinuity clears decoder, jitter, and playout state.
 
+Pause, resume, seek, close, and server pause results create a browser playout
+barrier. The browser tags decoder output and AudioWorklet input with a local
+generation. It rejects output from a retired generation. Pause and resume keep the
+server sequence continuous. A correlated seek starts a new sequence at zero.
+
 The capture port has four credits. The encoder queue has four entries. The browser
 stops PTT when a capture, encoder, or WebSocket queue reaches its limit. The playout
 worklet uses a fixed 500 ms ring buffer. It does not use an unbounded media array.

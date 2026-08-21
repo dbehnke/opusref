@@ -18,11 +18,19 @@ test('production worker encodes exact packet metadata and decodes bounded PCM', 
     const packets = messages.filter(message => message.type === 'packet').map(message => message.packet as ArrayBuffer)
     const metadata = packets.map(packet => { const view = new DataView(packet); return { channel: view.getBigUint64(8).toString(), sequence: view.getUint32(16), timestamp: view.getUint32(20), payloadLength: view.getUint16(24) } })
     messages.length = 0
-    packets.forEach((packet, index) => { const bytes = new Uint8Array(packet); const length = new DataView(packet).getUint16(24); worker.postMessage({ type: 'media', packet: { kind: 1, channelId: 1n, sequence: index, timestamp: index * 960, payload: bytes.slice(32, 32 + length) } }) })
+    packets.forEach((packet, index) => { const bytes = new Uint8Array(packet); const length = new DataView(packet).getUint16(24); worker.postMessage({ type: 'media', epoch: 0, packet: { kind: 1, channelId: 1n, sequence: index, timestamp: index * 960, payload: bytes.slice(32, 32 + length) } }) })
     await waitFor(() => messages.filter(message => message.type === 'pcm').reduce((sum, message) => sum + message.pcm.length, 0) >= 2880)
     const decodedFrames = messages.filter(message => message.type === 'pcm').reduce((sum, message) => sum + message.pcm.length, 0)
+    messages.length = 0
+    worker.postMessage({ type: 'reset-playout', epoch: 1 })
+    packets.forEach((packet, index) => { const bytes = new Uint8Array(packet); const length = new DataView(packet).getUint16(24); worker.postMessage({ type: 'media', epoch: 0, packet: { kind: 1, channelId: 1n, sequence: index, timestamp: index * 960, payload: bytes.slice(32, 32 + length) } }) })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const staleDecodedFrames = messages.filter(message => message.type === 'pcm').reduce((sum, message) => sum + message.pcm.length, 0)
+    packets.forEach((packet, index) => { const bytes = new Uint8Array(packet); const length = new DataView(packet).getUint16(24); worker.postMessage({ type: 'media', epoch: 1, packet: { kind: 1, channelId: 1n, sequence: index, timestamp: 48_000 + index * 960, payload: bytes.slice(32, 32 + length) } }) })
+    await waitFor(() => messages.filter(message => message.type === 'pcm').reduce((sum, message) => sum + message.pcm.length, 0) >= 2880)
+    const decodedEpochs = [...new Set(messages.filter(message => message.type === 'pcm').map(message => message.epoch))]
     worker.terminate()
-    return { supported, metadata, decodedFrames }
+    return { supported, metadata, decodedFrames, staleDecodedFrames, decodedEpochs }
   })
   expect(result.supported).toBe(true)
   expect(result.metadata).toEqual([
@@ -32,4 +40,6 @@ test('production worker encodes exact packet metadata and decodes bounded PCM', 
   ])
   expect(result.metadata!.every(packet => packet.payloadLength >= 1 && packet.payloadLength <= 1168)).toBe(true)
   expect(result.decodedFrames).toBeGreaterThanOrEqual(2880)
+  expect(result.staleDecodedFrames).toBe(0)
+  expect(result.decodedEpochs).toEqual([1])
 })

@@ -6,12 +6,13 @@ class OpusRefAudioProcessor extends AudioWorkletProcessor {
     this.playRead = 0
     this.playWrite = 0
     this.playSize = 0
+    this.playoutEpoch = 0
     this.captureCredits = 4
     this.port.onmessage = event => {
-      if (event.data.type === 'play' && event.data.pcm instanceof Float32Array) {
+      if (event.data.type === 'play' && event.data.epoch === this.playoutEpoch && event.data.pcm instanceof Float32Array) {
         if (event.data.pcm.length > this.playback.length - this.playSize) {
           this.playRead = this.playWrite = this.playSize = 0
-          this.port.postMessage({ type: 'playback-overflow' })
+          this.port.postMessage({ type: 'playback-overflow', epoch: this.playoutEpoch })
           return
         }
         for (const sample of event.data.pcm) {
@@ -20,7 +21,7 @@ class OpusRefAudioProcessor extends AudioWorkletProcessor {
           this.playSize++
         }
       }
-      if (event.data.type === 'clear') this.playRead = this.playWrite = this.playSize = 0
+      if (event.data.type === 'clear') { this.playoutEpoch = event.data.epoch; this.playRead = this.playWrite = this.playSize = 0 }
       if (event.data.type === 'capture-ack') this.captureCredits = Math.min(4, this.captureCredits + 1)
     }
   }
