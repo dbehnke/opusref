@@ -79,7 +79,7 @@ test('mobile account cards keep every action reachable by touch and keyboard', a
       expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(width)
     }
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
-    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    await page.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); window.scrollTo(0, 0) })
     const accountScreenshot = testInfo.outputPath(`account-actions-${width}px.png`); await page.screenshot({ path: accountScreenshot, fullPage: true }); await testInfo.attach(`account-actions-${width}px`, { path: accountScreenshot, contentType: 'image/png' })
   }
 })
