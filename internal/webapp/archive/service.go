@@ -32,6 +32,7 @@ const (
 	PartialServerShutdown
 	PartialProcessRestart
 	PartialTruncatedEntry
+	PartialFileLimit
 )
 
 type commandKind uint8
@@ -57,19 +58,21 @@ type command struct {
 	ack                  chan struct{}
 }
 type Service struct {
-	state     *store.Store
-	directory string
-	quota     int64
-	commands  chan command
-	mu        sync.Mutex
-	used      int64
-	dropped   map[StreamKey]bool
-	closed    chan struct{}
-	closeOnce sync.Once
-	healthy   atomic.Bool
-	observer  func(string, string)
-	alerts    []archiveAlert
-	quotaStop bool
+	state         *store.Store
+	directory     string
+	quota         int64
+	commands      chan command
+	mu            sync.Mutex
+	used          int64
+	dropped       map[StreamKey]bool
+	closed        chan struct{}
+	closeOnce     sync.Once
+	healthy       atomic.Bool
+	observer      func(string, string)
+	alerts        []archiveAlert
+	quotaStop     bool
+	fileLimit     int64
+	alertOverflow bool
 }
 type archiveAlert struct{ action, result string }
 type activeStream struct {
@@ -86,7 +89,10 @@ type activeStream struct {
 	hasBounds                               bool
 	firstAudioSequence, lastAudioSequence   uint32
 	firstAudioTimestamp, lastAudioTimestamp uint32
+	stopped                                 bool
 }
+
+const maxPendingRecoveryAlerts = 256
 
 func NewService(ctx context.Context, state *store.Store, directory string, quota int64, queuePackets int) (*Service, error) {
 	if queuePackets <= 0 {
@@ -99,7 +105,7 @@ func NewService(ctx context.Context, state *store.Store, directory string, quota
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("archive directory is invalid")
 	}
-	service := &Service{state: state, directory: directory, quota: quota, commands: make(chan command, queuePackets+4), dropped: map[StreamKey]bool{}, closed: make(chan struct{})}
+	service := &Service{state: state, directory: directory, quota: quota, fileLimit: MaxFileSize, commands: make(chan command, queuePackets+4), dropped: map[StreamKey]bool{}, closed: make(chan struct{})}
 	service.healthy.Store(true)
 	if err = service.recover(ctx); err != nil {
 		return nil, err
@@ -151,13 +157,34 @@ func (s *Service) observe(action, result string) {
 func (s *Service) recoveryAlert(result string) {
 	s.mu.Lock()
 	if s.observer == nil {
-		s.alerts = append(s.alerts, archiveAlert{"recover", result})
+		if len(s.alerts) < maxPendingRecoveryAlerts-1 {
+			s.alerts = append(s.alerts, archiveAlert{"recover", result})
+		} else if !s.alertOverflow {
+			s.alerts = append(s.alerts, archiveAlert{"recover_overflow", "failure"})
+			s.alertOverflow = true
+		}
 		s.mu.Unlock()
 		return
 	}
 	observer := s.observer
 	s.mu.Unlock()
 	observer("recover", result)
+}
+
+func (s *Service) queueStartupAlertLocked(alert archiveAlert) {
+	if len(s.alerts) < maxPendingRecoveryAlerts {
+		s.alerts = append(s.alerts, alert)
+		return
+	}
+	if alert.action != "quota" {
+		return
+	}
+	for index := range s.alerts {
+		if s.alerts[index].action == "recover" {
+			s.alerts[index] = alert
+			return
+		}
+	}
 }
 func (s *Service) setQuotaStopped(stopped bool) {
 	s.mu.Lock()
@@ -171,6 +198,19 @@ func (s *Service) setQuotaStopped(stopped bool) {
 		}
 		s.observe("quota", result)
 	}
+}
+func (s *Service) canCreate(need int64) bool {
+	s.mu.Lock()
+	available := !s.quotaStop && s.used+need <= s.quota
+	changed := !available && !s.quotaStop
+	if !available {
+		s.quotaStop = true
+	}
+	s.mu.Unlock()
+	if changed {
+		s.observe("quota", "full")
+	}
+	return available
 }
 func (s *Service) media(item command) bool {
 	select {
@@ -204,7 +244,9 @@ func (s *Service) run(ctx context.Context) {
 		case <-ctx.Done():
 			if active != nil {
 				active.reasons |= PartialServerShutdown
-				s.finish(active, "server_shutdown")
+				if !active.stopped {
+					s.finish(active, "server_shutdown")
+				}
 			}
 			return
 		case item := <-s.commands:
@@ -221,11 +263,13 @@ func (s *Service) run(ctx context.Context) {
 			case commandStart:
 				if active != nil {
 					active.reasons |= PartialMissingEnd
-					s.finish(active, "missing_end")
+					if !active.stopped {
+						s.finish(active, "missing_end")
+					}
 				}
 				active = &activeStream{key: item.key, id: uuid.New(), node: item.node, source: item.source, webUserID: item.webUserID, started: item.started}
 			case commandAudio, commandData:
-				if active == nil || active.key != item.key {
+				if active == nil || active.key != item.key || active.stopped {
 					break
 				}
 				if !active.seen && item.sequence != 0 {
@@ -244,7 +288,9 @@ func (s *Service) run(ctx context.Context) {
 					if item.partial {
 						active.reasons |= PartialSyntheticEnd
 					}
-					s.finish(active, item.reason)
+					if !active.stopped {
+						s.finish(active, item.reason)
+					}
 					active = nil
 				}
 			case commandAttribute:
@@ -258,7 +304,9 @@ func (s *Service) run(ctx context.Context) {
 			case commandClose:
 				if active != nil {
 					active.reasons |= PartialServerShutdown
-					s.finish(active, "server_shutdown")
+					if !active.stopped {
+						s.finish(active, "server_shutdown")
+					}
 				}
 				if item.ack != nil {
 					close(item.ack)
@@ -284,12 +332,9 @@ func (s *Service) run(ctx context.Context) {
 func (s *Service) write(active *activeStream, item command) {
 	if active.file == nil {
 		need := int64(HeaderSize + EntryHeaderSize + len(item.payload))
-		s.mu.Lock()
-		available := s.used+need <= s.quota
-		s.mu.Unlock()
-		if !available {
+		if !s.canCreate(need) {
 			active.reasons |= PartialQuota
-			s.setQuotaStopped(true)
+			active.stopped = true
 			return
 		}
 		relative := active.id.String() + ".orar"
@@ -297,9 +342,15 @@ func (s *Service) write(active *activeStream, item command) {
 			active.reasons |= PartialWriteFailure
 			return
 		}
-		file, err := CreateFile(s.directory, active.id, s.remainingQuota())
+		file, err := createFile(s.directory, active.id, s.remainingQuota(), s.fileLimit)
 		if err != nil {
-			active.reasons |= PartialWriteFailure
+			if errors.Is(err, ErrQuotaLimit) {
+				active.reasons |= PartialQuota
+				active.stopped = true
+				s.setQuotaStopped(true)
+			} else {
+				active.reasons |= PartialWriteFailure
+			}
 			return
 		}
 		active.file = file
@@ -315,9 +366,15 @@ func (s *Service) write(active *activeStream, item command) {
 		offset = 0
 	}
 	if err := active.file.Append(Packet{Sequence: item.sequence, Timestamp: item.timestamp, ArrivalMS: uint32(offset), Payload: item.payload}); err != nil {
-		if errors.Is(err, ErrLimit) {
+		if errors.Is(err, ErrFileLimit) {
+			active.reasons |= PartialFileLimit
+			active.stopped = true
+			s.finish(active, "file_limit")
+		} else if errors.Is(err, ErrQuotaLimit) {
 			active.reasons |= PartialQuota
+			active.stopped = true
 			s.setQuotaStopped(true)
+			s.finish(active, "quota")
 		} else {
 			active.reasons |= PartialWriteFailure
 		}
@@ -381,7 +438,7 @@ func (s *Service) recount() error {
 	wasStopped := s.quotaStop
 	s.quotaStop = used >= s.quota
 	if s.quotaStop && !wasStopped {
-		s.alerts = append(s.alerts, archiveAlert{"quota", "full"})
+		s.queueStartupAlertLocked(archiveAlert{"quota", "full"})
 	}
 	s.mu.Unlock()
 	return nil

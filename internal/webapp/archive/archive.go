@@ -22,18 +22,25 @@ const (
 	MaxFileSize     = int64(256 * 1024 * 1024)
 )
 
-var ErrLimit = errors.New("archive size limit reached")
+var (
+	ErrFileLimit  = errors.New("recording size limit reached")
+	ErrQuotaLimit = errors.New("archive quota reached")
+)
 
 type Packet struct {
 	Sequence, Timestamp, ArrivalMS uint32
 	Payload                        []byte
 }
 type Writer struct {
-	w    io.Writer
-	size int64
+	w       io.Writer
+	size    int64
+	maxSize int64
 }
 
 func NewWriter(w io.Writer, id uuid.UUID) (*Writer, error) {
+	return newWriter(w, id, MaxFileSize)
+}
+func newWriter(w io.Writer, id uuid.UUID, maxSize int64) (*Writer, error) {
 	if w == nil {
 		return nil, errors.New("writer is required")
 	}
@@ -45,14 +52,14 @@ func NewWriter(w io.Writer, id uuid.UUID) (*Writer, error) {
 	if err := writeAll(w, h); err != nil {
 		return nil, err
 	}
-	return &Writer{w: w, size: HeaderSize}, nil
+	return &Writer{w: w, size: HeaderSize, maxSize: maxSize}, nil
 }
 func (w *Writer) WritePacket(p Packet) error {
 	if len(p.Payload) < 1 || len(p.Payload) > MaxPayload {
 		return errors.New("Opus payload length is invalid")
 	}
-	if w.size+EntryHeaderSize+int64(len(p.Payload)) > MaxFileSize {
-		return ErrLimit
+	if w.size+EntryHeaderSize+int64(len(p.Payload)) > w.maxSize {
+		return ErrFileLimit
 	}
 	h := make([]byte, EntryHeaderSize)
 	binary.BigEndian.PutUint32(h[0:4], p.Sequence)
@@ -148,8 +155,11 @@ type File struct {
 }
 
 func CreateFile(dir string, id uuid.UUID, quotaRemaining int64) (*File, error) {
+	return createFile(dir, id, quotaRemaining, MaxFileSize)
+}
+func createFile(dir string, id uuid.UUID, quotaRemaining, fileLimit int64) (*File, error) {
 	if quotaRemaining < HeaderSize {
-		return nil, ErrLimit
+		return nil, ErrQuotaLimit
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
@@ -164,7 +174,7 @@ func CreateFile(dir string, id uuid.UUID, quotaRemaining int64) (*File, error) {
 		return nil, err
 	}
 	h := sha256.New()
-	writer, err := NewWriter(io.MultiWriter(file, h), id)
+	writer, err := newWriter(io.MultiWriter(file, h), id, fileLimit)
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -178,7 +188,7 @@ func CreateFile(dir string, id uuid.UUID, quotaRemaining int64) (*File, error) {
 func (f *File) Append(p Packet) error {
 	need := int64(EntryHeaderSize + len(p.Payload))
 	if f.writer.Size()+need > f.quota {
-		return ErrLimit
+		return ErrQuotaLimit
 	}
 	return f.writer.WritePacket(p)
 }

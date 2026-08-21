@@ -121,6 +121,98 @@ func TestQuotaRemainderStopsNewArchiveAndRaisesTransition(t *testing.T) {
 	}
 }
 
+func TestPerRecordingLimitFinalizesWithoutStoppingGlobalQuota(t *testing.T) {
+	ctx := context.Background()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	service, err := NewService(ctx, state, t.TempDir(), 1024*1024, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	service.fileLimit = HeaderSize + EntryHeaderSize + 1
+	var partial int
+	service.SetObserver(func(action, result string) {
+		if action == "finalize" && result == "partial" {
+			partial++
+		}
+	})
+	key := StreamKey{SessionID: 9, StreamID: 10}
+	service.Start(key, "WEB", "N0CALL", "", time.Now())
+	service.Audio(key, 0, 0, []byte{1}, time.Now())
+	service.Audio(key, 1, 960, []byte{2}, time.Now())
+	service.Audio(key, 2, 1920, []byte{3}, time.Now())
+	service.End(key, "normal", false)
+	items, listErr := state.ListRecordings(ctx, 10)
+	if listErr != nil || len(items) != 1 {
+		t.Fatalf("recordings=%d err=%v", len(items), listErr)
+	}
+	item := items[0]
+	if item.Status != "partial" || item.EndReason != "file_limit" || item.PartialReasons&PartialFileLimit == 0 || item.PacketCount != 1 || partial != 1 || service.QuotaFull() {
+		t.Fatalf("recording=%+v partial_alerts=%d quota_full=%v", item, partial, service.QuotaFull())
+	}
+}
+
+func TestQuotaStopLatchPreventsLaterSmallerArchive(t *testing.T) {
+	ctx := context.Background()
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	quota := int64(HeaderSize + EntryHeaderSize + 2)
+	service, err := NewService(ctx, state, t.TempDir(), quota, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	first := StreamKey{SessionID: 11, StreamID: 12}
+	service.Start(first, "WEB", "N0CALL", "", time.Now())
+	service.Audio(first, 0, 0, []byte{1, 2, 3}, time.Now())
+	service.Audio(first, 1, 960, []byte{1}, time.Now())
+	service.End(first, "normal", false)
+	second := StreamKey{SessionID: 13, StreamID: 14}
+	service.Start(second, "WEB", "N0CALL", "", time.Now())
+	service.Audio(second, 0, 0, []byte{1}, time.Now())
+	service.End(second, "normal", false)
+	items, listErr := state.ListRecordings(ctx, 10)
+	if listErr != nil || len(items) != 0 || !service.QuotaFull() {
+		t.Fatalf("recordings=%d quota_full=%v err=%v", len(items), service.QuotaFull(), listErr)
+	}
+}
+
+func TestStartupRecoveryAlertsAreBoundedWithOverflowIndicator(t *testing.T) {
+	service := &Service{}
+	for index := 0; index < maxPendingRecoveryAlerts+100; index++ {
+		service.recoveryAlert("failure")
+	}
+	if len(service.alerts) != maxPendingRecoveryAlerts || !service.alertOverflow {
+		t.Fatalf("alerts=%d overflow=%v", len(service.alerts), service.alertOverflow)
+	}
+	service.mu.Lock()
+	service.queueStartupAlertLocked(archiveAlert{"quota", "full"})
+	service.mu.Unlock()
+	var quota bool
+	for _, alert := range service.alerts {
+		quota = quota || alert.action == "quota"
+	}
+	if len(service.alerts) != maxPendingRecoveryAlerts || !quota {
+		t.Fatalf("startup alerts=%d quota=%v", len(service.alerts), quota)
+	}
+	var overflow int
+	service.SetObserver(func(action, result string) {
+		if action == "recover_overflow" && result == "failure" {
+			overflow++
+		}
+	})
+	if overflow != 1 {
+		t.Fatalf("overflow alerts=%d", overflow)
+	}
+}
+
 func TestRecoveryRemovesMissingCreatingRow(t *testing.T) {
 	ctx := context.Background()
 	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"))

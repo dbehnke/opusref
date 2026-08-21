@@ -30,11 +30,12 @@ func TestArchiveQuotaAndRecoveryObserversRaiseBoundedAlerts(t *testing.T) {
 	defer state.Close()
 	server.RecordArchive("quota", "full")
 	server.RecordArchive("recover", "failure")
-	if server.telemetry.value("opusrefweb_archive_alerts_total", "full") != 1 || server.telemetry.value("opusrefweb_archive_alerts_total", "recovery") != 1 {
+	server.RecordArchive("recover_overflow", "failure")
+	if server.telemetry.value("opusrefweb_archive_alerts_total", "full") != 1 || server.telemetry.value("opusrefweb_archive_alerts_total", "recovery") != 1 || server.telemetry.value("opusrefweb_archive_alerts_total", "recovery_overflow") != 1 {
 		t.Fatal("archive alert metrics were not incremented")
 	}
 	events := server.telemetry.recent()
-	if len(events) < 3 || events[0].Kind != "archive_failure" {
+	if len(events) < 4 || events[0].Kind != "archive_recovery_overflow" {
 		t.Fatalf("operator alerts=%+v", events)
 	}
 }

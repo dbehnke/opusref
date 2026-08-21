@@ -106,7 +106,7 @@ func (m *webTelemetry) render() string {
 	write("opusrefweb_ptt_total", "result", product([]string{"grant", "busy", "stop", "revoke", "error"}))
 	write("opusrefweb_auth_total", "method,result", product([]string{"password", "passkey"}, []string{"success", "failure", "rate_limited", "sign_counter_regression"}))
 	write("opusrefweb_archive_total", "action,result", product([]string{"create", "finalize", "recover", "delete", "purge"}, []string{"success", "partial", "failure"}))
-	write("opusrefweb_archive_alerts_total", "kind", product([]string{"full", "clear", "recovery"}))
+	write("opusrefweb_archive_alerts_total", "kind", product([]string{"full", "clear", "recovery", "recovery_overflow"}))
 	write("opusrefweb_playback_total", "action,result", product([]string{"open", "seek", "pause", "resume", "close"}, []string{"success", "busy", "failure"}))
 	write("opusrefweb_db_errors_total", "operation", product([]string{"read", "write", "migration", "backup", "audit"}))
 	write("opusrefweb_reconnect_total", "client,result", product([]string{"receive", "transmit"}, []string{"attempt", "success", "failure"}))

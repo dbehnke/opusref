@@ -129,10 +129,14 @@ enabled accounts, active sessions, retained recordings, archive bytes, archive
 quota bytes, and authentication failures. These metrics have no labels. The
 public listener does not serve them.
 
-`opusrefweb_archive_alerts_total` uses only the fixed `full`, `clear`, and
-`recovery` kinds. The companion also puts quota transitions and recovery
-anomalies in its bounded administrator event list. It does not put a recording
-ID or file path in a metric label or operator message.
+`opusrefweb_archive_alerts_total` uses only the fixed `full`, `clear`,
+`recovery`, and `recovery_overflow` kinds. The startup recovery buffer retains
+up to 255 anomaly alerts and one overflow alert. The complete startup alert
+buffer has a capacity of 256. A quota transition can replace one anomaly alert
+when the buffer is full. The overflow alert remains in the buffer. The companion
+puts quota transitions and recovery anomalies in its bounded administrator
+event list. It does not put a recording ID or file path in a metric label or
+operator message.
 
 ## 5. Snapshot design
 

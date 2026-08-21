@@ -140,6 +140,11 @@ func (s *Server) RecordArchive(action, result string) {
 		s.telemetry.setQuota(result == "full")
 		return
 	}
+	if action == "recover_overflow" {
+		s.telemetry.inc("opusrefweb_archive_alerts_total", "recovery_overflow")
+		s.telemetry.event("archive_recovery_overflow", "warning", "Archive recovery produced more alerts than the startup buffer can retain.")
+		return
+	}
 	s.telemetry.inc("opusrefweb_archive_total", action, result)
 	if action == "recover" && (result == "failure" || result == "partial") {
 		s.telemetry.inc("opusrefweb_archive_alerts_total", "recovery")
@@ -1210,7 +1215,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limiterName := strings.ToLower(in.Username)
-	if !s.limiter.Allow("login_user", limiterName, 5, 15*time.Minute, time.Now()) || !s.limiter.Allow("login_ip", s.clientAddress(r), 5, 15*time.Minute, time.Now()) {
+	now := time.Now()
+	if !s.limiter.Allow("login_ip", s.clientAddress(r), 5, 15*time.Minute, now) || !s.limiter.Allow("login_user", limiterName, 5, 15*time.Minute, now) {
 		s.telemetry.inc("opusrefweb_auth_total", "password", "rate_limited")
 		s.telemetry.event("rate_limit", "warning", "A password authentication rate limit was reached.")
 		writeError(w, http.StatusTooManyRequests, "rate_limited")

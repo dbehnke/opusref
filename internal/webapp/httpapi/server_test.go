@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -270,6 +271,40 @@ func TestLoginIsSameOriginAndNonEnumerating(t *testing.T) {
 	}
 	if w := login("alice", "quiet marble nebula orchard", "https://radio.example.test"); w.Code != http.StatusOK || len(w.Result().Cookies()) != 1 {
 		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRateLimitedIPCannotFillUsernameLimiter(t *testing.T) {
+	server, state := newTestServer(t)
+	defer state.Close()
+	for index := 0; index < 4100; index++ {
+		body := fmt.Sprintf(`{"username":"fresh-%d","password":"wrong password value"}`, index)
+		request := httptest.NewRequest(http.MethodPost, "https://radio.example.test/api/v1/auth/login", strings.NewReader(body))
+		request.RemoteAddr = "192.0.2.1:1234"
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "https://radio.example.test")
+		request.Header.Set("Sec-Fetch-Site", "same-origin")
+		response := httptest.NewRecorder()
+		server.PublicHandler().ServeHTTP(response, request)
+		if index >= 5 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d returned %d", index, response.Code)
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://radio.example.test/api/v1/auth/login", strings.NewReader(`{"username":"unrelated-fresh","password":"wrong password value"}`))
+	request.RemoteAddr = "198.51.100.1:1234"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://radio.example.test")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	response := httptest.NewRecorder()
+	server.PublicHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("fresh source was starved: %d", response.Code)
+	}
+	now := time.Now()
+	for _, category := range []string{"ws_ip", "passkey_ip", "passkey_account", "admin"} {
+		if !server.limiter.Allow(category, "unrelated", 1, time.Minute, now) {
+			t.Fatalf("%s was starved by fresh login usernames", category)
+		}
 	}
 }
 

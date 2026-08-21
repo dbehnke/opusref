@@ -16,16 +16,17 @@ type entry struct {
 type Limiter struct {
 	mu      sync.Mutex
 	key     [32]byte
-	entries map[[32]byte]entry
+	entries map[[32]byte]map[[32]byte]entry
 }
 
 const (
 	maxEntries     = 4096
+	maxCategories  = 32
 	stateRetention = 30 * time.Minute
 )
 
 func New() *Limiter {
-	l := &Limiter{entries: map[[32]byte]entry{}}
+	l := &Limiter{entries: map[[32]byte]map[[32]byte]entry{}}
 	_, _ = rand.Read(l.key[:])
 	return l
 }
@@ -33,22 +34,31 @@ func (l *Limiter) Allow(category, value string, maximum int, window time.Duratio
 	if maximum <= 0 || window <= 0 {
 		return false
 	}
-	mac := hmac.New(sha256.New, l.key[:])
-	mac.Write([]byte(category))
-	mac.Write([]byte{0})
-	mac.Write([]byte(value))
-	var key [32]byte
-	copy(key[:], mac.Sum(nil))
+	categoryKey := l.digest(category)
+	valueKey := l.digest(category + "\x00" + value)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for id, candidate := range l.entries {
-		if now.Sub(candidate.last) > stateRetention {
-			delete(l.entries, id)
+	for candidateCategory, candidates := range l.entries {
+		for id, candidate := range candidates {
+			if now.Sub(candidate.last) > stateRetention {
+				delete(candidates, id)
+			}
+		}
+		if len(candidates) == 0 {
+			delete(l.entries, candidateCategory)
 		}
 	}
-	item, exists := l.entries[key]
+	entries := l.entries[categoryKey]
+	if entries == nil {
+		if len(l.entries) >= maxCategories {
+			return false
+		}
+		entries = map[[32]byte]entry{}
+		l.entries[categoryKey] = entries
+	}
+	item, exists := entries[valueKey]
 	if !exists {
-		if len(l.entries) >= maxEntries {
+		if len(entries) >= maxEntries {
 			return false
 		}
 		item = entry{updated: now, last: now, tokens: float64(maximum)}
@@ -61,16 +71,28 @@ func (l *Limiter) Allow(category, value string, maximum int, window time.Duratio
 	}
 	item.last = now
 	if item.tokens < 1 {
-		l.entries[key] = item
+		entries[valueKey] = item
 		return false
 	}
 	item.tokens--
-	l.entries[key] = item
+	entries[valueKey] = item
 	return true
+}
+
+func (l *Limiter) digest(value string) [32]byte {
+	mac := hmac.New(sha256.New, l.key[:])
+	_, _ = mac.Write([]byte(value))
+	var result [32]byte
+	copy(result[:], mac.Sum(nil))
+	return result
 }
 
 func (l *Limiter) size() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.entries)
+	var total int
+	for _, entries := range l.entries {
+		total += len(entries)
+	}
+	return total
 }

@@ -123,6 +123,36 @@ func TestAtomicFileLifecycle(t *testing.T) {
 		t.Fatal("partial file remains")
 	}
 }
+
+func TestFileAndQuotaLimitsReturnDistinctErrors(t *testing.T) {
+	id := uuid.New()
+	fileLimited, err := createFile(t.TempDir(), id, 1024, HeaderSize+EntryHeaderSize+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fileLimited.Append(Packet{Payload: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = fileLimited.Append(Packet{Payload: []byte{2}}); !errors.Is(err, ErrFileLimit) || errors.Is(err, ErrQuotaLimit) {
+		t.Fatalf("file limit error=%v", err)
+	}
+	if _, _, _, err = fileLimited.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	quotaLimited, err := createFile(t.TempDir(), uuid.New(), HeaderSize+EntryHeaderSize+1, MaxFileSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = quotaLimited.Append(Packet{Payload: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = quotaLimited.Append(Packet{Payload: []byte{2}}); !errors.Is(err, ErrQuotaLimit) || errors.Is(err, ErrFileLimit) {
+		t.Fatalf("quota limit error=%v", err)
+	}
+	if _, _, _, err = quotaLimited.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+}
 func TestWriterCompletesShortWrites(t *testing.T) {
 	var out shortWriter
 	w, err := NewWriter(&out, uuid.New())

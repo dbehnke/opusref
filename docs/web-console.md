@@ -103,8 +103,17 @@ channel. Seek starts a new sequence at zero.
 Authentication limits use bounded in-memory token buckets. Passkey begin and
 finish operations share source and account buckets. Administrator mutations
 share one administrator-session bucket. Limiter state expires after 30 minutes.
+Each operation category has separate limiter capacity. A rejected source does
+not allocate new username state. One operation category cannot exhaust another
+category.
 Audit records use fixed action and outcome values. Audit details do not contain
 submitted credentials, tokens, addresses, or media.
+
+One recording has a hard 256 MiB limit. The service finalizes that recording as
+partial when it reaches the limit. This limit does not stop other recordings.
+The global archive quota stops new recordings until an administrator deletes
+enough archive data. The startup alert buffer retains at most 256 entries. It
+retains an overflow alert when it drops recovery alerts.
 
 ## Passkey flow
 

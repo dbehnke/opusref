@@ -43,3 +43,34 @@ func TestLimiterExpiresAndBoundsCardinality(t *testing.T) {
 		t.Fatalf("expired state retained: %d", got)
 	}
 }
+
+func TestCardinalityIsIsolatedByCategory(t *testing.T) {
+	l := New()
+	now := time.Unix(100, 0)
+	for i := 0; i < maxEntries; i++ {
+		if !l.Allow("login_user", string(rune(i)), 1, time.Minute, now) {
+			t.Fatalf("new login key %d was refused", i)
+		}
+	}
+	if l.Allow("login_user", "overflow", 1, time.Minute, now) {
+		t.Fatal("category overflow was accepted")
+	}
+	for _, category := range []string{"login_ip", "ws_ip", "passkey_ip", "passkey_account", "admin"} {
+		if !l.Allow(category, "independent", 1, time.Minute, now) {
+			t.Fatalf("%s was starved by login usernames", category)
+		}
+	}
+}
+
+func TestCategoryCountIsBounded(t *testing.T) {
+	l := New()
+	now := time.Unix(100, 0)
+	for index := 0; index < maxCategories; index++ {
+		if !l.Allow(string(rune(index)), "value", 1, time.Minute, now) {
+			t.Fatalf("category %d was refused", index)
+		}
+	}
+	if l.Allow("overflow", "value", 1, time.Minute, now) {
+		t.Fatal("category overflow was accepted")
+	}
+}
