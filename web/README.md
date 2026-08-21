@@ -87,7 +87,9 @@ small screens so that each account action stays visible.
 Latch PTT is off by default. Hold mode stops when the user releases the control.
 Latch mode stops after the user activates the control a second time. The UI shows
 these instructions and announces each latch state change. Passkey removal requires
-confirmation and identifies the passkey.
+confirmation and identifies the passkey. Cancel receives initial focus. The modal
+contains keyboard focus and makes the background inert. Escape cancels the action
+and returns focus to the passkey control.
 
 Playwright uses loopback servers to test control messages, ORWB media, playback,
 close handling, anonymous downgrade, and the production bundle over HTTPS and
