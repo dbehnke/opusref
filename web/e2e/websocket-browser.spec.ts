@@ -92,8 +92,8 @@ test('browser retires playback media across pause, resume, and seek barriers', a
     const request = JSON.parse(data.toString())
     if (request.type === 'hello') socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: request.request_id, body: { authenticated: true, ptt_available: false } }))
     if (request.type === 'playback_open') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_opened', request_id: request.request_id, body: { channel_id: '9', recording_id: 'recording-1', duration_ms: 10_000, status: 'complete' } })); socket.send(packet(0, 0)) }
-    if (request.type === 'playback_pause') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'paused', elapsed_ms: 20 } })); socket.send(packet(1, 960)) }
-    if (request.type === 'playback_resume') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'playing', elapsed_ms: 20 } })); socket.send(packet(1, 960)) }
+    if (request.type === 'playback_pause') { socket.send(packet(1, 960)); socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'paused', elapsed_ms: 20 } })) }
+    if (request.type === 'playback_resume') { socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'playing', elapsed_ms: 20 } })); socket.send(packet(2, 1920)) }
     if (request.type === 'playback_seek') { socket.send(packet(2, 1920)); socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: '9', state: 'playing', elapsed_ms: 1000 } })); socket.send(packet(0, 48_000)) }
   }))
   try {
@@ -114,7 +114,7 @@ test('browser retires playback media across pause, resume, and seek barriers', a
       await new Promise(resolve => setTimeout(resolve, 50))
       const afterPause = (audio as any).playbackExpectedSequence
       audio.playback('playback_resume', '9')
-      await waitFor(() => (audio as any).playbackExpectedSequence === 2)
+      await waitFor(() => (audio as any).playbackExpectedSequence === 3)
       const afterResume = (audio as any).playbackExpectedSequence
       audio.seek('9', 1000)
       await waitFor(() => audio.state.playback?.elapsedMs >= 1000 && (audio as any).playbackExpectedSequence === 1)
@@ -122,7 +122,7 @@ test('browser retires playback media across pause, resume, and seek barriers', a
       await audio.close()
       return result
     }, `http://127.0.0.1:${address.port}/api/v1/ws`)
-    expect(state).toEqual({ afterPause: 1, afterResume: 2, afterSeek: 1, error: undefined })
+    expect(state).toEqual({ afterPause: 2, afterResume: 3, afterSeek: 1, error: undefined })
   } finally { for (const client of server.clients) client.terminate(); await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 

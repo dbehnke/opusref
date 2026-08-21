@@ -32,6 +32,7 @@ export class BrowserAudioSession extends EventTarget {
   private playbackTimer = 0
   private playoutEpoch = 0
   private playbackAccepting = false
+  private playbackSequenceAccounting = false
   private playbackExpectedSequence?: number
   private readonly playbackRequests = new Map<string, { action: 'open' | 'pause' | 'resume' | 'seek' | 'close'; epoch: number }>()
   private capabilityResolve?: (supported: boolean) => void
@@ -88,7 +89,8 @@ export class BrowserAudioSession extends EventTarget {
   playback(type: 'playback_pause' | 'playback_resume' | 'playback_close', channelId: string): void {
     this.playbackBarrier()
     const action = type === 'playback_pause' ? 'pause' : type === 'playback_resume' ? 'resume' : 'close'
-    this.sendPlayback(type, action, { channel_id: channelId })
+    const sent = this.sendPlayback(type, action, { channel_id: channelId })
+    if (type === 'playback_pause' && sent) this.playbackSequenceAccounting = true
     if (type === 'playback_pause' && this.state.playback) { clearInterval(this.playbackTimer); this.update({ playback: { ...this.state.playback, state: 'paused' } }) }
     if (type === 'playback_close') this.closePlayback()
   }
@@ -137,10 +139,10 @@ export class BrowserAudioSession extends EventTarget {
       const live = event.media.kind === MediaKind.Live && event.media.channelId === this.liveChannel && !this.state.playback
       const playback = event.media.kind === MediaKind.Playback && event.media.channelId.toString() === this.state.playback?.channelId
       if (live && !this.retired.has(event.media.channelId)) this.worker?.postMessage({ type: 'media', epoch: this.playoutEpoch, packet: event.media })
-      else if (playback && !this.retired.has(event.media.channelId) && this.playbackAccepting) {
+      else if (playback && !this.retired.has(event.media.channelId) && (this.playbackAccepting || this.playbackSequenceAccounting)) {
         if (event.media.sequence !== this.playbackExpectedSequence) { this.playbackBarrier(); this.pausePlaybackForOverload('Playback paused because the server media sequence was invalid.'); return }
         this.playbackExpectedSequence = (event.media.sequence + 1) >>> 0
-        this.worker?.postMessage({ type: 'media', epoch: this.playoutEpoch, packet: event.media })
+        if (this.playbackAccepting) this.worker?.postMessage({ type: 'media', epoch: this.playoutEpoch, packet: event.media })
       }
     }
     const control = event.control
@@ -153,9 +155,9 @@ export class BrowserAudioSession extends EventTarget {
     else if (control.type === 'ptt_busy') { this.update({ ptt: 'idle', busy: true, error: 'The reflector floor is busy.' }); setTimeout(() => this.update({ busy: false }), 3000) }
     else if (control.type === 'ptt_ended') { clearInterval(this.totTimer); this.worker?.postMessage({ type: 'stop-transmit' }); this.stopMicrophone(); this.pttChannel = undefined; this.cancelPending = false; this.update({ ptt: 'idle', remaining: undefined }) }
     else if (control.type === 'discontinuity') { const body = control.body as { old_channel_id: string; new_channel_id: string }; try { const oldID = parseChannelId(body.old_channel_id); const newID = parseChannelId(body.new_channel_id); this.retire(oldID); if (oldID === this.liveChannel) this.liveChannel = newID; if (!this.state.playback) this.resetPlayout(); this.activity('Live audio restarted after a network discontinuity.') } catch { this.socket.close() } }
-    else if (control.type === 'playback_opened') { const body = control.body as { channel_id: string; recording_id: string; duration_ms: number; status: 'complete' | 'partial' }; const request = control.request_id ? this.playbackRequests.get(control.request_id) : undefined; if (control.request_id) this.playbackRequests.delete(control.request_id); if (!request || request.action !== 'open' || request.epoch !== this.playoutEpoch) return; try { parseChannelId(body.channel_id); this.resetPlayout(); this.playbackExpectedSequence = 0; this.playbackAccepting = true; this.update({ playback: { channelId: body.channel_id, recordingId: body.recording_id, durationMs: body.duration_ms, status: body.status, state: 'playing', elapsedMs: 0 } }); this.startPlaybackClock() } catch { this.socket.close() } }
-    else if (control.type === 'playback_state') { const body = control.body as { channel_id: string; state: 'playing' | 'paused' | 'closed'; elapsed_ms: number }; const request = control.request_id ? this.playbackRequests.get(control.request_id) : undefined; if (control.request_id) this.playbackRequests.delete(control.request_id); if (request && request.epoch !== this.playoutEpoch) return; if (this.state.playback?.channelId === body.channel_id) { if (body.state === 'closed') this.closePlayback(); else { this.resetPlayout(); if (request?.action === 'seek') this.playbackExpectedSequence = 0; this.playbackAccepting = body.state === 'playing'; this.update({ playback: { ...this.state.playback, state: body.state, elapsedMs: body.elapsed_ms } }); if (body.state === 'playing') this.startPlaybackClock(); else clearInterval(this.playbackTimer) } } }
-    else if (control.type === 'error') { if (control.request_id) this.playbackRequests.delete(control.request_id); const body = control.body as { code?: string; text?: string }; if (body.code === 'session_invalid') this.downgradeSession(); else this.update({ error: body.text ?? 'The live request failed.' }) }
+    else if (control.type === 'playback_opened') { const body = control.body as { channel_id: string; recording_id: string; duration_ms: number; status: 'complete' | 'partial' }; const request = control.request_id ? this.playbackRequests.get(control.request_id) : undefined; if (control.request_id) this.playbackRequests.delete(control.request_id); if (!request || request.action !== 'open' || request.epoch !== this.playoutEpoch) return; try { parseChannelId(body.channel_id); this.resetPlayout(); this.playbackExpectedSequence = 0; this.playbackSequenceAccounting = false; this.playbackAccepting = true; this.update({ playback: { channelId: body.channel_id, recordingId: body.recording_id, durationMs: body.duration_ms, status: body.status, state: 'playing', elapsedMs: 0 } }); this.startPlaybackClock() } catch { this.socket.close() } }
+    else if (control.type === 'playback_state') { const body = control.body as { channel_id: string; state: 'playing' | 'paused' | 'closed'; elapsed_ms: number }; const request = control.request_id ? this.playbackRequests.get(control.request_id) : undefined; if (control.request_id) this.playbackRequests.delete(control.request_id); if (request && request.epoch !== this.playoutEpoch) return; if (this.state.playback?.channelId === body.channel_id) { if (body.state === 'closed') this.closePlayback(); else { this.resetPlayout(); if (request?.action === 'seek') this.playbackExpectedSequence = 0; this.playbackSequenceAccounting = false; this.playbackAccepting = body.state === 'playing'; this.update({ playback: { ...this.state.playback, state: body.state, elapsedMs: body.elapsed_ms } }); if (body.state === 'playing') this.startPlaybackClock(); else clearInterval(this.playbackTimer) } } }
+    else if (control.type === 'error') { const request = control.request_id ? this.playbackRequests.get(control.request_id) : undefined; if (control.request_id) this.playbackRequests.delete(control.request_id); if (request?.epoch === this.playoutEpoch) this.playbackSequenceAccounting = false; const body = control.body as { code?: string; text?: string }; if (body.code === 'session_invalid') this.downgradeSession(); else this.update({ error: body.text ?? 'The live request failed.' }) }
   }
 
   private startTOT(seconds: number) {
@@ -174,8 +176,8 @@ export class BrowserAudioSession extends EventTarget {
   private closePlayback() { clearInterval(this.playbackTimer); this.playbackBarrier(); this.playbackExpectedSequence = undefined; this.playbackRequests.clear(); this.update({ playback: undefined }) }
   private downgradeSession() { if (this.state.ptt !== 'idle') this.stopPTT(); if (this.state.playback) this.closePlayback(); this.update({ pttAvailable: false }); this.activity('Your session ended. Live listening remains available.'); this.dispatchEvent(new Event('session-invalid')) }
   private resetPlayout() { this.playoutEpoch++; this.worker?.postMessage({ type: 'reset-playout', epoch: this.playoutEpoch }); this.audioNode?.port.postMessage({ type: 'clear', epoch: this.playoutEpoch }) }
-  private playbackBarrier() { this.playbackAccepting = false; this.resetPlayout() }
+  private playbackBarrier() { this.playbackAccepting = false; this.playbackSequenceAccounting = false; this.resetPlayout() }
   private pausePlaybackForOverload(message: string) { if (this.state.playback && this.state.playback.state !== 'paused') this.playback('playback_pause', this.state.playback.channelId); this.update({ error: message }) }
-  private sendPlayback(type: string, action: 'open' | 'pause' | 'resume' | 'seek' | 'close', body: unknown) { const requestID = this.send(type, body); if (requestID) this.playbackRequests.set(requestID, { action, epoch: this.playoutEpoch }) }
+  private sendPlayback(type: string, action: 'open' | 'pause' | 'resume' | 'seek' | 'close', body: unknown): boolean { const requestID = this.send(type, body); if (!requestID) return false; this.playbackRequests.set(requestID, { action, epoch: this.playoutEpoch }); return true }
   private send(type: string, body: unknown): string | undefined { try { return this.socket.send(type, body) } catch { this.update({ error: 'The live request queue is full. Reconnect and try again.' }); return undefined } }
 }
