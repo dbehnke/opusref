@@ -67,8 +67,17 @@ describe('browser audio lifecycle', () => {
     ;(audio as any).onWorker({ type: 'pcm', epoch: seekEpoch, pcm: new Float32Array(960) })
     expect(workletMessages.filter(message => message.type === 'play')).toHaveLength(1)
 
+    audio.seek('9', 2000)
+    audio.seek('9', 3000)
+    control('playback_state', 'request-5', { channel_id: '9', state: 'playing', elapsed_ms: 2000 })
+    media(0, 96_000)
+    expect(workerMessages.filter(message => message.type === 'media')).toHaveLength(3)
+    control('playback_state', 'request-6', { channel_id: '9', state: 'playing', elapsed_ms: 3000 })
+    media(0, 144_000)
+    expect(workerMessages.filter(message => message.type === 'media').map(message => message.packet.sequence)).toEqual([0, 1, 0, 0])
+
     audio.playback('playback_close', '9')
     media(1, 48_960)
-    expect(workerMessages.filter(message => message.type === 'media').map(message => message.packet.sequence)).toEqual([0, 1, 0])
+    expect(workerMessages.filter(message => message.type === 'media').map(message => message.packet.sequence)).toEqual([0, 1, 0, 0])
   })
 })
