@@ -5,6 +5,9 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/dbehnke/opusref/pkg/client"
 )
 
 type fakeTX struct {
@@ -59,5 +62,26 @@ func TestPTTRejectsSequenceOrTimestampGap(t *testing.T) {
 	g, _ := m.Start(context.Background(), "s", "N0CALL")
 	if err := m.Send(context.Background(), "s", g.ChannelID, 1, 0, []byte{1}); !errors.Is(err, ErrSequence) {
 		t.Fatalf("got %v", err)
+	}
+}
+func TestPTTReflectorEndClearsOwnerAndNotifies(t *testing.T) {
+	m := NewPTTManager(&fakeTX{})
+	grant, err := m.Start(context.Background(), "session-a", "N0CALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ends, cancel := m.SubscribeEnds()
+	defer cancel()
+	m.Observe(client.Event{Kind: client.EventStreamEnd})
+	select {
+	case ended := <-ends:
+		if ended.Session != "session-a" || ended.ChannelID != grant.ChannelID {
+			t.Fatalf("end=%+v", ended)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing PTT end")
+	}
+	if _, err = m.Start(context.Background(), "session-b", "N0CALL"); err != nil {
+		t.Fatalf("floor was not cleared: %v", err)
 	}
 }

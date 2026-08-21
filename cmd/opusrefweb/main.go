@@ -24,6 +24,7 @@ import (
 	wsprotocol "github.com/dbehnke/opusref/internal/webapp/socket"
 	"github.com/dbehnke/opusref/internal/webapp/store"
 	"github.com/dbehnke/opusref/pkg/client"
+	"github.com/dbehnke/opusref/pkg/wire"
 	webassets "github.com/dbehnke/opusref/web"
 	"golang.org/x/term"
 )
@@ -188,6 +189,13 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	argonStarted := time.Now()
+	if _, err = auth.HashPassword("startup-argon2-latency-probe", params(c)); err != nil {
+		return fmt.Errorf("Argon2 startup probe: %w", err)
+	}
+	if elapsed := time.Since(argonStarted); elapsed > 500*time.Millisecond {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: Argon2 startup probe took %s; run opusrefweb auth benchmark\n", elapsed.Round(time.Millisecond))
+	}
 	state, err := store.Open(context.Background(), c.Storage.SQLitePath)
 	if err != nil {
 		return err
@@ -199,26 +207,19 @@ func serve(args []string) error {
 	}
 	sharedKey := string(sharedKeyBytes)
 	clientOptions := client.Options{ServerAddress: c.Reflector.UDPAddress, NodeCallsign: c.Reflector.NodeCallsign, SharedKey: sharedKey}
-	receiver, err := client.NewUDP(clientOptions)
-	if err != nil {
-		return err
-	}
+	receiver := gateway.NewSupervisedClient(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512)
 	defer receiver.Close()
-	transmitter, err := client.NewUDP(clientOptions)
-	if err != nil {
-		return err
-	}
+	transmitter := gateway.NewSupervisedClient(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512)
 	defer transmitter.Close()
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()
-	if err = receiver.Connect(runCtx); err != nil {
-		return fmt.Errorf("connect receiver: %w", err)
-	}
-	if err = transmitter.Connect(runCtx); err != nil {
-		return fmt.Errorf("connect transmitter: %w", err)
-	}
+	_ = receiver.Connect(runCtx)
+	_ = transmitter.Connect(runCtx)
 	hub := gateway.NewLiveHub()
 	ptt := gateway.NewPTTManager(transmitter)
+	attribution := gateway.NewGrantAttribution()
+	ptt.SetAttribution(attribution)
+	go observeTransmitter(runCtx, transmitter, attribution, ptt)
 	archives, err := webarchive.NewService(runCtx, state, c.Storage.ArchiveDirectory, c.Storage.HardQuotaBytes, c.Limits.ArchiveQueuePackets)
 	if err != nil {
 		return err
@@ -247,8 +248,8 @@ func serve(args []string) error {
 	}
 	monitorClient := reflectormonitor.New(c.Reflector.MonitoringURL)
 	go monitorClient.Run(runCtx, c.Reflector.MonitorPollInterval.Time())
-	go publishReceiver(runCtx, receiver, hub, archives)
-	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives}, state)
+	go publishReceiver(runCtx, receiver, hub, archives, attribution)
+	api := httpapi.New(httpapi.Config{PublicOrigin: c.Web.PublicOrigin, OpenAccess: c.Web.OpenAccess, SessionIdle: c.Authentication.SessionIdle.Time(), SessionAbsolute: c.Authentication.SessionAbsolute.Time(), MaxSessions: c.Authentication.MaxSessionsPerAccount, Argon2: params(c), Assets: webassets.Handler(), LiveHub: hub, PTT: ptt, LiveQueuePackets: c.Limits.LiveQueuePackets, LiveQueueBytes: c.Limits.LiveQueueBytes, PlaybackQueuePackets: c.Limits.PlaybackQueuePackets, PlaybackQueueBytes: c.Limits.PlaybackQueueBytes, ControlQueueMessages: c.Limits.ControlQueueMessages, MaxPlaybacks: c.Limits.MaxPlaybacks, PlaybackMaxDuration: c.Limits.PlaybackMaxDuration.Time(), MaxConcurrentHashes: c.Authentication.MaxConcurrentHashes, Passkeys: passkeys, TrustedProxyCIDRs: c.Web.TrustedProxyCIDRs, MaxWebSockets: c.Limits.MaxWebSockets, MaxWebSocketsPerSession: c.Limits.MaxWebSocketsPerSession, PasswordBlocklist: additional, ReflectorMonitor: monitorClient, MonitorStaleAfter: c.Reflector.MonitorStaleAfter.Time(), Archives: archives, ReadyCheck: func() bool { return receiver.Ready() && transmitter.Ready() && archives.Ready() }}, state)
 	public := &http.Server{Addr: c.Web.HTTPListen, Handler: api.PublicHandler(), ReadHeaderTimeout: 5 * time.Second}
 	monitor := &http.Server{Addr: c.Web.MonitorListen, Handler: api.MonitorHandler(), ReadHeaderTimeout: 5 * time.Second}
 	fail := make(chan error, 2)
@@ -270,23 +271,59 @@ func serve(args []string) error {
 	return errors.Join(public.Shutdown(ctx), monitor.Shutdown(ctx))
 }
 
-func publishReceiver(ctx context.Context, receiver client.Client, hub *gateway.LiveHub, archives *webarchive.Service) {
+func publishReceiver(ctx context.Context, receiver client.Client, hub *gateway.LiveHub, archives *webarchive.Service, attribution *gateway.GrantAttribution) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event := <-receiver.Events():
+			key := webarchive.StreamKey{SessionID: event.SessionID, StreamID: event.StreamID}
 			switch event.Kind {
 			case client.EventStreamStart:
 				hub.Start(event.SourceCallsign)
-				archives.Start(event.NodeCallsign, event.SourceCallsign, time.Now())
+				webUserID := attribution.User(gateway.ReflectorStream{SessionID: event.SessionID, StreamID: event.StreamID})
+				archives.Start(key, event.NodeCallsign, event.SourceCallsign, webUserID, time.Now())
 			case client.EventAudio:
 				hub.Publish(wsprotocol.Media{Kind: wsprotocol.KindLive, Timestamp: event.Timestamp, Payload: event.Payload})
-				archives.Audio(event.Sequence, event.Timestamp, event.Payload, time.Now())
+				archives.Audio(key, event.Sequence, event.Timestamp, event.Payload, time.Now())
+			case client.EventData:
+				archives.Data(key, event.Sequence)
 			case client.EventStreamEnd:
 				hub.End("stream_end")
-				archives.End("stream_end")
+				archives.End(key, recordingEndReason(event.EndReason), event.Synthetic)
 			}
 		}
+	}
+}
+
+func observeTransmitter(ctx context.Context, transmitter client.Client, attribution *gateway.GrantAttribution, ptt *gateway.PTTManager) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-transmitter.Events():
+			if !ok {
+				return
+			}
+			attribution.Observe(event)
+			ptt.Observe(event)
+		}
+	}
+}
+
+func recordingEndReason(reason wire.EndReason) string {
+	switch reason {
+	case wire.EndReasonOwnerDisconnect:
+		return "owner_disconnect"
+	case wire.EndReasonGrantTimeout:
+		return "grant_timeout"
+	case wire.EndReasonMediaInactivity:
+		return "media_inactivity"
+	case wire.EndReasonTransmitTimeLimit:
+		return "transmit_time_limit"
+	case wire.EndReasonServerShutdown:
+		return "server_shutdown"
+	default:
+		return "normal"
 	}
 }

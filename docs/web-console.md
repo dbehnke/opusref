@@ -58,15 +58,27 @@ must have mode `0600`.
 
 1. Copy `opusrefweb.example.yaml` to an operator-controlled path.
 2. Set the final HTTPS origin and WebAuthn RP ID.
-3. Create the storage directory with mode `0700`.
-4. Run `opusrefweb auth benchmark --config FILE`.
-5. Run `opusrefweb admin create --config FILE --username NAME` on a TTY.
-6. Start `opusrefd`.
-7. Start `opusrefweb serve --config FILE`.
+3. Install the first 10,000 entries from the SecLists common-credentials list at
+   the configured `password_blocklist_file`. The service rejects a missing,
+   invalid, or oversized file.
+4. Create the storage directory with mode `0700`.
+5. Run `opusrefweb auth benchmark --config FILE`.
+6. Run `opusrefweb admin create --config FILE --username NAME` on a TTY.
+7. Start `opusrefd`.
+8. Start `opusrefweb serve --config FILE`.
 
 The service refuses readiness when no enabled administrator exists. Stop the
 service with SIGTERM. The process removes readiness before it closes the HTTP
 listeners and reflector clients.
+
+The receive client and transmit client reconnect with a bounded exponential
+delay. Readiness is false unless both clients have authenticated reflector
+sessions. A reconnect does not change the browser API. A reflector revoke ends
+the active browser PTT channel.
+
+The WebSocket writer uses separate bounded control, live-audio, and playback
+queues. Control output has priority. A full media queue closes the affected
+connection. One slow browser cannot block the reflector clients.
 
 ## Passkey flow
 
@@ -110,6 +122,30 @@ flowchart TD
     H --> I[Finalize known files]
     H --> J[Quarantine orphan or corrupt files]
 ```
+
+Each queued archive item includes the reflector session ID and stream ID. The
+archive worker accepts an item only for the active stream. `STREAM_END` drains
+all earlier media before it finalizes the file. A sequence gap, a synthetic end,
+an unknown prefix, or archive backpressure makes the recording `partial`.
+
+Recording IDs are canonical UUID strings. File access stays in the configured
+archive directory. Playback indexes at most 4,096 packets and 1 MiB of index
+data. The default playback duration limit is 15 minutes. Deletion uses the
+database `deleting` state and a `.deleting` file. Startup
+completes an interrupted deletion. Retention removes expired recordings first.
+Quota cleanup then removes the oldest recordings until use is at most 90 percent.
+
+## API pagination
+
+`GET /api/v1/recordings` accepts `limit`, `cursor`, `callsign`, `status`,
+`from`, and `to`. The limit range is 1 through 200. The cursor is opaque. The
+result contains `items` and can contain `next_cursor`. Use
+`GET /api/v1/recordings/{id}` for one recording.
+
+Passkey option results contain `ceremony_id` and `publicKey` at the same level.
+Passkey reauthentication uses `/api/v1/me/reauth/passkey/options` and
+`/api/v1/me/reauth/passkey/verify`. A successful verification returns a one-use
+reauthentication token that expires after five minutes.
 
 ## Shutdown
 

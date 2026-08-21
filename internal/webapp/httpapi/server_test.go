@@ -96,3 +96,39 @@ func TestChannelIDUsesCanonicalLosslessDecimal(t *testing.T) {
 		}
 	}
 }
+
+func TestPasskeyOptionsResponseIsFlattened(t *testing.T) {
+	result := passkeyOptionsResponse("ceremony", map[string]any{"publicKey": map[string]any{"rpId": "radio.example.test"}})
+	if result["ceremony_id"] != "ceremony" || result["publicKey"] == nil || result["options"] != nil {
+		t.Fatalf("response=%+v", result)
+	}
+}
+
+func TestRecordingQueryUsesOpaqueValidatedCursorAndFilters(t *testing.T) {
+	stamp := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	cursor := encodeRecordingCursor(stamp, "recording-id")
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/recordings?limit=200&callsign=n0call&status=partial&cursor="+cursor, nil)
+	query, err := recordingQuery(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query.Limit != 200 || query.Source != "N0CALL" || query.Status != "partial" || query.BeforeID != "recording-id" {
+		t.Fatalf("query=%+v", query)
+	}
+	bad := httptest.NewRequest(http.MethodGet, "/api/v1/recordings?cursor=not-base64", nil)
+	if _, err = recordingQuery(bad); err == nil {
+		t.Fatal("invalid cursor accepted")
+	}
+}
+
+func TestAdminCursorIsEndpointBound(t *testing.T) {
+	cursor := encodeAdminCursor(adminCursor{Kind: "accounts", Username: "alice", ID: "user-id"})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts?limit=25&cursor="+cursor, nil)
+	limit, decoded, err := adminPageRequest(r, "accounts")
+	if err != nil || limit != 25 || decoded.ID != "user-id" {
+		t.Fatalf("limit=%d cursor=%+v err=%v", limit, decoded, err)
+	}
+	if _, _, err = adminPageRequest(r, "audit"); err == nil {
+		t.Fatal("cross-endpoint cursor accepted")
+	}
+}

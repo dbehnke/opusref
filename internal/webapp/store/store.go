@@ -153,17 +153,53 @@ type AuditEvent struct {
 	Details    string    `json:"details"`
 }
 type Recording struct {
-	ID, NodeCallsign, SourceCallsign, Status, EndReason string `json:"-"`
+	ID, NodeCallsign, SourceCallsign, Status, EndReason string
+	RelativePath                                        string
 	StartedAt                                           time.Time
 	EndedAt                                             *time.Time
 	PacketCount, ByteSize                               int64
+	SHA256                                              []byte
+}
+type RecordingQuery struct {
+	Limit                         int
+	BeforeStart, BeforeID, Source string
+	From, To                      *time.Time
+	Status                        string
 }
 
 func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, error) {
-	if limit < 1 || limit > 200 {
+	return s.QueryRecordings(ctx, RecordingQuery{Limit: limit})
+}
+func (s *Store) QueryRecordings(ctx context.Context, query RecordingQuery) ([]Recording, error) {
+	limit := query.Limit
+	if limit < 1 || limit > 201 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size FROM recordings WHERE status IN('complete','partial') ORDER BY start_at DESC LIMIT ?`, limit)
+	statement := `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,relative_path,sha256 FROM recordings WHERE status IN('complete','partial')`
+	args := []any{}
+	if query.Source != "" {
+		statement += " AND source_callsign=?"
+		args = append(args, query.Source)
+	}
+	if query.Status == "complete" || query.Status == "partial" {
+		statement += " AND status=?"
+		args = append(args, query.Status)
+	}
+	if query.From != nil {
+		statement += " AND start_at>=?"
+		args = append(args, query.From.UTC().Format(time.RFC3339Nano))
+	}
+	if query.To != nil {
+		statement += " AND start_at<=?"
+		args = append(args, query.To.UTC().Format(time.RFC3339Nano))
+	}
+	if query.BeforeStart != "" && query.BeforeID != "" {
+		statement += " AND (start_at<? OR (start_at=? AND id<?))"
+		args = append(args, query.BeforeStart, query.BeforeStart, query.BeforeID)
+	}
+	statement += " ORDER BY start_at DESC,id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +209,7 @@ func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, err
 		var item Recording
 		var start string
 		var end sql.NullString
-		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize); err != nil {
+		if err = rows.Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.RelativePath, &item.SHA256); err != nil {
 			return nil, err
 		}
 		item.StartedAt, _ = time.Parse(time.RFC3339Nano, start)
@@ -185,8 +221,23 @@ func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, err
 	}
 	return out, rows.Err()
 }
-func (s *Store) InsertRecording(ctx context.Context, id, node, source, path string, start time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO recordings(id,node_callsign,source_callsign,start_at,status,relative_path,created_at)VALUES(?,?,?,?,'creating',?,?)`, id, node, source, start.UTC().Format(time.RFC3339Nano), path, time.Now().UTC().Format(time.RFC3339Nano))
+func (s *Store) RecordingByID(ctx context.Context, id string) (Recording, error) {
+	var item Recording
+	var start string
+	var end sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT id,node_callsign,source_callsign,status,COALESCE(end_reason,''),start_at,end_at,packet_count,byte_size,relative_path,sha256 FROM recordings WHERE id=? AND status IN('complete','partial')`, id).Scan(&item.ID, &item.NodeCallsign, &item.SourceCallsign, &item.Status, &item.EndReason, &start, &end, &item.PacketCount, &item.ByteSize, &item.RelativePath, &item.SHA256)
+	if err != nil {
+		return item, err
+	}
+	item.StartedAt, _ = time.Parse(time.RFC3339Nano, start)
+	if end.Valid {
+		parsed, _ := time.Parse(time.RFC3339Nano, end.String)
+		item.EndedAt = &parsed
+	}
+	return item, nil
+}
+func (s *Store) InsertRecording(ctx context.Context, id, node, source, webUserID, path string, start time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO recordings(id,node_callsign,source_callsign,web_user_id,start_at,status,relative_path,created_at)VALUES(?,?,?,?,?,'creating',?,?)`, id, node, source, nullString(webUserID), start.UTC().Format(time.RFC3339Nano), path, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 func (s *Store) OpenRecording(ctx context.Context, id string) error {
@@ -221,9 +272,55 @@ func (s *Store) ExpiredRecordings(ctx context.Context, before time.Time) ([]stri
 	}
 	return out, rows.Err()
 }
+func (s *Store) OldestRecordings(ctx context.Context, limit int) ([]string, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM recordings WHERE status IN('complete','partial') ORDER BY end_at,id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 func (s *Store) MarkRecordingDeleted(ctx context.Context, id string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE recordings SET status='deleted',deleted_at=? WHERE id=?", now.UTC().Format(time.RFC3339Nano), id)
+	_, err := s.db.ExecContext(ctx, "UPDATE recordings SET status='deleted',intended_status=NULL,deleted_at=? WHERE id=?", now.UTC().Format(time.RFC3339Nano), id)
 	return err
+}
+func (s *Store) BeginRecordingDelete(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, "UPDATE recordings SET intended_status=status,status='deleting' WHERE id=? AND status IN('complete','partial')", id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) DeletingRecordings(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM recordings WHERE status='deleting'")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) WriteAudit(ctx context.Context, action, outcome string, actor, target, recording *string, details string, now time.Time) error {
@@ -237,10 +334,21 @@ func (s *Store) WriteAudit(ctx context.Context, action, outcome string, actor, t
 	return err
 }
 func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEvent, error) {
-	if limit < 1 || limit > 200 {
+	return s.ListAuditBefore(ctx, limit, 0)
+}
+func (s *Store) ListAuditBefore(ctx context.Context, limit int, beforeID int64) ([]AuditEvent, error) {
+	if limit < 1 || limit > 201 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,occurred_at,action,outcome,details FROM audit_events ORDER BY id DESC LIMIT ?`, limit)
+	statement := `SELECT id,occurred_at,action,outcome,details FROM audit_events`
+	args := []any{}
+	if beforeID > 0 {
+		statement += " WHERE id<?"
+		args = append(args, beforeID)
+	}
+	statement += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -266,17 +374,29 @@ func (s *Store) PurgeAudit(ctx context.Context, before time.Time) (int64, error)
 }
 
 func (s *Store) WebAuthnByUserID(ctx context.Context, userID string) (WebAuthnMaterial, error) {
-	return s.webAuthnMaterial(ctx, "u.id=?", userID)
+	return s.webAuthnMaterial(ctx, "u.id=?", userID, "")
 }
 func (s *Store) WebAuthnByHandle(ctx context.Context, handle []byte) (WebAuthnMaterial, error) {
-	return s.webAuthnMaterial(ctx, "u.webauthn_handle=?", handle)
+	return s.webAuthnMaterial(ctx, "u.webauthn_handle=?", handle, "")
 }
-func (s *Store) webAuthnMaterial(ctx context.Context, where string, arg any) (WebAuthnMaterial, error) {
+func (s *Store) WebAuthnByUserIDRP(ctx context.Context, userID, rpID string) (WebAuthnMaterial, error) {
+	return s.webAuthnMaterial(ctx, "u.id=?", userID, rpID)
+}
+func (s *Store) WebAuthnByHandleRP(ctx context.Context, handle []byte, rpID string) (WebAuthnMaterial, error) {
+	return s.webAuthnMaterial(ctx, "u.webauthn_handle=?", handle, rpID)
+}
+func (s *Store) webAuthnMaterial(ctx context.Context, where string, arg any, rpID string) (WebAuthnMaterial, error) {
 	var out WebAuthnMaterial
 	if err := s.db.QueryRowContext(ctx, "SELECT u.id,u.username,u.webauthn_handle FROM users u WHERE "+where+" AND u.disabled_at IS NULL AND u.deleted_at IS NULL", arg).Scan(&out.UserID, &out.Username, &out.Handle); err != nil {
 		return out, err
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT public_key FROM webauthn_credentials WHERE user_id=?", out.UserID)
+	query := "SELECT public_key FROM webauthn_credentials WHERE user_id=?"
+	args := []any{out.UserID}
+	if rpID != "" {
+		query += " AND rp_id=?"
+		args = append(args, rpID)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return out, err
 	}
@@ -290,11 +410,11 @@ func (s *Store) webAuthnMaterial(ctx context.Context, where string, arg any) (We
 	}
 	return out, rows.Err()
 }
-func (s *Store) SaveWebAuthnCredential(ctx context.Context, userID, rpID, label string, id, encoded []byte, now time.Time) error {
+func (s *Store) SaveWebAuthnCredential(ctx context.Context, userID, rpID, label string, id, encoded []byte, signCount uint32, transports string, backupEligible, backupState bool, now time.Time) error {
 	if len(label) < 1 || len(label) > 64 {
 		return errors.New("passkey label is invalid")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO webauthn_credentials(id,user_id,rp_id,public_key,sign_count,transports,backup_eligible,backup_state,label,created_at)VALUES(?,?,?,?,0,'',0,0,?,?)`, id, userID, rpID, encoded, label, now.UTC().Format(time.RFC3339Nano))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO webauthn_credentials(id,user_id,rp_id,public_key,sign_count,transports,backup_eligible,backup_state,label,created_at)VALUES(?,?,?,?,?,?,?,?,?,?)`, id, userID, rpID, encoded, signCount, transports, backupEligible, backupState, label, now.UTC().Format(time.RFC3339Nano))
 	return err
 }
 func (s *Store) UpdateWebAuthnCredential(ctx context.Context, userID string, id, encoded []byte, signCount uint32, backupEligible, backupState bool, now time.Time) error {
@@ -310,6 +430,20 @@ func (s *Store) UpdateWebAuthnCredential(ctx context.Context, userID string, id,
 }
 
 type Store struct{ db *sql.DB }
+type MonitoringCounts struct {
+	Accounts, Sessions, Recordings, AuthenticationFailures int64
+}
+
+func (s *Store) MonitoringCounts(ctx context.Context, now time.Time) (MonitoringCounts, error) {
+	var counts MonitoringCounts
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	err := s.db.QueryRowContext(ctx, `SELECT
+(SELECT COUNT(*) FROM users WHERE disabled_at IS NULL AND deleted_at IS NULL),
+(SELECT COUNT(*) FROM sessions WHERE revoked_at IS NULL AND absolute_expiry>?),
+(SELECT COUNT(*) FROM recordings WHERE status IN('complete','partial')),
+(SELECT COUNT(*) FROM audit_events WHERE action IN('login','passkey_login') AND outcome='failure')`, stamp).Scan(&counts.Accounts, &counts.Sessions, &counts.Recordings, &counts.AuthenticationFailures)
+	return counts, err
+}
 
 func Open(ctx context.Context, path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -328,6 +462,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{db: db}
+	if err = s.backupBeforeMigration(ctx, path); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err = s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -337,6 +475,25 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+func (s *Store) backupBeforeMigration(ctx context.Context, path string) error {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&exists); err != nil || exists == 0 {
+		return err
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil || version == 0 || version >= 2 {
+		return err
+	}
+	backup := fmt.Sprintf("%s.pre-v%d-%d.bak", path, version, time.Now().UnixNano())
+	quoted := strings.ReplaceAll(backup, "'", "''")
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO '"+quoted+"'"); err != nil {
+		return fmt.Errorf("create migration backup: %w", err)
+	}
+	if err := os.Chmod(backup, 0600); err != nil {
+		return fmt.Errorf("secure migration backup: %w", err)
+	}
+	return nil
 }
 func rejectSymlink(path string) error {
 	info, err := os.Lstat(path)
@@ -360,10 +517,24 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 1 {
+	if version > 2 {
 		return errors.New("database schema is newer than this program")
 	}
 	if version == 1 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS recordings_browse ON recordings(status,start_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS recordings_retention ON recordings(status,end_at);
+CREATE INDEX IF NOT EXISTS audit_browse ON audit_events(id DESC);
+INSERT INTO schema_migrations(version,applied_at)VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if version == 2 {
 		return nil
 	}
 	schema := `
@@ -382,7 +553,10 @@ INSERT OR IGNORE INTO schema_migrations(version,applied_at)VALUES(1,strftime('%Y
 	if _, err = tx.ExecContext(ctx, schema); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return s.migrate(ctx)
 }
 
 func (s *Store) CreateUser(ctx context.Context, in CreateUser) (User, error) {
@@ -425,10 +599,21 @@ func (s *Store) FindUserByID(ctx context.Context, id string) (User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT id,username,COALESCE(callsign,''),password_hash,role,password_change_required,disabled_at IS NOT NULL,created_at FROM users WHERE id=? AND deleted_at IS NULL`, id))
 }
 func (s *Store) ListUsers(ctx context.Context, limit int) ([]UserSummary, error) {
-	if limit < 1 || limit > 200 {
+	return s.ListUsersAfter(ctx, limit, "", "")
+}
+func (s *Store) ListUsersAfter(ctx context.Context, limit int, afterUsername, afterID string) ([]UserSummary, error) {
+	if limit < 1 || limit > 201 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,username,COALESCE(callsign,''),role,password_change_required,disabled_at IS NOT NULL FROM users WHERE deleted_at IS NULL ORDER BY username LIMIT ?`, limit)
+	statement := `SELECT id,username,COALESCE(callsign,''),role,password_change_required,disabled_at IS NOT NULL FROM users WHERE deleted_at IS NULL`
+	args := []any{}
+	if afterUsername != "" && afterID != "" {
+		statement += " AND (username>? OR (username=? AND id>?))"
+		args = append(args, afterUsername, afterUsername, afterID)
+	}
+	statement += " ORDER BY username,id LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, err
 	}

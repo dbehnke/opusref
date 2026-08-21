@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,14 +53,14 @@ func (u user) WebAuthnName() string                       { return u.name }
 func (u user) WebAuthnDisplayName() string                { return u.name }
 func (u user) WebAuthnCredentials() []webauthn.Credential { return u.credentials }
 func (m *Manager) loadByID(ctx context.Context, id string) (user, error) {
-	material, err := m.store.WebAuthnByUserID(ctx, id)
+	material, err := m.store.WebAuthnByUserIDRP(ctx, id, m.rpID)
 	if err != nil {
 		return user{}, err
 	}
 	return decodeUser(material)
 }
 func (m *Manager) loadByHandle(ctx context.Context, handle []byte) (user, error) {
-	material, err := m.store.WebAuthnByHandle(ctx, handle)
+	material, err := m.store.WebAuthnByHandleRP(ctx, handle, m.rpID)
 	if err != nil {
 		return user{}, err
 	}
@@ -123,6 +124,37 @@ func (m *Manager) BeginEnrollment(ctx context.Context, userID, sessionID string)
 	m.put(id, ceremony{"enroll", userID, sessionID, *data, time.Now().Add(5 * time.Minute)})
 	return id, options, nil
 }
+func (m *Manager) BeginReauth(ctx context.Context, userID, sessionID string) (string, any, error) {
+	u, err := m.loadByID(ctx, userID)
+	if err != nil {
+		return "", nil, err
+	}
+	options, data, err := m.engine.BeginLogin(u, webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		return "", nil, err
+	}
+	id := uuid.NewString()
+	m.put(id, ceremony{"reauth", userID, sessionID, *data, time.Now().Add(5 * time.Minute)})
+	return id, options, nil
+}
+func (m *Manager) FinishReauth(ctx context.Context, id, userID, sessionID string, response json.RawMessage) error {
+	item, err := m.take(id, "reauth", userID, sessionID)
+	if err != nil {
+		return err
+	}
+	u, err := m.loadByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(response))
+	request.Header.Set("Content-Type", "application/json")
+	credential, err := m.engine.FinishLogin(u, item.data, request)
+	if err != nil || credential.Authenticator.CloneWarning {
+		return errors.New("passkey verification failed")
+	}
+	encoded, _ := json.Marshal(credential)
+	return m.store.UpdateWebAuthnCredential(ctx, userID, credential.ID, encoded, credential.Authenticator.SignCount, credential.Flags.BackupEligible, credential.Flags.BackupState, time.Now())
+}
 func (m *Manager) FinishEnrollment(ctx context.Context, id, userID, sessionID, label string, response json.RawMessage) error {
 	item, err := m.take(id, "enroll", userID, sessionID)
 	if err != nil {
@@ -142,7 +174,11 @@ func (m *Manager) FinishEnrollment(ctx context.Context, id, userID, sessionID, l
 	if err != nil {
 		return err
 	}
-	return m.store.SaveWebAuthnCredential(ctx, userID, m.rpID, label, credential.ID, encoded, time.Now())
+	transports := make([]string, len(credential.Transport))
+	for index, transport := range credential.Transport {
+		transports[index] = string(transport)
+	}
+	return m.store.SaveWebAuthnCredential(ctx, userID, m.rpID, label, credential.ID, encoded, credential.Authenticator.SignCount, strings.Join(transports, ","), credential.Flags.BackupEligible, credential.Flags.BackupState, time.Now())
 }
 func (m *Manager) put(id string, value ceremony) {
 	m.mu.Lock()

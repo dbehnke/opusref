@@ -29,7 +29,7 @@ authentication:
   argon2_iterations: 3
   argon2_parallelism: 4
   max_concurrent_hashes: 2
-  password_blocklist_file: ""
+  password_blocklist_file: /etc/opusref/seclists-10k-most-common.txt
 webauthn:
   rp_id: "opusref.example.org"
   rp_name: "OpusRef"
@@ -46,6 +46,7 @@ limits:
   archive_queue_packets: 512
   archive_queue_bytes: 1048576
   max_playbacks: 50
+  playback_max_duration: 15m
 logging:
   level: "info"
   format: "json"

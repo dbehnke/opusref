@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+
+	"github.com/dbehnke/opusref/pkg/client"
 )
 
 var (
@@ -21,28 +23,45 @@ type ReflectorTransmitter interface {
 	EndStream(context.Context) error
 }
 type Grant struct{ ChannelID uint64 }
+type PTTEnd struct {
+	Session, Reason string
+	ChannelID       uint64
+}
 type pttState struct {
 	session                     string
 	channel                     uint64
 	nextSequence, nextTimestamp uint32
 }
 type PTTManager struct {
-	mu    sync.Mutex
-	tx    ReflectorTransmitter
-	state pttState
-	used  map[uint64]struct{}
+	mu          sync.Mutex
+	tx          ReflectorTransmitter
+	state       pttState
+	used        map[uint64]struct{}
+	attribution *GrantAttribution
+	subscribers map[uint64]chan PTTEnd
+	nextSub     uint64
 }
 
 func NewPTTManager(tx ReflectorTransmitter) *PTTManager {
-	return &PTTManager{tx: tx, used: map[uint64]struct{}{}}
+	return &PTTManager{tx: tx, used: map[uint64]struct{}{}, subscribers: map[uint64]chan PTTEnd{}}
 }
+func (m *PTTManager) SetAttribution(attribution *GrantAttribution) { m.attribution = attribution }
 func (m *PTTManager) Start(ctx context.Context, session, callsign string) (Grant, error) {
+	return m.StartForUser(ctx, session, "", callsign)
+}
+func (m *PTTManager) StartForUser(ctx context.Context, session, userID, callsign string) (Grant, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state.channel != 0 {
 		return Grant{}, ErrBusy
 	}
+	if m.attribution != nil {
+		m.attribution.Begin(userID)
+	}
 	if err := m.tx.RequestStream(ctx, callsign); err != nil {
+		if m.attribution != nil {
+			m.attribution.Cancel(userID)
+		}
 		return Grant{}, err
 	}
 	channel, err := m.channel()
@@ -95,6 +114,41 @@ func (m *PTTManager) StopSession(ctx context.Context, session string) error {
 	}
 	m.state = pttState{}
 	return m.tx.EndStream(ctx)
+}
+func (m *PTTManager) Observe(event client.Event) {
+	if event.Kind != client.EventStreamEnd && !(event.Kind == client.EventStatus && event.Message == "disconnected") {
+		return
+	}
+	m.mu.Lock()
+	if m.state.channel == 0 {
+		m.mu.Unlock()
+		return
+	}
+	ended := PTTEnd{Session: m.state.session, ChannelID: m.state.channel, Reason: event.Message}
+	if ended.Reason == "" {
+		ended.Reason = "reflector_revoke"
+	}
+	m.state = pttState{}
+	for _, subscriber := range m.subscribers {
+		select {
+		case subscriber <- ended:
+		default:
+		}
+	}
+	m.mu.Unlock()
+}
+func (m *PTTManager) SubscribeEnds() (<-chan PTTEnd, func()) {
+	m.mu.Lock()
+	m.nextSub++
+	id := m.nextSub
+	channel := make(chan PTTEnd, 4)
+	m.subscribers[id] = channel
+	m.mu.Unlock()
+	return channel, func() {
+		m.mu.Lock()
+		delete(m.subscribers, id)
+		m.mu.Unlock()
+	}
 }
 func (m *PTTManager) channel() (uint64, error) {
 	for {

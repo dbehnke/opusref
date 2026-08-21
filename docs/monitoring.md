@@ -123,6 +123,12 @@ are `granted`, `busy`, `rejected`, and `overloaded`. Stream-end reasons and
 timeout kinds use the values that the protocol specification defines. Packet
 type labels use the lowercase names in the packet-type registry.
 
+`opusrefweb` exports a separate fixed-cardinality set. It uses the
+`opusrefweb_` prefix. The set includes process readiness, WebSocket connections,
+enabled accounts, active sessions, retained recordings, archive bytes, archive
+quota bytes, and authentication failures. These metrics have no labels. The
+public listener does not serve them.
+
 ## 5. Snapshot design
 
 ```mermaid

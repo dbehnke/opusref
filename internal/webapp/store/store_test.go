@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -45,6 +47,31 @@ func TestAccountAndSessionLifecycle(t *testing.T) {
 	}
 	if _, err := s.AuthenticateSession(context.Background(), raw, time.Now()); err == nil {
 		t.Fatal("disabled user's session remained valid")
+	}
+}
+
+func TestMigrationCreatesRestrictedBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	state, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = state.DB().Exec("DELETE FROM schema_migrations WHERE version=2"); err != nil {
+		t.Fatal(err)
+	}
+	_ = state.Close()
+	state, err = Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	backups, err := filepath.Glob(path + ".pre-v1-*.bak")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("backups=%v err=%v", backups, err)
+	}
+	info, err := os.Stat(backups[0])
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("backup mode=%v err=%v", info.Mode().Perm(), err)
 	}
 }
 

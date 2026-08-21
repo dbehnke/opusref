@@ -81,17 +81,18 @@ type WebAuthn struct {
 	Origins []string `yaml:"origins"`
 }
 type Limits struct {
-	MaxWebSockets           int `yaml:"max_websockets"`
-	MaxWebSocketsPerSession int `yaml:"max_websockets_per_session"`
-	LiveQueuePackets        int `yaml:"live_queue_packets"`
-	LiveQueueBytes          int `yaml:"live_queue_bytes"`
-	PlaybackQueuePackets    int `yaml:"playback_queue_packets"`
-	PlaybackQueueBytes      int `yaml:"playback_queue_bytes"`
-	TransmitQueuePackets    int `yaml:"transmit_queue_packets"`
-	ControlQueueMessages    int `yaml:"control_queue_messages"`
-	ArchiveQueuePackets     int `yaml:"archive_queue_packets"`
-	ArchiveQueueBytes       int `yaml:"archive_queue_bytes"`
-	MaxPlaybacks            int `yaml:"max_playbacks"`
+	MaxWebSockets           int      `yaml:"max_websockets"`
+	MaxWebSocketsPerSession int      `yaml:"max_websockets_per_session"`
+	LiveQueuePackets        int      `yaml:"live_queue_packets"`
+	LiveQueueBytes          int      `yaml:"live_queue_bytes"`
+	PlaybackQueuePackets    int      `yaml:"playback_queue_packets"`
+	PlaybackQueueBytes      int      `yaml:"playback_queue_bytes"`
+	TransmitQueuePackets    int      `yaml:"transmit_queue_packets"`
+	ControlQueueMessages    int      `yaml:"control_queue_messages"`
+	ArchiveQueuePackets     int      `yaml:"archive_queue_packets"`
+	ArchiveQueueBytes       int      `yaml:"archive_queue_bytes"`
+	MaxPlaybacks            int      `yaml:"max_playbacks"`
+	PlaybackMaxDuration     Duration `yaml:"playback_max_duration"`
 }
 type Logging struct {
 	Level  string `yaml:"level"`
@@ -105,7 +106,7 @@ func Defaults() Config {
 		Storage:        Storage{"/var/lib/opusrefweb/opusrefweb.db", "/var/lib/opusrefweb/recordings", Duration(24 * time.Hour), 10 * 1024 * 1024 * 1024, Duration(time.Minute), Duration(720 * time.Hour)},
 		Authentication: Authentication{Duration(12 * time.Hour), Duration(168 * time.Hour), 3, 65536, 3, 4, 2, ""},
 		WebAuthn:       WebAuthn{RPName: "OpusRef"},
-		Limits:         Limits{250, 3, 64, 131072, 64, 131072, 64, 32, 512, 1048576, 50}, Logging: Logging{"info", "json"},
+		Limits:         Limits{250, 3, 64, 131072, 64, 131072, 64, 32, 512, 1048576, 50, Duration(15 * time.Minute)}, Logging: Logging{"info", "json"},
 	}
 }
 
@@ -189,6 +190,9 @@ func (c Config) Validate() error {
 		if v <= 0 {
 			return errors.New("all queue and connection limits must be positive")
 		}
+	}
+	if c.Limits.PlaybackMaxDuration <= 0 {
+		return errors.New("playback maximum duration must be positive")
 	}
 	return nil
 }
