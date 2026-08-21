@@ -1,0 +1,10 @@
+network:
+  udp_listen: "127.0.0.1:14600"
+reflector:
+  id: "SYSTEM"
+  display_name: "System Proxy Reflector"
+monitoring:
+  http_listen: "127.0.0.1:18082"
+logging:
+  level: "info"
+  format: "json"

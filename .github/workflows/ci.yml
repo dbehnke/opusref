@@ -39,3 +39,7 @@ jobs:
         working-directory: web
       - run: npm run test:e2e
         working-directory: web
+      - name: Install nginx for the reverse-proxy system gate
+        run: sudo apt-get update && sudo apt-get install --yes nginx
+      - run: npm run test:system-proxy
+        working-directory: web

@@ -15,6 +15,7 @@ npm test
 npm run build
 npm run check:dist
 npm run test:e2e
+npm run test:system-proxy
 ```
 
 The browser never sends or receives an audio container. Each ORWB binary message
@@ -66,6 +67,10 @@ close handling, anonymous downgrade, and the production bundle over HTTPS and
 same-origin WSS. The local HTTPS certificate is test-only. The system release gate
 must also test the configured reverse proxy and the devices in
 [QUALIFICATION.md](QUALIFICATION.md).
+
+The system proxy test starts the Go reflector, Go companion, and nginx. It uses
+native nginx when available and a pinned nginx container otherwise. It requires
+OpenSSL and either nginx or Docker.
 
 ## Production assets
 

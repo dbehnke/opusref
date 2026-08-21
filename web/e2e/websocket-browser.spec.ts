@@ -15,7 +15,6 @@ test('browser socket exchanges strict control and ORWB media without compression
       socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: hello.request_id, body: { authenticated: false, ptt_available: false, passkey_available: false } }))
       const packet = Buffer.alloc(33); packet.write('ORWB', 0); packet.writeUInt8(1, 4); packet.writeUInt8(1, 5); packet.writeBigUInt64BE(1n, 8); packet.writeUInt16BE(1, 24); packet.writeUInt8(0xf8, 32)
       socket.send(packet)
-      setTimeout(() => socket.close(1012, 'restart'), 10)
     })
   })
   try {
@@ -28,7 +27,7 @@ test('browser socket exchanges strict control and ORWB media without compression
       socket.addEventListener('event', (event: Event) => {
         const detail = (event as CustomEvent).detail
         if (detail.control) events.push({ type: detail.control.type })
-        if (detail.media) events.push({ kind: detail.media.kind, channel: detail.media.channelId.toString(), payload: [...detail.media.payload] })
+        if (detail.media) { events.push({ kind: detail.media.kind, channel: detail.media.channelId.toString(), payload: [...detail.media.payload] }); socket.close() }
         if (detail.closed) events.push({ closeCode: detail.closed.code, reason: detail.closed.reason })
       })
       socket.connect({ encoder: true, decoder: true, context_rate: 48000 })
@@ -39,7 +38,7 @@ test('browser socket exchanges strict control and ORWB media without compression
     expect(hello).toMatchObject({ api_version: 1, type: 'hello', body: { audio: { encoder: true, decoder: true, context_rate: 48000 } } })
     expect(extensions).toBe('')
     expect(received.slice(0, 2)).toEqual([{ type: 'hello_ok' }, { kind: 1, channel: '1', payload: [0xf8] }])
-    expect([1005, 1012]).toContain(received[2].closeCode)
+    expect(received[2]).toEqual({ closeCode: 1000, reason: 'page_close' })
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 
@@ -53,9 +52,12 @@ test('browser socket preserves playback controls, partial status, and media', as
     if (request.type === 'hello') socket.send(JSON.stringify({ api_version: 1, type: 'hello_ok', request_id: request.request_id, body: { authenticated: true, role: 'user', ptt_available: true, passkey_available: false } }))
     if (request.type === 'playback_open') {
       socket.send(JSON.stringify({ api_version: 1, type: 'playback_opened', request_id: request.request_id, body: { channel_id: '18446744073709551615', recording_id: 'recording-1', duration_ms: 4000, status: 'partial' } }))
-      const packet = Buffer.alloc(33); packet.write('ORWB', 0); packet.writeUInt8(1, 4); packet.writeUInt8(3, 5); packet.writeBigUInt64BE(18446744073709551615n, 8); packet.writeUInt16BE(1, 24); packet.writeUInt8(0xf8, 32); socket.send(packet)
+      const packet = Buffer.alloc(33); packet.write('ORWB', 0); packet.writeUInt8(1, 4); packet.writeUInt8(3, 5); packet.writeBigUInt64BE(18446744073709551615n, 8); packet.writeUInt32BE(0, 16); packet.writeUInt32BE(0, 20); packet.writeUInt16BE(1, 24); packet.writeUInt8(0xf8, 32); socket.send(packet)
     }
-    if (request.type === 'playback_seek') socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: request.body.channel_id, state: 'playing', elapsed_ms: request.body.elapsed_ms } }))
+    if (request.type === 'playback_seek') {
+      socket.send(JSON.stringify({ api_version: 1, type: 'playback_state', request_id: request.request_id, body: { channel_id: request.body.channel_id, state: 'playing', elapsed_ms: request.body.elapsed_ms } }))
+      const packet = Buffer.alloc(34); packet.write('ORWB', 0); packet.writeUInt8(1, 4); packet.writeUInt8(3, 5); packet.writeBigUInt64BE(18446744073709551615n, 8); packet.writeUInt32BE(0, 16); packet.writeUInt32BE(95040, 20); packet.writeUInt16BE(2, 24); packet.set([0xf8, 0xff], 32); socket.send(packet)
+    }
   }))
   try {
     await page.goto('/')
@@ -63,15 +65,19 @@ test('browser socket preserves playback controls, partial status, and media', as
       // @ts-expect-error Vite serves this source module during browser tests.
       const { OpusRefSocket } = await import('/src/lib/socket.ts')
       const socket = new OpusRefSocket(endpoint); const events: any[] = []
-      socket.addEventListener('event', (event: Event) => { const detail = (event as CustomEvent).detail; if (detail.control) { events.push(detail.control); if (detail.control.type === 'hello_ok') socket.send('playback_open', { recording_id: 'recording-1' }); if (detail.control.type === 'playback_opened') socket.send('playback_seek', { channel_id: detail.control.body.channel_id, elapsed_ms: 2000 }) } if (detail.media) events.push({ type: 'media', kind: detail.media.kind, channel_id: detail.media.channelId.toString() }) })
+      socket.addEventListener('event', (event: Event) => { const detail = (event as CustomEvent).detail; if (detail.control) { events.push(detail.control); if (detail.control.type === 'hello_ok') socket.send('playback_open', { recording_id: 'recording-1' }); if (detail.control.type === 'playback_opened') socket.send('playback_seek', { channel_id: detail.control.body.channel_id, elapsed_ms: 2000 }) } if (detail.media) events.push({ type: 'media', kind: detail.media.kind, channel_id: detail.media.channelId.toString(), sequence: detail.media.sequence, timestamp: detail.media.timestamp, payload: [...detail.media.payload] }) })
       socket.connect({ encoder: true, decoder: true, context_rate: 48000 }, 'csrf')
-      const start = performance.now(); while (!events.some(event => event.type === 'playback_state')) { if (performance.now() - start > 5000) throw new Error('playback timeout'); await new Promise(resolve => setTimeout(resolve, 10)) }
+      const start = performance.now(); while (!events.some(event => event.type === 'playback_state') || events.filter(event => event.type === 'media').length < 2) { if (performance.now() - start > 5000) throw new Error('playback timeout'); await new Promise(resolve => setTimeout(resolve, 10)) }
       socket.close(); return events.map(event => event.type === 'media' ? event : { type: event.type, body: event.body })
     }, `http://127.0.0.1:${address.port}/api/v1/ws`)
     expect(requests.map(request => request.type)).toEqual(['hello', 'playback_open', 'playback_seek'])
     expect(requests[2].body).toEqual({ channel_id: '18446744073709551615', elapsed_ms: 2000 })
     expect(result).toContainEqual({ type: 'playback_opened', body: { channel_id: '18446744073709551615', recording_id: 'recording-1', duration_ms: 4000, status: 'partial' } })
-    expect(result).toContainEqual({ type: 'media', kind: 3, channel_id: '18446744073709551615' })
+    expect(result).toContainEqual({ type: 'playback_state', body: { channel_id: '18446744073709551615', state: 'playing', elapsed_ms: 2000 } })
+    expect(result.filter(event => event.type === 'media')).toEqual([
+      { type: 'media', kind: 3, channel_id: '18446744073709551615', sequence: 0, timestamp: 0, payload: [0xf8] },
+      { type: 'media', kind: 3, channel_id: '18446744073709551615', sequence: 0, timestamp: 95040, payload: [0xf8, 0xff] },
+    ])
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 
