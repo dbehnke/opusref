@@ -15,22 +15,32 @@ type ClientFactory func() (client.Client, error)
 // SupervisedClient keeps one replaceable OpusRef client connected. It keeps
 // the public event channel stable across reconnects.
 type SupervisedClient struct {
-	factory ClientFactory
-	events  chan client.Event
-	done    chan struct{}
-	mu      sync.RWMutex
-	active  client.Client
-	cancel  context.CancelFunc
-	ready   atomic.Bool
-	once    sync.Once
-	dropped map[ReflectorStream]bool
+	factory                        ClientFactory
+	events                         chan client.Event
+	done                           chan struct{}
+	mu                             sync.RWMutex
+	active                         client.Client
+	cancel                         context.CancelFunc
+	ready                          atomic.Bool
+	once                           sync.Once
+	dropped                        map[ReflectorStream]bool
+	initialBackoff, maximumBackoff time.Duration
 }
 
 func NewSupervisedClient(factory ClientFactory, eventCapacity int) *SupervisedClient {
+	return NewSupervisedClientWithBackoff(factory, eventCapacity, 250*time.Millisecond, 10*time.Second)
+}
+func NewSupervisedClientWithBackoff(factory ClientFactory, eventCapacity int, initial, maximum time.Duration) *SupervisedClient {
 	if eventCapacity <= 0 {
 		eventCapacity = 512
 	}
-	return &SupervisedClient{factory: factory, events: make(chan client.Event, eventCapacity), done: make(chan struct{}), dropped: map[ReflectorStream]bool{}}
+	if initial <= 0 {
+		initial = 250 * time.Millisecond
+	}
+	if maximum < initial {
+		maximum = 10 * time.Second
+	}
+	return &SupervisedClient{factory: factory, events: make(chan client.Event, eventCapacity), done: make(chan struct{}), dropped: map[ReflectorStream]bool{}, initialBackoff: initial, maximumBackoff: maximum}
 }
 func (s *SupervisedClient) Connect(ctx context.Context) error {
 	s.mu.Lock()
@@ -46,7 +56,7 @@ func (s *SupervisedClient) Connect(ctx context.Context) error {
 }
 func (s *SupervisedClient) run(ctx context.Context) {
 	defer s.once.Do(func() { close(s.done); close(s.events) })
-	backoff := 250 * time.Millisecond
+	backoff := s.initialBackoff
 	for ctx.Err() == nil {
 		current, err := s.factory()
 		if err == nil {
@@ -59,10 +69,10 @@ func (s *SupervisedClient) run(ctx context.Context) {
 			if !waitContext(ctx, backoff) {
 				return
 			}
-			backoff = min(backoff*2, 10*time.Second)
+			backoff = min(backoff*2, s.maximumBackoff)
 			continue
 		}
-		backoff = 250 * time.Millisecond
+		backoff = s.initialBackoff
 		s.mu.Lock()
 		s.active = current
 		s.mu.Unlock()

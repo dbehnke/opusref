@@ -207,9 +207,9 @@ func serve(args []string) error {
 	}
 	sharedKey := string(sharedKeyBytes)
 	clientOptions := client.Options{ServerAddress: c.Reflector.UDPAddress, NodeCallsign: c.Reflector.NodeCallsign, SharedKey: sharedKey}
-	receiver := gateway.NewSupervisedClient(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512)
+	receiver := gateway.NewSupervisedClientWithBackoff(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512, c.Reflector.ReconnectInitial.Time(), c.Reflector.ReconnectMax.Time())
 	defer receiver.Close()
-	transmitter := gateway.NewSupervisedClient(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512)
+	transmitter := gateway.NewSupervisedClientWithBackoff(func() (client.Client, error) { return client.NewUDP(clientOptions) }, 512, c.Reflector.ReconnectInitial.Time(), c.Reflector.ReconnectMax.Time())
 	defer transmitter.Close()
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()
